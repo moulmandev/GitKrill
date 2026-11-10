@@ -286,7 +286,7 @@ fn section_ui(ui: &mut Ui, section: Section, page: &mut Page<'_>, states: &mut S
     }
 }
 
-const ROW: f32 = 40.0;
+const ROW: f32 = 36.0;
 
 /// The section list. Returns true when "Exit Preferences" was clicked.
 fn nav(ui: &mut Ui, shared: &Shared, view: &mut PrefsView, repo: Option<&str>) -> bool {
