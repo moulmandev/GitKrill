@@ -18,7 +18,7 @@ use eframe::egui::{
 
 use crate::app::{Zoom, zoom};
 use crate::git::ops::{self, PullMode};
-use crate::git::{Oid, RepoSnapshot, RowKind, short};
+use crate::git::{ChangeKind, Oid, RepoSnapshot, RowKind, short};
 use crate::platform;
 use crate::state::{AppAction, Dialog, RepoTab, Settings, Shared};
 use crate::theme::{self, icons};
@@ -407,6 +407,9 @@ pub fn entries(tabs: &[RepoTab], active: usize, settings: &Settings) -> Vec<Entr
     if let (Some(tab), Some(snap)) = (tab, snap) {
         crate::ui::gitflow::palette_entries(&mut list, tab, snap);
     }
+    if let Some(tab) = tab {
+        external_tools(&mut list, tab, snap, settings);
+    }
 
     if let Some(snap) = snap {
         branches_and_tags(&mut list, snap);
@@ -476,13 +479,45 @@ fn repository_actions(list: &mut Vec<Entry>, tab: &RepoTab, snap: Option<&RepoSn
     list.push(Entry::on_tab("search", icons::MAGNIFYING_GLASS, "Search commits", |tab, _| graph::open_search(tab)).shortcut("Ctrl+F"));
     list.push(Entry::on_tab("refresh", icons::ARROWS_CLOCKWISE, "Refresh", |tab, _| tab.refresh()).shortcut("F5"));
     list.push(
-        Entry::on_tab("terminal", icons::TERMINAL_WINDOW, "Open a terminal here", |tab, _| platform::terminal(&tab.path))
+        Entry::on_tab("terminal", icons::TERMINAL_WINDOW, "Open a terminal here", |tab, shared| {
+            crate::external::terminal(&shared.settings.tools, &tab.path)
+        })
             .keywords("shell console command prompt"),
     );
     list.push(
         Entry::on_tab("reveal", icons::FOLDER_SIMPLE, "Show in file manager", |tab, _| platform::reveal(&tab.path))
             .keywords("explorer finder folder"),
     );
+}
+
+/// The editor and merge tool of Preferences > External Tools.
+fn external_tools(list: &mut Vec<Entry>, tab: &RepoTab, snap: Option<&RepoSnapshot>, settings: &Settings) {
+    let tools = &settings.tools;
+    if tools.has_editor() {
+        list.push(
+            Entry::on_tab("open-in-editor", icons::CODE, "Open repository in editor", |tab, shared| {
+                crate::external::edit(&shared.settings.tools, &tab.path)
+            })
+            .detail(tools.editor_name().to_owned())
+            .keywords("external ide code folder"),
+        );
+    }
+    let conflicted = snap.into_iter().flat_map(|snap| &snap.status.unstaged).filter(|f| f.kind == ChangeKind::Conflicted);
+    for file in conflicted.take(20) {
+        if tab.is_running(&crate::external::merge_label(tools, &file.path)) {
+            continue;
+        }
+        let path = file.path.clone();
+        list.push(
+            Entry::on_tab(format!("mergetool:{path}"), icons::GIT_MERGE, "Open in merge tool", move |tab, shared| {
+                if let Some(cmd) = crate::external::merge(&shared.settings.tools, &path) {
+                    tab.run(cmd);
+                }
+            })
+            .detail(file.path.clone())
+            .keywords("conflict resolve external mergetool"),
+        );
+    }
 }
 
 fn app_actions(list: &mut Vec<Entry>, has_tab: bool, settings: &Settings) {

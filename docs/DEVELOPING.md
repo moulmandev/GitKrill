@@ -39,6 +39,7 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Persist a preference | Add a field to your area's struct in `src/prefs/<area>.rs` (held by `Settings::<area>`; per repository: `RepoPrefs` via `prefs::repo` / `prefs::repo_mut`); it is saved automatically. Older top-level fields of `Settings` stay where they are. |
 | Show a preference | Its section's page in `src/ui/prefs/<section>.rs` (see "Preferences" below). |
 | Read or change git's configuration | `crate::prefs::gitconfig`: `page.global` / `page.repo` on a preferences page (`get`, `get_bool`, `set`, `set_bool`; read in the background, written through `git config`); `gitconfig::read` / `write` / `effective` from background code. |
+| Hand a file or folder to the user's merge tool, diff tool, editor or terminal | `crate::external`: `merge(tools, file)` gives a `GitCmd` for `tab.run`; `diff`, `edit` and `terminal` start the program on a short-lived thread. Pass `&shared.settings.tools`. Failures come back as toasts; a `GITKRILL_SHOT` run prints the command instead. To support another tool, add it to `KNOWN` (where to look, its command lines). |
 | Give every git command an environment variable | `git::cli::set_session_env` (the SSH key and author of the profile in use). |
 | Change what the commit button does | `src/ui/commit_button.rs`: the split button (`show`), what runs once a commit succeeded (`follow_up`), the commit template in the message fields (`prefill`). |
 | Do network or other non-repository background work | Spawn your own thread, send results over a channel, call `ctx.request_repaint()` when something arrives, and poll the channel from your UI code. Never block in UI code. |
@@ -193,6 +194,11 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   file named `signed-in` stands in for a token; without it the fixture is
   signed out. Browser links clicked during a `GITKRILL_SHOT` run are
   printed, not opened.
+- External tools (merge, diff, editor, terminal) are never started by a
+  `GITKRILL_SHOT` run either: "would run: ..." on standard error shows the
+  exact command line. Preferences > External Tools still lists the tools
+  really installed, so set the run's choices in `cfg/settings.json`
+  (`"tools": {"merge": {"program": {"id": "vscode", ...}}}`) or click them.
 - For a demo repository whose remote must look like GitHub, set the fetch URL
   to github.com, a separate push URL to a local bare repository
   (`git remote set-url --push origin <bare>`), and `"auto_fetch_minutes": 0`

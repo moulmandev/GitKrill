@@ -486,6 +486,13 @@ impl App {
                 if ui.button("Show in file manager").clicked() {
                     platform::reveal(&path);
                 }
+                let tools = &self.shared.settings.tools;
+                if ui.button("Open in terminal").clicked() {
+                    crate::external::terminal(tools, &path);
+                }
+                if tools.has_editor() && ui.button("Open in editor").clicked() {
+                    crate::external::edit(tools, &path);
+                }
                 if ui.button("Copy path").clicked() {
                     ui.ctx().copy_text(path.display().to_string());
                 }
@@ -642,6 +649,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
         ui::update::poll(&ctx, &mut self.shared);
+        crate::external::poll(&ctx, &mut self.shared);
         self.shortcuts(&ctx);
 
         let title = match self.tabs.get(self.active) {

@@ -5,6 +5,7 @@
 
 mod app;
 mod avatars;
+mod external;
 mod git;
 mod hosting;
 mod platform;

@@ -6,7 +6,6 @@ use eframe::egui::{
 };
 
 use crate::git::ops::{self, PullMode};
-use crate::platform;
 use crate::state::{Dialog, RepoTab, Settings, Shared};
 use crate::theme::{self, icons};
 use crate::ui::widgets::{elided, icon_button, menu_item};
@@ -184,7 +183,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
             ui.painter().vline(sep.center().x, sep.shrink2(vec2(0.0, 6.0)).y_range(), egui::Stroke::new(1.0, theme::border()));
 
             if tool_button(ui, "Terminal", icons::TERMINAL_WINDOW, true, false, "Open a terminal in this repository").clicked() {
-                platform::terminal(&tab.path);
+                crate::external::terminal(&shared.settings.tools, &tab.path);
             }
         },
     );
