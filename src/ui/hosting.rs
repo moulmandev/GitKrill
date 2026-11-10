@@ -2,7 +2,7 @@
 //! CI runs, the offer to connect a self-hosted server, and the dialog that
 //! asks what runs on it.
 
-use eframe::egui::{Align2, Color32, Rect, Response, RichText, Sense, Ui, Vec2, pos2};
+use eframe::egui::{Align2, Button, Color32, Rect, Response, RichText, Sense, Ui, Vec2, pos2, vec2};
 
 use crate::git::{BranchInfo, Oid, RemoteInfo, RepoSnapshot};
 use crate::git::ops::GitCmd;
@@ -600,9 +600,22 @@ pub fn connect_body(ui: &mut Ui, shared: &mut Shared, host: &str, path: &str, ch
         .color(theme::text_dim()),
     );
     ui.add_space(2.0);
-    ui.radio_value(choice, Some(ServerKind::GitLab), "GitLab");
-    ui.radio_value(choice, Some(ServerKind::GitHubEnterprise), "GitHub Enterprise");
-    ui.radio_value(choice, Some(ServerKind::Ignored), "Neither: don't offer again");
+    let options = [
+        (ServerKind::GitLab, icons::GITLAB_LOGO, "GitLab"),
+        (ServerKind::GitHubEnterprise, icons::GITHUB_LOGO, "GitHub Enterprise"),
+        (ServerKind::Ignored, icons::PROHIBIT, "Neither: don't offer again"),
+    ];
+    for (kind, icon, label) in options {
+        let selected = *choice == Some(kind);
+        let color = if selected { theme::text_bright() } else { theme::text() };
+        let text = RichText::new(format!("{icon}   {label}")).font(theme::font(13.5)).color(color);
+        let option = Button::selectable(selected, text)
+            .frame_when_inactive(true)
+            .min_size(vec2(ui.available_width(), 30.0));
+        if ui.add(option).clicked() {
+            *choice = Some(kind);
+        }
+    }
 
     let explanation = match *choice {
         Some(ServerKind::GitLab) => format!(
@@ -621,12 +634,15 @@ pub fn connect_body(ui: &mut Ui, shared: &mut Shared, host: &str, path: &str, ch
             "{host} is not contacted, and not offered again. Right-click the remote to \
              connect it later."
         ),
-        None => String::new(),
+        None => "Choose one to see where requests would go and which sign-in would be used.".to_owned(),
     };
-    if !explanation.is_empty() {
-        ui.add_space(2.0);
+    ui.add_space(2.0);
+    // Room for the longest explanation, so the dialog (centred on screen)
+    // does not move under the pointer when the choice changes.
+    ui.scope(|ui| {
+        ui.set_min_height(50.0);
         ui.label(RichText::new(explanation).font(theme::font(12.0)).color(theme::text_dim()));
-    }
+    });
 
     let button = if *choice == Some(ServerKind::Ignored) { "Save" } else { "Connect" };
     match dialogs::buttons(ui, button, choice.is_some(), false) {

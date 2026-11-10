@@ -98,6 +98,11 @@ impl Service {
         if self.is_gitlab() { "project" } else { "repository" }
     }
 
+    /// "repositories", or "projects" on GitLab.
+    pub fn repos_word(self) -> &'static str {
+        if self.is_gitlab() { "projects" } else { "repositories" }
+    }
+
     /// The ref on the remote that follows a pull request's head commit.
     fn pull_ref(self, number: u64) -> String {
         match self {
@@ -601,7 +606,7 @@ impl Problem {
     /// The summary plus what to do about it, for a tooltip.
     pub fn detail(&self, service: Service) -> String {
         let host = service.name();
-        let repository = service.repo_word();
+        let (repository, repositories) = (service.repo_word(), service.repos_word());
         let sign_in = sign_in_advice(service);
         let advice = match self {
             Problem::RateLimited { .. } => format!(
@@ -609,7 +614,7 @@ impl Problem {
                  refreshing resumes by itself. Signing in raises the limit."
             ),
             Problem::NotSignedIn => format!(
-                "{host} only shows public {repository}s without a sign-in, and it does not \
+                "{host} only shows public {repositories} without a sign-in, and it does not \
                  show this one. {sign_in}"
             ),
             Problem::SignInRejected => format!(
@@ -736,7 +741,7 @@ pub enum Auth {
 
 impl Auth {
     pub fn describe(self, service: Service) -> String {
-        let repositories = format!("public {}s only", service.repo_word());
+        let repositories = format!("public {} only", service.repos_word());
         match self {
             Auth::Unknown => String::new(),
             Auth::Anonymous => format!("Not signed in: {repositories}"),
@@ -3448,6 +3453,8 @@ mod tests {
         assert_eq!(Auth::SignedIn(TokenSource::Cli).describe(Service::GitLab), "Signed in through the GitLab CLI");
         assert_eq!(Auth::Anonymous.describe(Service::GitLab), "Not signed in: public projects only");
         assert_eq!(Auth::SignedIn(TokenSource::Cli).describe(Service::GitHubEnterprise), "Signed in through the GitHub CLI");
+        assert_eq!(Auth::Anonymous.describe(Service::GitHub), "Not signed in: public repositories only");
+        assert!(Problem::NotSignedIn.detail(Service::GitHub).contains("only shows public repositories without"));
 
         let gitlab_com = at(Service::GitLab, "gitlab.com", "g", "a");
         let own = at(Service::GitLab, "git.acme.com", "g", "a");

@@ -433,7 +433,9 @@ impl Client {
             // Nobody can open a merge request anonymously: do not even ask.
             let Some((token, _)) = &self.token else {
                 return Err(Problem::Failed(if self.rejected.is_empty() {
-                    "Not signed in to GitLab. Set GITLAB_TOKEN or run `glab auth login`, then try again.".to_owned()
+                    "Not signed in to GitLab. Set GITLAB_TOKEN (and GITLAB_HOST for your own server) \
+                     or run `glab auth login`, then try again."
+                        .to_owned()
                 } else {
                     "GitLab refused the saved sign-in (expired or revoked?). Sign in again, then try again."
                         .to_owned()
