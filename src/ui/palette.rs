@@ -394,7 +394,7 @@ pub fn entries(tabs: &[RepoTab], active: usize, settings: &Settings) -> Vec<Entr
     if let Some(shown) = tab.and_then(|tab| tab.hosting.connected()) {
         let service = shown.repo.service;
         list.push(
-            Entry::on_tab("create-pr", icons::GIT_PULL_REQUEST, format!("Create {}", service.pull_word()), |tab, shared| {
+            Entry::on_tab("create-pr", if service.is_gitlab() { icons::GIT_MERGE } else { icons::GIT_PULL_REQUEST }, format!("Create {}", service.pull_word()), |tab, shared| {
                 crate::ui::new_pull::open(tab, shared, None)
             })
             .detail(format!("on {}", shown.repo.site()))
