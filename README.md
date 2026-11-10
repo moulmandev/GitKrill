@@ -102,6 +102,8 @@ be installed.
 - A resolver for conflicted files: current and incoming side by side, take
   either or both per conflict, edit the result by hand, save and mark resolved
 - Binary and delete/modify conflicts: keep one side or delete
+- Or hand a conflicted file to an external merge tool (`git mergetool`):
+  the file counts as resolved once the tool has saved it
 
 **History**
 - Checkout (branch, remote branch, commit, tag), create / rename / delete branch
@@ -140,7 +142,12 @@ be installed.
   `target`, `.venv`, ...) are not searched
 - Dark and light themes, or follow the system setting (**View > Theme**)
 - Clone and init
-- Open a terminal in the repository
+- External tools (**Preferences > External Tools**): a merge tool, a diff
+  tool, an editor and a terminal, picked from those installed (VS Code,
+  Beyond Compare, KDiff3, Meld, P4Merge, WinMerge, Sublime Merge, JetBrains
+  IDEs, Notepad++, Windows Terminal, PowerShell, Git Bash, ...) or typed as
+  a command. Changed files open in the diff tool or editor from their context
+  menu, the repository in the editor or terminal from its tab's menu
 - Command palette (`Ctrl+P`): type a few letters of any action, branch, tag,
   repository or commit SHA and press Enter
 

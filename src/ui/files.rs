@@ -3,6 +3,7 @@
 
 use eframe::egui::{self, Align2, Rect, ScrollArea, Sense, Ui, pos2, vec2};
 
+use crate::external::{self, Compare};
 use crate::git::{ChangeKind, DiffSource, DiffTarget, FileChange, ops};
 use crate::platform;
 use crate::state::{Dialog, Overlay, RepoTab, Shared};
@@ -210,6 +211,11 @@ pub fn file_list(
                                     if menu_item(ui, icons::PLUS, stage) {
                                         run = Some(ops::stage(one));
                                     }
+                                    if file.kind == ChangeKind::Conflicted
+                                        && menu_item(ui, icons::GIT_MERGE, "Open in merge tool")
+                                    {
+                                        run = external::merge(&shared.settings.tools, &file.path);
+                                    }
                                     if file.kind != ChangeKind::Conflicted
                                         && menu_item(ui, icons::TRASH, "Discard changes")
                                     {
@@ -236,6 +242,20 @@ pub fn file_list(
                                 DiffSource::Commit(_) => {}
                             }
                             let full = workdir.join(&file.path);
+                            let tools = &shared.settings.tools;
+                            // Untracked files have nothing to compare with;
+                            // conflicts go to the merge tool.
+                            let comparable = !matches!(file.kind, ChangeKind::Untracked | ChangeKind::Conflicted);
+                            if comparable && menu_item(ui, icons::GIT_DIFF, "Open in diff tool") {
+                                let compare = compare_for(tab, source);
+                                external::diff(tools, &workdir, compare, &file.path, file.old_path.as_deref());
+                            }
+                            if file.kind != ChangeKind::Deleted
+                                && tools.has_editor()
+                                && menu_item(ui, icons::CODE, "Open in editor")
+                            {
+                                external::edit(tools, &full);
+                            }
                             if file.kind != ChangeKind::Deleted {
                                 if menu_item(ui, icons::FILE_TEXT, "Open file") {
                                     platform::open(&full);
@@ -273,6 +293,23 @@ pub fn file_list(
     }
     if let Some(overlay) = overlay {
         tab.overlay = Some(overlay);
+    }
+}
+
+/// What "Open in diff tool" compares for the files of `source`: a commit
+/// with its first parent.
+fn compare_for(tab: &RepoTab, source: DiffSource) -> Compare {
+    match source {
+        DiffSource::Unstaged => Compare::Unstaged,
+        DiffSource::Staged => Compare::Staged,
+        DiffSource::Commit(oid) => {
+            let details = tab.details.as_ref().and_then(|d| d.as_ref().ok()).filter(|d| d.oid == oid);
+            let parent = match details {
+                Some(details) => details.parents.first().map(|parent| parent.to_string()),
+                None => Some(format!("{oid}^")),
+            };
+            Compare::Commit { commit: oid.to_string(), parent }
+        }
     }
 }
 

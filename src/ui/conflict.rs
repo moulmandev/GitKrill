@@ -466,7 +466,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, view: &mut Conf
             Content::Text { merge, edited_outside, .. } => {
                 text_ui(ui, tab, shared, view, &file, merge, *edited_outside, free);
             }
-            Content::Whole(why) => whole_ui(ui, tab, view, &file, *why),
+            Content::Whole(why) => whole_ui(ui, tab, shared, view, &file, *why),
         }
         if view.asking {
             ask(ui.ctx(), tab, shared, view, &file);
@@ -706,6 +706,8 @@ enum Action {
     Reset,
     Step(isize),
     Save { mark_resolved: bool },
+    /// Hand the file to the external merge tool (Preferences > External Tools).
+    MergeTool,
 }
 
 /// What clicking a side's checkbox makes of a resolution. Picking the
@@ -836,6 +838,11 @@ impl Resolver {
                 }
             }
             Action::Save { mark_resolved } => self.save(tab, shared, file, mark_resolved, false),
+            Action::MergeTool => {
+                if let Some(cmd) = crate::external::merge(&shared.settings.tools, &file.path) {
+                    tab.run(cmd);
+                }
+            }
         }
     }
 }
@@ -878,7 +885,8 @@ fn text_ui(
     let saving = view.saving.is_some();
     let open = view.draft.open_conflicts();
     let total = view.draft.choices.len();
-    title_buttons(ui, free, open, view.is_dirty(), saving, &mut actions);
+    let merging = tab.is_running(&crate::external::merge_label(&shared.settings.tools, &file.path));
+    title_buttons(ui, free, open, view.is_dirty(), (saving, merging), &mut actions);
     toolbar(ui, open, total, saving, &mut actions);
     if edited_outside {
         notice(
@@ -1041,11 +1049,12 @@ fn text_ui(
 }
 
 /// Save buttons, in the free part of the title bar.
-fn title_buttons(ui: &mut Ui, free: Rect, open: usize, dirty: bool, saving: bool, actions: &mut Vec<Action>) {
+fn title_buttons(ui: &mut Ui, free: Rect, open: usize, dirty: bool, (saving, merging): (bool, bool), actions: &mut Vec<Action>) {
     const RESOLVE: &str = "Save and mark resolved";
     const SAVE: &str = "Save";
+    const MERGE_TOOL: &str = "Open in merge tool";
     // The path may run under the buttons when the view is narrow.
-    let width = tint_button_size(ui, RESOLVE).x + tint_button_size(ui, SAVE).x + 22.0;
+    let width = tint_button_size(ui, RESOLVE).x + tint_button_size(ui, SAVE).x + tint_button_size(ui, MERGE_TOOL).x + 28.0;
     let backing = Rect::from_min_max(
         pos2((free.right() - width).max(free.left()), free.top() + 1.0),
         pos2(free.right(), free.bottom() - 1.0),
@@ -1054,8 +1063,9 @@ fn title_buttons(ui: &mut Ui, free: Rect, open: usize, dirty: bool, saving: bool
 
     ui.scope_builder(UiBuilder::new().max_rect(free).layout(Layout::right_to_left(Align::Center)), |ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
-        if saving {
-            ui.label(RichText::new("Saving…").color(theme::text_dim()));
+        if saving || merging {
+            let what = if merging { "Waiting for the merge tool…" } else { "Saving…" };
+            ui.label(RichText::new(what).color(theme::text_dim()));
             ui.add(egui::Spinner::new().size(13.0).color(theme::accent()));
             return;
         }
@@ -1073,6 +1083,13 @@ fn title_buttons(ui: &mut Ui, free: Rect, open: usize, dirty: bool, saving: bool
                     Unresolved regions keep their conflict markers.";
         if save.on_hover_text(hint).on_disabled_hover_text("Nothing new to save").clicked() {
             actions.push(Action::Save { mark_resolved: false });
+        }
+        // The tool works on the file as it is on disk: not with choices
+        // made here and not saved yet.
+        let merge_tool = ui.add_enabled_ui(!dirty, |ui| tint_button(ui, MERGE_TOOL, theme::text_dim())).inner;
+        let hint = "Resolve the file in the merge tool chosen in Preferences > External Tools.                     It is marked as resolved once the tool has saved it.";
+        if merge_tool.on_hover_text(hint).on_disabled_hover_text("Save or reset your choices first").clicked() {
+            actions.push(Action::MergeTool);
         }
     });
 }
@@ -1786,7 +1803,7 @@ fn file_size(bytes: usize) -> String {
 
 /// Binary files, delete/modify and rename leftovers: no editor, just the
 /// question of which version stays.
-fn whole_ui(ui: &mut Ui, tab: &mut RepoTab, view: &mut Resolver, file: &ConflictFile, why: Whole) {
+fn whole_ui(ui: &mut Ui, tab: &mut RepoTab, shared: &Shared, view: &mut Resolver, file: &ConflictFile, why: Whole) {
     let (ours, theirs) = (&file.ours_info, &file.theirs_info);
     let (headline, explanation) = match why {
         Whole::Binary => (
@@ -1865,6 +1882,17 @@ fn whole_ui(ui: &mut Ui, tab: &mut RepoTab, view: &mut Resolver, file: &Conflict
         }
         if ui.add(wide(format!("{}  Delete the file", icons::TRASH), theme::red())).clicked() {
             run = Some((conflict::delete(&file.path), "The file is deleted.".to_owned()));
+        }
+        // A merge tool can take what is too large or binary for this view.
+        let tools = &shared.settings.tools;
+        if matches!(why, Whole::Binary | Whole::TooLarge) {
+            let merging = tab.is_running(&crate::external::merge_label(tools, &file.path));
+            let button = wide(format!("{}  Open in merge tool", icons::GIT_MERGE), theme::text_dim());
+            if ui.add_enabled(!merging, button).on_disabled_hover_text("Waiting for the merge tool…").clicked()
+                && let Some(cmd) = crate::external::merge(tools, &file.path)
+            {
+                tab.run(cmd);
+            }
         }
     });
 
