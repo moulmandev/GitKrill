@@ -1,9 +1,11 @@
 //! The diff view that replaces the graph while a file is open.
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::sync::{Arc, Mutex, Weak};
 
 use eframe::egui::{
@@ -12,14 +14,14 @@ use eframe::egui::{
 };
 
 use crate::git::diff::LineApply;
-use crate::git::{ChangeKind, DiffSource, DiffTarget, FileChange, FileDiff, ops, short};
+use crate::git::{ChangeKind, DiffSource, DiffTarget, FileChange, FileDiff, ops, short, text};
+use crate::prefs::editor;
 use crate::state::{Dialog, RepoTab, Shared, ToastKind};
 use crate::theme::{self, icons};
 use crate::ui::highlight;
 use crate::ui::textsel::{self, Lines, Pos};
 use crate::ui::widgets::{self, icon_button, kind_icon, tint_button};
 
-const LINE_H: f32 = 19.0;
 const HUNK_H: f32 = 30.0;
 const NUM_W: f32 = 46.0;
 const BAR_H: f32 = 38.0;
@@ -43,6 +45,18 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
     if title_bar(ui, tab, shared, &target, loaded.as_deref()) {
         tab.diff = None;
         return;
+    }
+
+    // Read before the encoding or tab width changed: read it again. The old
+    // lines stay on screen until the new ones are in.
+    if let Some(Ok(diff)) = &data
+        && diff.format.generation != text::generation()
+    {
+        let asked = egui::Id::new(("diff-reload", &tab.path));
+        if ui.data(|d| d.get_temp::<u64>(asked)) != Some(text::generation()) {
+            ui.data_mut(|d| d.insert_temp(asked, text::generation()));
+            tab.reload_diff();
+        }
     }
 
     match data {
@@ -282,27 +296,6 @@ impl<'a> DiffText<'a> {
         let hunk = self.starts.partition_point(|start| *start <= line).saturating_sub(1);
         (hunk, line - self.starts[hunk])
     }
-
-    /// The text position nearest to height `y` of the diff (from the top of
-    /// its content) and, when that is not "wherever x points", its column:
-    /// a point on a hunk header is at the start of the hunk's first line,
-    /// one below the last line at the end of it (`usize::MAX`).
-    fn line_at(&self, tops: &[f32], y: f32) -> (usize, Option<usize>) {
-        let Some(last) = self.total.checked_sub(1) else { return (0, Some(0)) };
-        let Some(hunk) = tops.partition_point(|top| *top <= y).checked_sub(1) else {
-            return (0, Some(0));
-        };
-        let offset = y - tops[hunk] - HUNK_H;
-        if offset < 0.0 {
-            return (self.starts[hunk].min(last), Some(0));
-        }
-        let index = (offset / LINE_H) as usize;
-        let len = self.diff.hunks[hunk].lines.len();
-        if index >= len {
-            return ((self.starts[hunk] + len).saturating_sub(1).min(last), Some(usize::MAX));
-        }
-        (self.starts[hunk] + index, None)
-    }
 }
 
 impl Lines for DiffText<'_> {
@@ -317,9 +310,178 @@ impl Lines for DiffText<'_> {
 
     fn source(&self, line: usize) -> Option<&str> {
         let (hunk, index) = self.locate(line);
-        let sources = self.sources.get_or_init(|| self.diff.hunks.iter().map(|hunk| hunk.sources()).collect());
+        let encoding = self.diff.format.encoding;
+        let sources = self.sources.get_or_init(|| self.diff.hunks.iter().map(|hunk| hunk.sources(encoding)).collect());
         sources.get(hunk)?.as_ref()?.get(index).map(|text| text.as_ref())
     }
+}
+
+/// Where hunks and lines are in a diff's content, in points from its top.
+/// With word wrap a line takes one row or more; without, exactly one.
+struct Geometry {
+    line_h: f32,
+    hunk_h: f32,
+    /// Top of every hunk's header.
+    tops: Vec<f32>,
+    height: f32,
+    /// With word wrap: the first row of every line (the lines of all hunks
+    /// one after the other), then the total. `None`: a row per line.
+    rows: Option<Arc<Vec<u32>>>,
+}
+
+impl Geometry {
+    fn new(text: &DiffText<'_>, line_h: f32, hunk_h: f32, rows: Option<Arc<Vec<u32>>>) -> Self {
+        let mut geometry = Geometry { line_h, hunk_h, tops: Vec::with_capacity(text.starts.len()), height: 0.0, rows };
+        let mut height = 0.0;
+        for h in 0..text.starts.len() {
+            geometry.tops.push(height);
+            height += hunk_h + geometry.hunk_rows(text, h) as f32 * line_h;
+        }
+        if text.diff.truncated {
+            height += hunk_h;
+        }
+        geometry.height = height;
+        geometry
+    }
+
+    /// The first row of line `flat` of the text.
+    fn row(&self, flat: usize) -> usize {
+        self.rows.as_ref().map_or(flat, |rows| rows[flat] as usize)
+    }
+
+    /// Rows taken by the lines of hunk `h`.
+    fn hunk_rows(&self, text: &DiffText<'_>, h: usize) -> usize {
+        let start = text.starts[h];
+        self.row(start + text.diff.hunks[h].lines.len()) - self.row(start)
+    }
+
+    /// Rows taken by line `flat` of the text.
+    fn line_rows(&self, flat: usize) -> usize {
+        self.row(flat + 1) - self.row(flat)
+    }
+
+    /// Top of line `i` of hunk `h`.
+    fn line_top(&self, text: &DiffText<'_>, h: usize, i: usize) -> f32 {
+        let start = text.starts[h];
+        self.tops[h] + self.hunk_h + (self.row(start + i) - self.row(start)) as f32 * self.line_h
+    }
+
+    /// The line of hunk `h` that row `row` of the hunk belongs to.
+    fn line_of_row(&self, text: &DiffText<'_>, h: usize, row: usize) -> usize {
+        let start = text.starts[h];
+        let len = text.diff.hunks[h].lines.len();
+        match &self.rows {
+            None => row.min(len.saturating_sub(1)),
+            Some(rows) => {
+                let base = rows[start] as usize;
+                rows[start..start + len].partition_point(|first| *first as usize - base <= row).saturating_sub(1)
+            }
+        }
+    }
+
+    /// The lines of hunk `h` with a row between heights `from` and `to`.
+    fn lines_between(&self, text: &DiffText<'_>, h: usize, from: f32, to: f32) -> Range<usize> {
+        let len = text.diff.hunks[h].lines.len();
+        let lines_top = self.tops[h] + self.hunk_h;
+        let first = ((from - lines_top) / self.line_h).floor().max(0.0) as usize;
+        let last = ((to - lines_top) / self.line_h).ceil().max(0.0) as usize;
+        if first >= self.hunk_rows(text, h) || last == 0 {
+            return 0..0;
+        }
+        self.line_of_row(text, h, first)..(self.line_of_row(text, h, last - 1) + 1).min(len)
+    }
+
+    /// What is at height `y` of the content: a line of the text, which of
+    /// its rows, and the column when it is not "wherever x points". A point
+    /// on a hunk header is at the start of the hunk's first line, one below
+    /// the last line at the end of it (`usize::MAX`).
+    fn locate(&self, text: &DiffText<'_>, y: f32) -> (usize, usize, Option<usize>) {
+        let Some(last) = text.total.checked_sub(1) else { return (0, 0, Some(0)) };
+        let Some(h) = self.tops.partition_point(|top| *top <= y).checked_sub(1) else {
+            return (0, 0, Some(0));
+        };
+        let offset = y - self.tops[h] - self.hunk_h;
+        if offset < 0.0 {
+            return (text.starts[h].min(last), 0, Some(0));
+        }
+        let row = (offset / self.line_h) as usize;
+        let start = text.starts[h];
+        if row >= self.hunk_rows(text, h) {
+            let len = text.diff.hunks[h].lines.len();
+            return ((start + len).saturating_sub(1).min(last), 0, Some(usize::MAX));
+        }
+        let i = self.line_of_row(text, h, row);
+        (start + i, row - (self.row(start + i) - self.row(start)), None)
+    }
+}
+
+/// Row counts of the lines of a text (a diff, a blame) wrapped at some
+/// width, kept from frame to frame: worked out again only for another
+/// text, width or font.
+#[derive(Clone)]
+struct WrapCache {
+    /// Held weakly so the address stays taken: "same address" then reliably
+    /// means "same object".
+    owner: Weak<dyn Any + Send + Sync>,
+    columns: usize,
+    rows: Arc<Vec<u32>>,
+}
+
+/// The first row of every line of `owner` (and the total) wrapped at
+/// `columns`, from `count` (see [`first_rows`]) when not known yet. Kept
+/// under `id`.
+pub(super) fn wrap_rows<T: Any + Send + Sync>(
+    ui: &Ui,
+    id: egui::Id,
+    owner: &Arc<T>,
+    columns: usize,
+    count: impl FnOnce() -> Vec<u32>,
+) -> Arc<Vec<u32>> {
+    if let Some(cache) = ui.data(|data| data.get_temp::<WrapCache>(id))
+        && cache.columns == columns
+        && std::ptr::addr_eq(cache.owner.as_ptr(), Arc::as_ptr(owner))
+    {
+        return cache.rows;
+    }
+    let rows = Arc::new(count());
+    let owner: Weak<dyn Any + Send + Sync> = Arc::downgrade(owner) as Weak<dyn Any + Send + Sync>;
+    ui.data_mut(|data| data.insert_temp(id, WrapCache { owner, columns, rows: rows.clone() }));
+    rows
+}
+
+/// The first row of every one of `lines` wrapped at `columns`, then the
+/// total. Goes through every line once; only lines longer than a row are
+/// looked into.
+pub(super) fn first_rows<'a>(lines: impl IntoIterator<Item = &'a str>, columns: usize) -> Vec<u32> {
+    let mut rows = Vec::new();
+    let mut at = 0u32;
+    for line in lines {
+        rows.push(at);
+        at += text::wrapped_rows(line, columns) as u32;
+    }
+    rows.push(at);
+    rows
+}
+
+/// The rows of a shown line wrapped at `columns` (or all of it on one row
+/// without): the columns and the bytes of each.
+pub(super) fn segments(shown: &str, columns: Option<usize>) -> Vec<(Range<usize>, Range<usize>)> {
+    let breaks = columns.map(|columns| text::wrap_points(shown, columns)).unwrap_or_default();
+    if breaks.is_empty() {
+        return vec![(0..usize::MAX, 0..shown.len())];
+    }
+    let mut out = Vec::with_capacity(breaks.len() + 1);
+    let (mut col, mut byte) = (0, 0);
+    let mut next = breaks.iter().copied().peekable();
+    for (c, (at, _)) in shown.char_indices().enumerate() {
+        if next.peek() == Some(&c) {
+            next.next();
+            out.push((col..c, byte..at));
+            (col, byte) = (c, at);
+        }
+    }
+    out.push((col..shown.chars().count(), byte..shown.len()));
+    out
 }
 
 /// Background of an added / removed line. One picked for staging keeps its
@@ -334,25 +496,42 @@ pub(super) fn line_background(origin: char, selected: bool) -> Option<Color32> {
     Some(if selected { theme::mix(base, full, 0.16) } else { base })
 }
 
-fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget, diff: &Arc<FileDiff>) {
-    // Vertical offset of every hunk, so only the visible part is painted.
-    let mut tops = Vec::with_capacity(diff.hunks.len());
-    let mut height = 0.0;
-    for hunk in &diff.hunks {
-        tops.push(height);
-        height += HUNK_H + hunk.lines.len() as f32 * LINE_H;
-    }
-    if diff.truncated {
-        height += HUNK_H;
-    }
+/// Room kept free right of wrapped text, so a row never runs under the
+/// scroll bar.
+pub(super) const WRAP_MARGIN: f32 = 24.0;
+/// Narrower than this, wrapping would make a column of letters.
+pub(super) const MIN_WRAP_COLUMNS: usize = 20;
 
-    let font = theme::mono(12.5);
+fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget, diff: &Arc<FileDiff>) {
+    // Preferences > Editor: font, size, line numbers, wrapping, colours.
+    let look = editor::look();
+    let font = look.font();
+    let small = look.small();
+    let line_h = look.line_height();
+    let hunk_h = HUNK_H.max(line_h + 10.0);
+    let scale = look.size / editor::DEFAULT_FONT_SIZE;
+    let num_w = if look.numbers { (NUM_W * scale).round() } else { 0.0 };
+    let sign_w = (22.0 * scale).round();
+    let gutter = num_w * 2.0 + sign_w;
     let char_w = ui.painter().fonts_mut(|f| f.glyph_width(&font, 'm'));
-    let gutter = NUM_W * 2.0 + 22.0;
-    let text_w = gutter + diff.max_chars as f32 * char_w + 40.0;
+
+    let text = DiffText::new(diff);
+    let view = ui.available_rect_before_wrap();
+    // Wrapped, the code fits the view and only scrolls up and down.
+    let columns = look.wrap.then(|| {
+        let room = view.width() - gutter - WRAP_MARGIN;
+        ((room / char_w).floor().max(0.0) as usize).max(MIN_WRAP_COLUMNS)
+    });
+    let rows = columns.map(|columns| {
+        let lines = || diff.hunks.iter().flat_map(|hunk| &hunk.lines).map(|line| line.text.as_str());
+        wrap_rows(ui, ui.id().with("diff-wrap"), diff, columns, || first_rows(lines(), columns))
+    });
+    let geometry = Geometry::new(&text, line_h, hunk_h, rows);
+    let height = geometry.height;
+    let text_w = if columns.is_some() { 0.0 } else { gutter + diff.max_chars as f32 * char_w + 40.0 };
 
     // Colours arrive from a background thread; until then lines are plain.
-    let style = highlight::style_for(ui.ctx(), diff, &target.path);
+    let style = highlight::style_for(ui.ctx(), diff, &target.path, look.highlight);
 
     // Lines can be picked wherever they can be staged: working tree diffs of
     // files that are not in the middle of a merge.
@@ -371,15 +550,14 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
 
     // Selected text, kept per place a diff is shown in (this view, the file
     // history).
-    let text = DiffText::new(diff);
     let text_id = ui.id().with("diff-text-selection");
     let text_selection =
         ui.data_mut(|data| data.get_temp_mut_or_default::<Arc<Mutex<textsel::Selection>>>(text_id).clone());
     let mut text_selection = text_selection.lock().unwrap_or_else(|e| e.into_inner());
     text_selection.follow(diff, ui.ctx().cumulative_frame_nr(), || fingerprint(target, diff));
-    let view = ui.available_rect_before_wrap();
 
-    ScrollArea::both().id_salt("diff-body").auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
+    let scroll = if columns.is_some() { ScrollArea::vertical() } else { ScrollArea::both() };
+    scroll.id_salt("diff-body").auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
         let size = vec2(text_w.max(ui.available_width()), height.max(ui.available_height()));
         let sense = if stageable { Sense::click() } else { Sense::hover() };
         let (content, response) = ui.allocate_exact_size(size, sense);
@@ -401,14 +579,16 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
             if text.count() == 0 {
                 return Pos::default();
             }
-            let (line, col) = text.line_at(&tops, pos.y - content.top());
+            let (line, row, col) = geometry.locate(&text, pos.y - content.top());
             let shown = text.shown(line);
             let col = match col {
                 Some(usize::MAX) => shown.chars().count(),
                 Some(col) => col,
                 None => {
-                    let galley = painter.layout_no_wrap(shown.to_owned(), font.clone(), theme::text());
-                    textsel::column_at(&galley, pos.x - text_left)
+                    let parts = segments(shown, columns);
+                    let (cols, bytes) = parts[row.min(parts.len() - 1)].clone();
+                    let galley = painter.layout_no_wrap(shown[bytes].to_owned(), font.clone(), theme::text());
+                    cols.start + textsel::column_at(&galley, pos.x - text_left)
                 }
             };
             Pos::new(line, col)
@@ -419,16 +599,14 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
         // The changed line under a point in the gutter, if any. Hunk
         // headers, context lines and the space below the diff give `None`.
         let line_at = |pos: Pos2| -> Option<LineRef> {
-            if pos.x >= left + gutter {
+            if pos.x >= left + gutter || text.count() == 0 {
                 return None;
             }
-            let y = pos.y - content.top();
-            let h = tops.partition_point(|top| *top <= y).checked_sub(1)?;
-            let offset = y - tops[h] - HUNK_H;
-            if offset < 0.0 {
+            let (flat, _, col) = geometry.locate(&text, pos.y - content.top());
+            if col.is_some() {
                 return None;
             }
-            let i = (offset / LINE_H) as usize;
+            let (h, i) = text.locate(flat);
             (diff.hunks[h].lines.get(i)?.origin != ' ').then_some((h, i))
         };
         let mut hovered = None;
@@ -446,37 +624,32 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
 
         let text_clip = Rect::from_min_max(pos2(left + gutter, painter.clip_rect().top()), painter.clip_rect().max);
         let text_painter = painter.with_clip_rect(text_clip.intersect(painter.clip_rect()));
-        let numbers_right = left + NUM_W * 2.0 - 1.0;
+        // The line numbers, or without them the column of +/- signs, are
+        // where a picked line is marked.
+        let numbers_right = if look.numbers { left + num_w * 2.0 - 1.0 } else { left + sign_w - 1.0 };
 
         for (h, hunk) in diff.hunks.iter().enumerate() {
-            let top = tops[h];
-            let bottom = top + HUNK_H + hunk.lines.len() as f32 * LINE_H;
+            let top = geometry.tops[h];
+            let bottom = top + hunk_h + geometry.hunk_rows(&text, h) as f32 * line_h;
             if bottom < viewport.min.y || top > viewport.max.y {
                 continue;
             }
 
             // Hunk header.
             let y = content.top() + top;
-            let bar = Rect::from_min_max(pos2(left, y), pos2(right, y + HUNK_H));
+            let bar = Rect::from_min_max(pos2(left, y), pos2(right, y + hunk_h));
             painter.rect_filled(bar, 0.0, theme::diff_hunk_bg());
             painter.hline(bar.x_range(), bar.top(), Stroke::new(1.0, theme::border()));
-            painter.text(
-                pos2(left + 12.0, bar.center().y),
-                Align2::LEFT_CENTER,
-                &hunk.header,
-                theme::mono(12.0),
-                theme::text_dim(),
-            );
+            painter.text(pos2(left + 12.0, bar.center().y), Align2::LEFT_CENTER, &hunk.header, small.clone(), theme::text_dim());
             hunk_buttons(ui, tab, shared, target, diff, h, bar, selection.as_deref_mut());
 
             // Lines.
             let styled = style.hunk(h);
-            let lines_top = top + HUNK_H;
-            let first = (((viewport.min.y - lines_top) / LINE_H).floor().max(0.0)) as usize;
-            let last = ((((viewport.max.y - lines_top) / LINE_H).ceil().max(0.0)) as usize).min(hunk.lines.len());
-            for (i, line) in hunk.lines.iter().enumerate().take(last).skip(first) {
-                let y = content.top() + lines_top + i as f32 * LINE_H;
-                let row = Rect::from_min_max(pos2(left, y), pos2(right, y + LINE_H));
+            for i in geometry.lines_between(&text, h, viewport.min.y, viewport.max.y) {
+                let line = &hunk.lines[i];
+                let flat = text.starts[h] + i;
+                let y = content.top() + geometry.line_top(&text, h, i);
+                let row = Rect::from_min_max(pos2(left, y), pos2(right, y + geometry.line_rows(flat) as f32 * line_h));
                 let selected = selection.as_ref().is_some_and(|s| s.lines.contains(&(h, i)));
                 let sign_color = match line.origin {
                     '+' => theme::green(),
@@ -496,55 +669,68 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
                     painter.rect_filled(numbers, 0.0, theme::with_alpha(theme::accent(), 46));
                 }
 
-                let cy = row.center().y;
-                let number_color = if selected { theme::text_bright() } else { theme::text_faint() };
-                let number = |n: Option<u32>, x: f32| {
-                    if let Some(n) = n {
-                        painter.text(pos2(x, cy), Align2::RIGHT_CENTER, n.to_string(), theme::mono(11.5), number_color);
-                    }
-                };
-                number(line.old_no, left + NUM_W - 6.0);
-                number(line.new_no, left + NUM_W * 2.0 - 6.0);
+                // Numbers and sign go with the line's first row.
+                let cy = y + line_h / 2.0;
+                if look.numbers {
+                    let number_color = if selected { theme::text_bright() } else { theme::text_faint() };
+                    let number = |n: Option<u32>, x: f32| {
+                        if let Some(n) = n {
+                            painter.text(pos2(x, cy), Align2::RIGHT_CENTER, n.to_string(), small.clone(), number_color);
+                        }
+                    };
+                    number(line.old_no, left + num_w - 6.0);
+                    number(line.new_no, left + num_w * 2.0 - 6.0);
+                }
                 if line.origin != ' ' {
-                    painter.text(
-                        pos2(left + NUM_W * 2.0 + 8.0, cy),
-                        Align2::CENTER_CENTER,
-                        line.origin,
-                        theme::mono(12.5),
-                        sign_color,
-                    );
+                    let x = left + num_w * 2.0 + (sign_w * 0.36).round();
+                    painter.text(pos2(x, cy), Align2::CENTER_CENTER, line.origin, font.clone(), sign_color);
                 }
 
                 let spans = styled.as_ref().map_or(&[][..], |s| s.spans(i));
-                let galley = text_painter.layout_job(highlight::layout(&line.text, spans, &font));
-                let origin = pos2(text_left, cy - galley.size().y / 2.0);
-                // The part of the line that differs from its counterpart,
-                // behind the text. Positions come from the laid-out glyphs,
-                // as wide characters do not keep to the monospace grid.
-                if let (Some(styled), Some(placed)) = (&styled, galley.rows.first()) {
-                    let glyphs = &placed.row.glyphs;
-                    for range in styled.emphasis(i) {
-                        let (Some(from), Some(to)) = (glyphs.get(range.start), glyphs.get(range.end.wrapping_sub(1)))
-                        else {
-                            continue;
-                        };
-                        let x = origin.x + placed.pos.x;
-                        let mark = Rect::from_min_max(
-                            pos2(x + from.pos.x, row.top() + 1.0),
-                            pos2(x + to.pos.x + to.advance_width, row.bottom() - 1.0),
-                        );
-                        text_painter.rect_filled(mark, 2.0, highlight::emphasis_color(line.origin));
+                let parts = segments(&line.text, columns);
+                // Only a wrapped line needs its length for the selection.
+                let len = if parts.len() > 1 { parts.last().map_or(0, |(cols, _)| cols.end) } else { 0 };
+                for (k, (cols, bytes)) in parts.into_iter().enumerate() {
+                    let top = y + k as f32 * line_h;
+                    let galley = text_painter.layout_job(highlight::layout_part(&line.text, bytes, spans, &font));
+                    let origin = pos2(text_left, top + line_h / 2.0 - galley.size().y / 2.0);
+                    let part = Rect::from_min_max(pos2(left, top), pos2(right, top + line_h));
+                    // The part of the line that differs from its counterpart,
+                    // behind the text. Positions come from the laid-out glyphs,
+                    // as wide characters do not keep to the monospace grid.
+                    if let (Some(styled), Some(placed)) = (&styled, galley.rows.first()) {
+                        let glyphs = &placed.row.glyphs;
+                        for range in styled.emphasis(i) {
+                            let (start, end) = (range.start.max(cols.start), range.end.min(cols.end));
+                            if start >= end {
+                                continue;
+                            }
+                            let (Some(from), Some(to)) = (glyphs.get(start - cols.start), glyphs.get(end - cols.start - 1))
+                            else {
+                                continue;
+                            };
+                            let x = origin.x + placed.pos.x;
+                            let mark = Rect::from_min_max(
+                                pos2(x + from.pos.x, part.top() + 1.0),
+                                pos2(x + to.pos.x + to.advance_width, part.bottom() - 1.0),
+                            );
+                            text_painter.rect_filled(mark, 2.0, highlight::emphasis_color(line.origin));
+                        }
                     }
+                    if len == 0 {
+                        text_selection.paint(&text_painter, flat, &galley, origin.x, part, char_w);
+                    } else {
+                        text_selection.paint_part(&text_painter, flat, &galley, origin.x, part, char_w, cols, len);
+                    }
+                    text_painter.galley(origin, galley, theme::text());
                 }
-                text_selection.paint(&text_painter, text.starts[h] + i, &galley, origin.x, row, char_w);
-                text_painter.galley(origin, galley, theme::text());
             }
         }
 
         if diff.truncated {
-            let y = content.top() + height - HUNK_H;
+            let y = content.top() + height - hunk_h;
             painter.text(
-                pos2((left + right) / 2.0, y + HUNK_H / 2.0),
+                pos2((left + right) / 2.0, y + hunk_h / 2.0),
                 Align2::CENTER_CENTER,
                 "This diff is very large; the rest is not shown.",
                 theme::font(12.0),
@@ -820,17 +1006,65 @@ mod tests {
         assert_eq!(text.locate(3), (1, 0));
 
         // Where points fall: hunk headers lead to the first line after them.
-        let tops = [0.0, HUNK_H + 3.0 * LINE_H];
-        assert_eq!(text.line_at(&tops, -3.0), (0, Some(0)));
-        assert_eq!(text.line_at(&tops, 5.0), (0, Some(0)));
-        assert_eq!(text.line_at(&tops, HUNK_H + LINE_H * 1.5), (1, None));
-        assert_eq!(text.line_at(&tops, tops[1] + 4.0), (3, Some(0)));
-        assert_eq!(text.line_at(&tops, tops[1] + HUNK_H + LINE_H * 5.0), (3, Some(usize::MAX)));
+        const LINE_H: f32 = 19.0;
+        let geometry = Geometry::new(&text, LINE_H, HUNK_H, None);
+        let tops = &geometry.tops;
+        assert_eq!(tops, &[0.0, HUNK_H + 3.0 * LINE_H]);
+        assert_eq!(geometry.height, HUNK_H * 2.0 + 4.0 * LINE_H);
+        assert_eq!(geometry.locate(&text, -3.0), (0, 0, Some(0)));
+        assert_eq!(geometry.locate(&text, 5.0), (0, 0, Some(0)));
+        assert_eq!(geometry.locate(&text, HUNK_H + LINE_H * 1.5), (1, 0, None));
+        assert_eq!(geometry.locate(&text, tops[1] + 4.0), (3, 0, Some(0)));
+        assert_eq!(geometry.locate(&text, tops[1] + HUNK_H + LINE_H * 5.0), (3, 0, Some(usize::MAX)));
+        assert_eq!(geometry.lines_between(&text, 0, 0.0, HUNK_H + LINE_H * 1.5), 0..2);
+        assert_eq!(geometry.lines_between(&text, 1, 0.0, tops[1] + 2.0), 0..0);
 
         // Copied: no headers, no markers, tabs as tabs, LF line endings.
         let mut selection = textsel::Selection::default();
         selection.select_all(&text);
         assert_eq!(selection.text(&text).as_deref(), Some("fn main() {\n\told();\n\tnew();\n}"));
+    }
+
+    #[test]
+    fn wrapped_lines_take_rows_and_points_find_them() {
+        let line = |text: &str| DiffLine { origin: '+', old_no: None, new_no: Some(1), text: text.to_owned() };
+        let long = "word ".repeat(10); // 50 columns: three rows of 20
+        let diff = FileDiff {
+            hunks: vec![
+                Hunk { header: String::new(), raw: Vec::new(), lines: vec![line("short"), line(&long), line("end")] },
+                Hunk { header: String::new(), raw: Vec::new(), lines: vec![line(&long)] },
+            ],
+            ..Default::default()
+        };
+        let text = DiffText::new(&diff);
+        let rows = first_rows(diff.hunks.iter().flat_map(|hunk| &hunk.lines).map(|line| line.text.as_str()), 20);
+        assert_eq!(rows, [0, 1, 4, 5, 8]);
+
+        let (line_h, hunk_h) = (10.0, 30.0);
+        let geometry = Geometry::new(&text, line_h, hunk_h, Some(Arc::new(rows)));
+        // The first hunk: a header and five rows; the second: a header and three.
+        assert_eq!(geometry.tops, [0.0, 80.0]);
+        assert_eq!(geometry.height, 80.0 + 30.0 + 30.0);
+        assert_eq!(geometry.line_top(&text, 0, 2), 30.0 + 40.0);
+        assert_eq!(geometry.line_rows(1), 3);
+        // Each row of the long line, and the line after it.
+        assert_eq!(geometry.locate(&text, 35.0), (0, 0, None));
+        assert_eq!(geometry.locate(&text, 45.0), (1, 0, None));
+        assert_eq!(geometry.locate(&text, 65.0), (1, 2, None));
+        assert_eq!(geometry.locate(&text, 75.0), (2, 0, None));
+        assert_eq!(geometry.locate(&text, 80.0 + 30.0 + 15.0), (3, 1, None));
+        // Only the lines with a row in view are painted.
+        assert_eq!(geometry.lines_between(&text, 0, 50.0, 62.0), 1..2);
+        assert_eq!(geometry.lines_between(&text, 0, 0.0, 1000.0), 0..3);
+
+        // The rows of a line as painted: columns and bytes of each.
+        let parts = segments(&long, Some(20));
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], (0..20, 0..20));
+        assert_eq!(parts[2], (40..50, 40..50));
+        assert_eq!(segments("é wrapped", None), [(0..usize::MAX, 0.."é wrapped".len())]);
+        let wide = segments("éééé éééé", Some(5));
+        assert_eq!(wide, [(0..5, 0..9), (5..9, 9..17)]);
     }
 
     #[test]

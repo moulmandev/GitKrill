@@ -302,6 +302,8 @@ pub struct FileDiff {
     pub max_chars: usize,
     /// Both versions of a binary image file, decoded for the preview.
     pub images: Option<std::sync::Arc<picture::ImageDiff>>,
+    /// The encoding and tab width the lines were prepared with.
+    pub format: text::Format,
 }
 
 impl FileDiff {

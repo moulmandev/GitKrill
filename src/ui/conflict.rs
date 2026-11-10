@@ -34,12 +34,16 @@ use crate::git::conflict::{
     self, Chunk, ConflictFile, Content, Draft, Resolution, Segment, Side, SideInfo, Stage, TextMerge,
     Whole,
 };
-use crate::git::{ChangeKind, DiffTarget, Oid};
+use crate::git::{ChangeKind, DiffTarget, Oid, text};
+use crate::prefs::editor;
 use crate::state::{Overlay, RepoTab, Shared, ToastKind};
 use crate::theme::{self, icons};
 use crate::ui::widgets::{self, icon_button, tint_button, tint_button_at, tint_button_size};
 
-const LINE_H: f32 = 19.0;
+/// Height of a row of text, from the font size in Preferences > Editor.
+fn line_h() -> f32 {
+    editor::look().line_height()
+}
 /// Height of the strip of controls above each conflict.
 const HEAD_H: f32 = 26.0;
 const PANE_HEAD_H: f32 = 30.0;
@@ -47,6 +51,8 @@ const TOOLBAR_H: f32 = 38.0;
 const NOTICE_H: f32 = 26.0;
 /// Least width of the line-number column; long files get a wider one.
 const MIN_GUTTER: f32 = 48.0;
+/// The margin left of the text when line numbers are off.
+const NO_NUMBERS_GUTTER: f32 = 12.0;
 const TEXT_PAD: f32 = 8.0;
 const SCROLLBAR: f32 = 12.0;
 /// Share of the height given to the two sides; the result gets the rest.
@@ -54,7 +60,9 @@ const SIDES_SHARE: f32 = 0.45;
 /// Lines are cut off after this many characters when painted.
 const MAX_SHOWN: usize = 4000;
 /// Space kept above a conflict that previous / next scrolls to.
-const JUMP_MARGIN: f32 = LINE_H * 2.0;
+fn jump_margin() -> f32 {
+    line_h() * 2.0
+}
 
 /// Resolvers that were replaced while they had unsaved work, for instance
 /// because another conflicted file was clicked. `Resolver::start` picks
@@ -160,6 +168,8 @@ struct Resolver {
     saved: Draft,
     plan: Plan,
     replan: bool,
+    /// The row height the plan was made for; another font size makes another.
+    plan_line_h: f32,
     scroll: Vec2,
     /// The conflict that previous / next start from.
     current: usize,
@@ -189,6 +199,7 @@ impl Resolver {
             saved: Draft::default(),
             plan: Plan::default(),
             replan: true,
+            plan_line_h: 0.0,
             scroll: Vec2::ZERO,
             current: 0,
             jump: None,
@@ -269,6 +280,16 @@ impl Resolver {
                 }
                 Err(message) => self.phase = Phase::Failed(message),
             }
+        }
+
+        // The repository's encoding was changed with nothing decided yet:
+        // read the file again in the new one.
+        if matches!(self.phase, Phase::Ready)
+            && !self.is_dirty()
+            && self.saving.is_none()
+            && self.file.as_ref().is_some_and(|file| file.default_encoding != text::encoding_for(&self.repo))
+        {
+            self.load(tab);
         }
 
         // A save that has finished. Its error, if any, was already shown by
@@ -365,7 +386,8 @@ impl Resolver {
         mark_resolved: bool,
         then_close: bool,
     ) {
-        let Some(bytes) = file.render(&self.draft) else { return };
+        // In the file's encoding, with the line endings Preferences > Editor asks for.
+        let Some(bytes) = file.output(&self.draft, shared.settings.editor.eol) else { return };
         let name = file_name(&file.path);
         let done = if mark_resolved {
             (format!("Resolved {name}"), "The result is written and staged.".to_owned())
@@ -596,7 +618,7 @@ impl Plan {
         let mut above = [0usize; 3];
         let mut conflict = 0;
         let mut push = |plan: &mut Plan, kind: Kind, rows: usize, head: f32, lines: [usize; 3]| {
-            let bottom = top + head + rows as f32 * LINE_H;
+            let bottom = top + head + rows as f32 * line_h();
             plan.blocks.push(Block { kind, top, bottom, rows, above });
             top = bottom;
             for (count, add) in above.iter_mut().zip(lines) {
@@ -683,8 +705,8 @@ impl Plan {
 
 /// Of `count` rows starting at `top`, the ones inside `clip`.
 fn visible_rows(top: f32, count: usize, clip: Rect) -> Range<usize> {
-    let first = ((clip.top() - top) / LINE_H).floor().max(0.0) as usize;
-    let last = (((clip.bottom() - top) / LINE_H).ceil().max(0.0) as usize).min(count);
+    let first = ((clip.top() - top) / line_h()).floor().max(0.0) as usize;
+    let last = (((clip.bottom() - top) / line_h()).ceil().max(0.0) as usize).min(count);
     first.min(last)..last
 }
 
@@ -866,12 +888,13 @@ fn text_ui(
     edited_outside: bool,
     free: Rect,
 ) {
-    if view.replan {
+    if view.replan || view.plan_line_h != line_h() {
         view.plan = Plan::build(merge, &view.draft, view.editing.as_ref());
         view.replan = false;
+        view.plan_line_h = line_h();
     }
     if let Some(block) = view.jump.take().and_then(|index| view.plan.conflict(index)) {
-        view.scroll.y = block.top - JUMP_MARGIN;
+        view.scroll.y = block.top - jump_margin();
     }
 
     let mut actions = Vec::new();
@@ -893,7 +916,7 @@ fn text_ui(
 
     // Geometry: two sides on top, the result below, one scrollbar for all.
     let content = Rect::from_min_max(body.min, pos2(body.right() - SCROLLBAR, body.bottom()));
-    let sides_h = ((content.height() - PANE_HEAD_H * 2.0) * SIDES_SHARE).floor().max(LINE_H);
+    let sides_h = ((content.height() - PANE_HEAD_H * 2.0) * SIDES_SHARE).floor().max(line_h());
     let middle = content.center().x.round();
     let heads = Rect::from_min_max(content.min, pos2(content.right(), content.top() + PANE_HEAD_H));
     let sides = Rect::from_min_max(heads.left_bottom(), pos2(content.right(), heads.bottom() + sides_h));
@@ -902,11 +925,14 @@ fn text_ui(
     let ours_rect = Rect::from_min_max(sides.min, pos2(middle, sides.bottom()));
     let theirs_rect = Rect::from_min_max(pos2(middle + 1.0, sides.top()), sides.max);
 
-    let font = theme::mono(12.5);
-    let char_w = ui.painter().fonts_mut(|f| f.glyph_width(&font, 'm'));
+    // Preferences > Editor: the font, its size, line numbers or not.
+    let look = editor::look();
+    let font = look.font();
+    let (char_w, digit_w) =
+        ui.painter().fonts_mut(|f| (f.glyph_width(&font, 'm'), f.glyph_width(&number_font(), '0')));
     // Room for the largest line number.
     let digits = view.plan.lines.max(1).ilog10() + 1;
-    let gutter = (digits as f32 * 7.0 + 22.0).max(MIN_GUTTER);
+    let gutter = if look.numbers { (digits as f32 * digit_w + 22.0).max(MIN_GUTTER) } else { NO_NUMBERS_GUTTER };
     let text_w = view.plan.longest.min(MAX_SHOWN) as f32 * char_w + 40.0;
     let max_x = (text_w - (ours_rect.width() - gutter - TEXT_PAD)).max(0.0);
     let result_rect = if max_x > 0.0 {
@@ -917,9 +943,9 @@ fn text_ui(
     let view_h = sides.height().min(result_rect.height());
     // A little slack so the last rows clear the bottom edge, and enough for
     // "next conflict" to bring even the last one to its usual place.
-    let to_end = if view.plan.height > view_h { view.plan.height - view_h + LINE_H * 2.0 } else { 0.0 };
+    let to_end = if view.plan.height > view_h { view.plan.height - view_h + line_h() * 2.0 } else { 0.0 };
     let last_conflict = view.plan.blocks.iter().rev().find(|block| matches!(block.kind, Kind::Conflict { .. }));
-    let max_y = to_end.max(last_conflict.map_or(0.0, |block| block.top - JUMP_MARGIN));
+    let max_y = to_end.max(last_conflict.map_or(0.0, |block| block.top - jump_margin()));
 
     // Keyboard and wheel. Keys are left alone while a dialog is open or
     // another text field (the commit message, say) is being typed in.
@@ -935,7 +961,7 @@ fn text_ui(
             }
         }
         if !typing_elsewhere && view.editing.is_none() {
-            let page = view_h - LINE_H * 2.0;
+            let page = view_h - line_h() * 2.0;
             if key(Modifiers::NONE, Key::PageDown) {
                 view.scroll.y += page;
             }
@@ -1166,7 +1192,7 @@ fn pane_header(ui: &Ui, rect: Rect, info: &SideInfo, color: Color32) {
 }
 
 fn row_job(text: &str, font: &FontId, color: Color32) -> LayoutJob {
-    let format = TextFormat { font_id: font.clone(), color, line_height: Some(LINE_H), ..Default::default() };
+    let format = TextFormat { font_id: font.clone(), color, line_height: Some(line_h()), ..Default::default() };
     let mut job = LayoutJob::single_section(text.to_owned(), format);
     job.wrap.max_width = f32::INFINITY;
     job
@@ -1183,12 +1209,20 @@ fn draw_line(painter: &Painter, x: f32, top: f32, text: &str, font: &FontId, col
     painter.galley(pos2(x, top), galley, color);
 }
 
+/// The font of line numbers: the code font, a little smaller.
+fn number_font() -> FontId {
+    theme::code(editor::look().size - 1.5)
+}
+
 fn draw_number(painter: &Painter, gutter: f32, pane: Rect, top: f32, number: usize) {
+    if !editor::look().numbers {
+        return;
+    }
     painter.text(
-        pos2(pane.left() + gutter - 10.0, top + LINE_H / 2.0),
+        pos2(pane.left() + gutter - 10.0, top + line_h() / 2.0),
         Align2::RIGHT_CENTER,
         number.to_string(),
-        theme::mono(11.0),
+        number_font(),
         theme::text_faint(),
     );
 }
@@ -1196,7 +1230,7 @@ fn draw_number(painter: &Painter, gutter: f32, pane: Rect, top: f32, number: usi
 /// A remark in place of text: "no lines on this side".
 fn draw_remark(painter: &Painter, gutter: f32, pane: Rect, top: f32, text: &str, color: Color32) {
     painter.text(
-        pos2(pane.left() + gutter + TEXT_PAD, top + LINE_H / 2.0),
+        pos2(pane.left() + gutter + TEXT_PAD, top + line_h() / 2.0),
         Align2::LEFT_CENTER,
         text,
         theme::font(12.0),
@@ -1206,7 +1240,7 @@ fn draw_remark(painter: &Painter, gutter: f32, pane: Rect, top: f32, text: &str,
 
 /// The part of a row right of the line numbers.
 fn row_rect(gutter: f32, pane: Rect, top: f32) -> Rect {
-    Rect::from_min_max(pos2(pane.left() + gutter, top), pos2(pane.right(), top + LINE_H))
+    Rect::from_min_max(pos2(pane.left() + gutter, top), pos2(pane.right(), top + line_h()))
 }
 
 /// A child `Ui` clipped to a pane, so neither paint nor clicks leak out of it.
@@ -1259,7 +1293,7 @@ fn side_pane(ui: &mut Ui, scene: &Scene<'_>, rect: Rect, side: Side, actions: &m
             Kind::Stable { seg, from, to } => {
                 let Segment::Stable(chunk) = &scene.merge.segments[seg] else { continue };
                 for row in visible_rows(top, to - from, rect) {
-                    let y = top + row as f32 * LINE_H;
+                    let y = top + row as f32 * line_h();
                     draw_number(&painter, scene.gutter, rect, y, block.above[pane] + row + 1);
                     draw_line(&text_painter, text_x, y, &chunk.line(from + row), &scene.font, theme::text());
                 }
@@ -1270,7 +1304,7 @@ fn side_pane(ui: &mut Ui, scene: &Scene<'_>, rect: Rect, side: Side, actions: &m
                 draw_number(&painter, scene.gutter, rect, top, block.above[pane] + 1);
                 draw_line(&text_painter, text_x, top, &chunk.line(line), &scene.font, theme::text());
                 for row in 1..block.rows {
-                    let filler = row_rect(scene.gutter, rect, top + row as f32 * LINE_H);
+                    let filler = row_rect(scene.gutter, rect, top + row as f32 * line_h());
                     painter.rect_filled(filler, 0.0, theme::bg_void());
                 }
             }
@@ -1329,7 +1363,7 @@ fn side_pane(ui: &mut Ui, scene: &Scene<'_>, rect: Rect, side: Side, actions: &m
                     (false, false) => (0.04, theme::text_dim()),
                 };
                 for row in visible_rows(body_top, block.rows, rect) {
-                    let y = body_top + row as f32 * LINE_H;
+                    let y = body_top + row as f32 * line_h();
                     if row < chunk.len() {
                         let fill = theme::mix(theme::bg_app(), color, tint);
                         painter.rect_filled(row_rect(scene.gutter, rect, y), 0.0, fill);
@@ -1345,7 +1379,7 @@ fn side_pane(ui: &mut Ui, scene: &Scene<'_>, rect: Rect, side: Side, actions: &m
                 if used != Used::No && !chunk.is_empty() {
                     let bar = Rect::from_min_size(
                         pos2(rect.left() + scene.gutter, body_top),
-                        vec2(3.0, chunk.len() as f32 * LINE_H),
+                        vec2(3.0, chunk.len() as f32 * line_h()),
                     );
                     painter.rect_filled(bar, 0.0, color);
                 }
@@ -1399,7 +1433,7 @@ fn result_pane(
             Kind::Stable { seg, from, to } => {
                 let Segment::Stable(chunk) = &scene.merge.segments[seg] else { continue };
                 for row in visible_rows(top, to - from, rect) {
-                    let y = top + row as f32 * LINE_H;
+                    let y = top + row as f32 * line_h();
                     draw_number(&painter, scene.gutter, rect, y, block.above[2] + row + 1);
                     draw_line(&text_painter, text_x, y, &chunk.line(from + row), &scene.font, theme::text());
                 }
@@ -1408,12 +1442,12 @@ fn result_pane(
                 let target = Target::Line { seg, line };
                 let area = Rect::from_min_max(
                     pos2(rect.left() + scene.gutter, top),
-                    pos2(rect.right(), top + block.rows as f32 * LINE_H),
+                    pos2(rect.right(), top + block.rows as f32 * line_h()),
                 );
                 painter.rect_filled(area, 0.0, theme::mix(theme::bg_app(), typed(), 0.13));
                 if let Some(open) = editing.as_mut().filter(|e| e.target == target) {
                     for row in visible_rows(top, block.rows, rect) {
-                        let y = top + row as f32 * LINE_H;
+                        let y = top + row as f32 * line_h();
                         draw_number(&painter, scene.gutter, rect, y, block.above[2] + row + 1);
                     }
                     cursor = editor(ui, scene, rect, area, text_x, text_w, open, actions);
@@ -1423,12 +1457,12 @@ fn result_pane(
                         draw_remark(&painter, scene.gutter, rect, top, "line removed", theme::text_dim());
                     }
                     for (row, text) in typed.split('\n').enumerate().take(text_rows(typed)) {
-                        let y = top + row as f32 * LINE_H;
+                        let y = top + row as f32 * line_h();
                         draw_number(&painter, scene.gutter, rect, y, block.above[2] + row + 1);
                         draw_line(&text_painter, text_x, y, text, &scene.font, theme::text_bright());
                     }
                     let size = tint_button_size(ui, "Restore");
-                    let corner = pos2(rect.right() - size.x - 8.0, top + (LINE_H - size.y) / 2.0);
+                    let corner = pos2(rect.right() - size.x - 8.0, top + (line_h() - size.y) / 2.0);
                     let button = Rect::from_min_size(corner, size);
                     if ui.rect_contains_pointer(area)
                         && tint_button_at(ui, button, "Restore", theme::red())
@@ -1500,12 +1534,12 @@ fn result_pane(
                 let body_top = top + HEAD_H;
                 let area = Rect::from_min_max(
                     pos2(rect.left() + scene.gutter, body_top),
-                    pos2(rect.right(), body_top + block.rows as f32 * LINE_H),
+                    pos2(rect.right(), body_top + block.rows as f32 * line_h()),
                 );
                 if let Some(open) = editing.as_mut().filter(|e| e.target == target) {
                     painter.rect_filled(area, 0.0, theme::mix(theme::bg_app(), typed(), 0.13));
                     for row in visible_rows(body_top, text_rows(&open.text).max(1), rect) {
-                        let y = body_top + row as f32 * LINE_H;
+                        let y = body_top + row as f32 * line_h();
                         draw_number(&painter, scene.gutter, rect, y, block.above[2] + row + 1);
                     }
                     cursor = editor(ui, scene, rect, area, text_x, text_w, open, actions);
@@ -1526,16 +1560,16 @@ fn result_pane(
                     let shown = rows.start.min(count)..rows.end.min(count);
                     let lines = resolved_lines(choice, ours, theirs, shown.clone());
                     for (row, (text, from)) in shown.zip(lines) {
-                        let y = body_top + row as f32 * LINE_H;
+                        let y = body_top + row as f32 * line_h();
                         let color = from.map_or(typed(), side_color);
                         let row_area = row_rect(scene.gutter, rect, y);
                         painter.rect_filled(row_area, 0.0, theme::mix(theme::bg_app(), color, 0.15));
-                        painter.rect_filled(Rect::from_min_size(row_area.min, vec2(3.0, LINE_H)), 0.0, color);
+                        painter.rect_filled(Rect::from_min_size(row_area.min, vec2(3.0, line_h())), 0.0, color);
                         draw_number(&painter, scene.gutter, rect, y, block.above[2] + row + 1);
                         draw_line(&text_painter, text_x, y, &text, &scene.font, theme::text_bright());
                     }
                     for row in rows.start.max(count)..rows.end {
-                        let y = body_top + row as f32 * LINE_H;
+                        let y = body_top + row as f32 * line_h();
                         painter.rect_filled(row_rect(scene.gutter, rect, y), 0.0, theme::bg_void());
                         if count == 0 && row == 0 {
                             let remark = "no lines here in the result";
@@ -1557,14 +1591,14 @@ fn result_pane(
         let y = pos.y - rect.top() + scene.scroll.y;
         let column = ((pos.x - text_x) / scene.char_w).round().max(0.0) as usize;
         if let Some(block) = scene.plan.at(y) {
-            let row = ((y - block.top) / LINE_H).max(0.0) as usize;
+            let row = ((y - block.top) / line_h()).max(0.0) as usize;
             match block.kind {
                 Kind::Stable { seg, from, .. } => {
                     actions.push(Action::Edit(Target::Line { seg, line: from + row }, (0, column)));
                 }
                 Kind::Edited { seg, line } => actions.push(Action::Edit(Target::Line { seg, line }, (row, column))),
                 Kind::Conflict { index } if y >= block.top + HEAD_H => {
-                    let row = ((y - block.top - HEAD_H) / LINE_H) as usize;
+                    let row = ((y - block.top - HEAD_H) / line_h()) as usize;
                     actions.push(Action::Edit(Target::Conflict(index), (row, column)));
                 }
                 Kind::Conflict { index } => actions.push(Action::Focus(index)),

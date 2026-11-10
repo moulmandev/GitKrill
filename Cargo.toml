@@ -14,6 +14,9 @@ dirs = "7.0.0"
 # built against egui 0.36, so bump the two together.
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
 egui-phosphor = "0.14.0"
+# Reading and writing files in the encoding a repository is set to
+# (Preferences > Encoding): Windows-1252, Shift_JIS, GBK and the like.
+encoding_rs = "0.8.44"
 git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2"] }
 image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "webp"] }
 notify = "8"
@@ -21,6 +24,9 @@ rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
+# Already in the build through egui (it parses fonts with it); used directly
+# to check a font file before egui loads it (Preferences > Editor).
+skrifa = { version = "0.44", default-features = false, features = ["std"] }
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 ureq = "3.5.1"
 

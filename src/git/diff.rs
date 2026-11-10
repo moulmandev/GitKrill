@@ -5,7 +5,7 @@ use git2::{DiffFindOptions, DiffFormat, DiffOptions};
 
 use super::repo::{Loader, delta_kind, lossy};
 use super::picture;
-use super::text::{display_text, source_text};
+use super::text::{self, Encoding, display_text_in, source_text_in};
 use super::{DiffLine, DiffSource, DiffTarget, FileDiff, Hunk};
 
 /// Beyond this many lines the rest of the diff is not shown.
@@ -51,7 +51,9 @@ impl Loader {
             let _ = diff.find_similar(Some(&mut find));
         }
 
-        let mut out = FileDiff::default();
+        // How lines become text: the repository's encoding, the tab width.
+        let format = text::format_for(repo.workdir().unwrap_or(repo.path()));
+        let mut out = FileDiff { format, ..FileDiff::default() };
         // Blob ids of both sides of the file shown, for the image preview.
         let mut blobs = None;
         let mut wanted = false;
@@ -108,7 +110,7 @@ impl Loader {
                     }
                     shown += 1;
 
-                    let text = display_text(content);
+                    let text = display_text_in(content, &format);
                     out.max_chars = out.max_chars.max(text.chars().count());
                     hunk.lines.push(DiffLine {
                         origin,
@@ -229,11 +231,12 @@ fn split_hunk(raw: &[u8]) -> Option<(&[u8], Vec<RawLine<'_>>)> {
 
 impl Hunk {
     /// Each line's text as it is in the file (see `text::source_text`), in
-    /// the order of `lines`: what copying gives back. `None` if the patch
+    /// the order of `lines`: what copying gives back. `encoding` is the one
+    /// the diff was shown in (`FileDiff::format`). `None` if the patch
     /// cannot be read back into lines.
-    pub fn sources(&self) -> Option<Vec<std::borrow::Cow<'_, str>>> {
+    pub fn sources(&self, encoding: Encoding) -> Option<Vec<std::borrow::Cow<'_, str>>> {
         let (_, lines) = split_hunk(&self.raw)?;
-        Some(lines.iter().map(|line| source_text(line.body)).collect())
+        Some(lines.iter().map(|line| source_text_in(line.body, encoding)).collect())
     }
 }
 

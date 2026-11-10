@@ -551,6 +551,14 @@ impl RepoTab {
         self.diff = Some(DiffView { target, data: None });
     }
 
+    /// Loads the open diff again, as for a refresh: after Preferences >
+    /// Editor or Encoding changed how its lines are read.
+    pub fn reload_diff(&mut self) {
+        if let (Some(view), Some(handle)) = (&self.diff, &self.handle) {
+            handle.diff(view.target.clone());
+        }
+    }
+
     pub fn load_more(&mut self) {
         let Some(snap) = &self.snap else { return };
         // Only once the current page has arrived, or scrolling at the bottom

@@ -28,9 +28,11 @@ use eframe::egui::{
 };
 
 use crate::git::blame::{Blame, BlameCommit, BlameError, Cancel, FileCommit, HistoryCursor};
-use crate::git::{ChangeKind, DiffSource, DiffTarget, FileChange, FileDiff, Oid, RepoSnapshot, short};
+use crate::git::{ChangeKind, DiffSource, DiffTarget, FileChange, FileDiff, Oid, RepoSnapshot, short, text};
+use crate::prefs::editor;
 use crate::state::{RepoTab, Selection, Shared, ToastKind, format_time, relative_time};
 use crate::theme::{self, icons};
+use crate::ui::diff;
 use crate::ui::textsel::{self, Lines, Pos};
 use crate::ui::widgets::{self, elided, galley_left, menu_item, tint_button};
 
@@ -49,7 +51,6 @@ const DIFF_KEY: &str = "history:diff";
 const ROW_H: f32 = 46.0;
 const STRIP_H: f32 = 30.0;
 const HEADER_H: f32 = 54.0;
-const LINE_H: f32 = 19.0;
 /// Width of the commit column beside the blamed lines, when there is room.
 const ANNOT_W: f32 = 304.0;
 /// A history narrower than this puts the list above the diff, not beside it.
@@ -389,6 +390,9 @@ struct DiffSlot {
     requested: Option<Instant>,
     /// The last diff that was shown, kept up briefly while the next one loads.
     previous: Option<(DiffTarget, Arc<FileDiff>)>,
+    /// The text generation (see `git::text::generation`) a reload of `data`
+    /// was last asked for.
+    reloaded_for: u64,
 }
 
 impl HistoryView {
@@ -454,6 +458,20 @@ impl HistoryView {
                 slot.previous = Some((target.clone(), diff.clone()));
             }
             slot.data = Some(result);
+        }
+
+        // Read before the encoding or tab width changed: read it again. It
+        // stays on screen until the new one is in.
+        let slot = &mut self.history.diff;
+        let generation = text::generation();
+        if let (Some(Ok(diff)), Some(target)) = (&slot.data, &slot.target)
+            && diff.format.generation != generation
+            && slot.reloaded_for != generation
+        {
+            slot.reloaded_for = generation;
+            let (token, target) = (next_token(), target.clone());
+            slot.token = token;
+            tab.spawn_job(DIFF_KEY, move |loader| DiffLoaded { token, result: loader.diff(&target) });
         }
     }
 
@@ -1017,7 +1035,9 @@ impl HistoryView {
         let following = self.at.is_none();
         let head = if following { snap.head.oid } else { None };
         let dirty = (following && working_change(snap, &self.path).is_some()).then_some(snap);
-        let current = state.stamp.as_ref().is_some_and(|stamp| stamp.matches(head, dirty));
+        // Lines read before the encoding or tab width changed are read again.
+        let stale = matches!(&state.data, Some(Ok(blame)) if blame.format.generation != text::generation());
+        let current = !stale && state.stamp.as_ref().is_some_and(|stamp| stamp.matches(head, dirty));
         // One at a time: a blame that is still running is left to finish, and
         // what it shows is brought up to date afterwards.
         if !current && state.task.is_none() {
@@ -1228,19 +1248,69 @@ fn commit_menu(ui: &mut Ui, commit: &BlameCommit, action: &mut Option<Action>) {
     }
 }
 
+/// Where the lines of a blame are, from the top of its content. With word
+/// wrap a line takes one row or more; without, exactly one.
+struct BlameRows {
+    line_h: f32,
+    /// With word wrap: the first row of every line, then the total.
+    rows: Option<Arc<Vec<u32>>>,
+    lines: usize,
+}
+
+impl BlameRows {
+    /// The first row of line `line` (or the total for one past the last).
+    fn row(&self, line: usize) -> usize {
+        self.rows.as_ref().map_or(line, |rows| rows[line] as usize)
+    }
+
+    fn top(&self, line: usize) -> f32 {
+        self.row(line) as f32 * self.line_h
+    }
+
+    fn height(&self) -> f32 {
+        self.top(self.lines)
+    }
+
+    /// The line that row `row` belongs to.
+    fn line_of_row(&self, row: usize) -> usize {
+        match &self.rows {
+            None => row,
+            Some(rows) => rows[..self.lines].partition_point(|first| *first as usize <= row).saturating_sub(1),
+        }
+        .min(self.lines.saturating_sub(1))
+    }
+}
+
 fn blame_body(ui: &mut Ui, blame: &Arc<Blame>, heat: &[f32], selected: Option<usize>, action: &mut Option<Action>) {
-    let font = theme::mono(12.5);
-    let small = theme::mono(11.5);
-    let (char_w, digit_w) = ui.painter().fonts_mut(|f| (f.glyph_width(&font, 'm'), f.glyph_width(&small, '0')));
+    // Preferences > Editor: font, size, line numbers, wrapping.
+    let look = editor::look();
+    let font = look.font();
+    let small = look.small();
+    let line_h = look.line_height();
+    let sha_font = theme::mono(11.5);
+    let (char_w, digit_w, sha_w) = ui.painter().fonts_mut(|f| {
+        (f.glyph_width(&font, 'm'), f.glyph_width(&small, '0'), f.glyph_width(&sha_font, '0'))
+    });
     let lines = blame.lines.len();
-    let number_w = lines.to_string().len().max(3) as f32 * digit_w + 20.0;
+    let number_w = if look.numbers { lines.to_string().len().max(3) as f32 * digit_w + 20.0 } else { 6.0 };
     // In a narrow view the commit column gives way to the code: first it
     // shrinks, then it drops the date.
     let annot_w = (ui.available_width() * 0.4).clamp(150.0, ANNOT_W).round();
     let with_date = annot_w >= 230.0;
     let gutter = annot_w + number_w;
-    let text_w = gutter + 10.0 + blame.max_chars as f32 * char_w + 40.0;
-    let height = lines as f32 * LINE_H;
+    let view = ui.available_rect_before_wrap();
+    // Wrapped, the code fits the view and only scrolls up and down.
+    let columns = look.wrap.then(|| {
+        let room = view.width() - gutter - 10.0 - diff::WRAP_MARGIN;
+        ((room / char_w).floor().max(0.0) as usize).max(diff::MIN_WRAP_COLUMNS)
+    });
+    let rows = columns.map(|columns| {
+        let count = || diff::first_rows(blame.lines.iter().map(String::as_str), columns);
+        diff::wrap_rows(ui, ui.id().with("blame-wrap"), blame, columns, count)
+    });
+    let rows = BlameRows { line_h, rows, lines };
+    let text_w = if columns.is_some() { 0.0 } else { gutter + 10.0 + blame.max_chars as f32 * char_w + 40.0 };
+    let height = rows.height();
 
     // Selected text. It is dropped when another blame is shown, but not when
     // the same file is blamed again with the same result.
@@ -1254,14 +1324,15 @@ fn blame_body(ui: &mut Ui, blame: &Arc<Blame>, heat: &[f32], selected: Option<us
         (blame.rev, &blame.lines).hash(&mut hasher);
         hasher.finish()
     });
-    let view = ui.available_rect_before_wrap();
 
-    ScrollArea::both().id_salt("blame-body").auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
+    let scroll = if columns.is_some() { ScrollArea::vertical() } else { ScrollArea::both() };
+    scroll.id_salt("blame-body").auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
         // Exactly the size of the file, not stretched to fill the view: a
         // scroll area whose content is "as large as the space" shows a scroll
         // bar whenever rounding makes the two differ by a hair. What lies
         // beyond a short file is painted all the same.
-        let (content, _) = ui.allocate_exact_size(vec2(text_w, height), Sense::hover());
+        let width = if columns.is_some() { ui.available_width() } else { text_w };
+        let (content, _) = ui.allocate_exact_size(vec2(width, height), Sense::hover());
         let painter = ui.painter().clone();
         let clip = painter.clip_rect();
 
@@ -1287,12 +1358,15 @@ fn blame_body(ui: &mut Ui, blame: &Arc<Blame>, heat: &[f32], selected: Option<us
             if y < 0.0 {
                 return Pos::new(0, 0);
             }
-            let line = (y / LINE_H) as usize;
-            if line >= lines {
+            let row = (y / line_h) as usize;
+            if row >= rows.row(lines) {
                 return Pos::new(lines - 1, blame.lines[lines - 1].chars().count());
             }
-            let galley = painter.layout_no_wrap(blame.lines[line].clone(), font.clone(), theme::text());
-            Pos::new(line, textsel::column_at(&galley, pos.x - text_left))
+            let line = rows.line_of_row(row);
+            let parts = diff::segments(&blame.lines[line], columns);
+            let (cols, bytes) = parts[(row - rows.row(line)).min(parts.len() - 1)].clone();
+            let galley = painter.layout_no_wrap(blame.lines[line][bytes].to_owned(), font.clone(), theme::text());
+            Pos::new(line, cols.start + textsel::column_at(&galley, pos.x - text_left))
         };
         let text_response = state.text.interact(ui, ui.id().with("text"), text_rect, view, &text, hit);
         if text_response.secondary_clicked() {
@@ -1311,8 +1385,10 @@ fn blame_body(ui: &mut Ui, blame: &Arc<Blame>, heat: &[f32], selected: Option<us
             }
         });
 
-        let first = (viewport.min.y / LINE_H).floor().max(0.0) as usize;
-        let last = ((viewport.max.y / LINE_H).ceil().max(0.0) as usize).min(lines);
+        let first_row = (viewport.min.y / line_h).floor().max(0.0) as usize;
+        let last_row = (viewport.max.y / line_h).ceil().max(0.0) as usize;
+        let first = rows.line_of_row(first_row);
+        let last = if last_row == 0 { 0 } else { (rows.line_of_row(last_row - 1) + 1).min(lines) };
 
         // Blocks first: tint, separator and the commit they come from.
         let mut index = blame.block_of(first).unwrap_or(blame.blocks.len());
@@ -1320,8 +1396,8 @@ fn blame_body(ui: &mut Ui, blame: &Arc<Blame>, heat: &[f32], selected: Option<us
             let commit = &blame.commits[block.commit];
             let warmth = heat.get(block.commit).copied().unwrap_or(0.0);
             let color = age_color(commit, warmth);
-            let top = content.top() + block.start as f32 * LINE_H;
-            let bottom = top + block.len as f32 * LINE_H;
+            let top = content.top() + rows.top(block.start);
+            let bottom = content.top() + rows.top(block.start + block.len);
             // Only the part in view is laid out, however long the block is.
             let seen = Rect::from_min_max(pos2(left, top.max(view_top)), pos2(right, bottom.min(view_bottom)));
             let annot = Rect::from_min_max(seen.min, pos2(left + annot_w, seen.bottom()));
@@ -1350,8 +1426,9 @@ fn blame_body(ui: &mut Ui, blame: &Arc<Blame>, heat: &[f32], selected: Option<us
 
             // The commit is named on the block's first line that is in view,
             // so it stays readable while a long block scrolls past.
-            let label_top = top.max(view_top).min(bottom - LINE_H);
-            let label = Rect::from_min_max(pos2(left, label_top), pos2(left + annot_w, label_top + LINE_H));
+            let label_h = line_h.max(19.0).min(bottom - top);
+            let label_top = top.max(view_top).min(bottom - label_h);
+            let label = Rect::from_min_max(pos2(left, label_top), pos2(left + annot_w, label_top + label_h));
             let label_painter = painter.with_clip_rect(annot.intersect(clip));
             let bright = if is_selected { theme::text_bright() } else { theme::text() };
             if commit.is_uncommitted() {
@@ -1364,8 +1441,8 @@ fn blame_body(ui: &mut Ui, blame: &Arc<Blame>, heat: &[f32], selected: Option<us
                     galley_left(&label_painter, label, date_x, date);
                 }
                 let sha_color = if is_selected { theme::text_bright() } else { theme::text_dim() };
-                widgets::text_left(&label_painter, label, left + 12.0, &short(commit.oid), small.clone(), sha_color);
-                let author_x = left + 12.0 + digit_w * 7.0 + 10.0;
+                widgets::text_left(&label_painter, label, left + 12.0, &short(commit.oid), sha_font.clone(), sha_color);
+                let author_x = left + 12.0 + sha_w * 7.0 + 10.0;
                 let author = elided(&label_painter, &commit.author, theme::font(12.0), bright, date_x - author_x - 8.0);
                 galley_left(&label_painter, label, author_x, author);
             }
@@ -1404,20 +1481,31 @@ fn blame_body(ui: &mut Ui, blame: &Arc<Blame>, heat: &[f32], selected: Option<us
 
         // Then the file itself, over the highlight of selected text.
         for (i, line) in blame.lines.iter().enumerate().take(last).skip(first) {
-            let top = content.top() + i as f32 * LINE_H;
-            let y = top + 0.5 * LINE_H;
-            painter.text(
-                pos2(left + gutter - 10.0, y),
-                Align2::RIGHT_CENTER,
-                (i + 1).to_string(),
-                small.clone(),
-                theme::text_faint(),
-            );
-            let galley = text_painter.layout_no_wrap(line.clone(), font.clone(), theme::text());
-            let origin = pos2(text_left, y - galley.size().y / 2.0);
-            let row = Rect::from_min_max(pos2(left + gutter, top), pos2(right, top + LINE_H));
-            state.text.paint(&text_painter, i, &galley, origin.x, row, char_w);
-            text_painter.galley(origin, galley, theme::text());
+            let top = content.top() + rows.top(i);
+            if look.numbers {
+                painter.text(
+                    pos2(left + gutter - 10.0, top + 0.5 * line_h),
+                    Align2::RIGHT_CENTER,
+                    (i + 1).to_string(),
+                    small.clone(),
+                    theme::text_faint(),
+                );
+            }
+            let parts = diff::segments(line, columns);
+            // Only a wrapped line needs its length for the selection.
+            let len = if parts.len() > 1 { parts.last().map_or(0, |(cols, _)| cols.end) } else { 0 };
+            for (k, (cols, bytes)) in parts.into_iter().enumerate() {
+                let top = top + k as f32 * line_h;
+                let galley = text_painter.layout_no_wrap(line[bytes].to_owned(), font.clone(), theme::text());
+                let origin = pos2(text_left, top + 0.5 * line_h - galley.size().y / 2.0);
+                let row = Rect::from_min_max(pos2(left + gutter, top), pos2(right, top + line_h));
+                if len == 0 {
+                    state.text.paint(&text_painter, i, &galley, origin.x, row, char_w);
+                } else {
+                    state.text.paint_part(&text_painter, i, &galley, origin.x, row, char_w, cols, len);
+                }
+                text_painter.galley(origin, galley, theme::text());
+            }
         }
 
         painter.vline(left + annot_w, clip.y_range(), Stroke::new(1.0, theme::border()));

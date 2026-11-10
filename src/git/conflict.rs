@@ -22,6 +22,7 @@ use git2::{BranchType, ObjectType, Repository, RepositoryState};
 
 use super::ops::{GitCmd, Step};
 use super::repo::{lossy, read_head};
+use super::text::{self, Encoding, Eol, FileEncoding};
 use super::{Oid, short};
 
 /// Git looks for a NUL in this many leading bytes to call a file binary.
@@ -97,9 +98,10 @@ impl Chunk {
         self.bytes.ends_with(b"\n")
     }
 
-    /// Line `line` without its line ending, for display.
+    /// Line `line` without its line ending, for display. Chunks are UTF-8
+    /// (see [`load`]); a byte order mark at the start of the file is not shown.
     pub fn line(&self, line: usize) -> Cow<'_, str> {
-        String::from_utf8_lossy(strip_eol(self.raw(line, line + 1)))
+        Encoding::Utf8.decode(strip_eol(self.raw(line, line + 1)))
     }
 
     /// All lines as editor text: joined by `\n`, no trailing newline.
@@ -567,6 +569,15 @@ pub struct ConflictFile {
     /// The repository's git directory, home of the scratch index that
     /// [`save`] uses to write a file without staging it.
     pub git_dir: PathBuf,
+    /// How the file's text is stored, to write it back that way.
+    pub encoding: FileEncoding,
+    /// The sides were turned from `encoding` into UTF-8 to be merged and
+    /// shown; the result is turned back. Files in UTF-8 are worked on as
+    /// they are, byte for byte.
+    pub transcoded: bool,
+    /// The repository's encoding when the file was read (Preferences >
+    /// Encoding), to notice it changing.
+    pub default_encoding: Encoding,
 }
 
 impl ConflictFile {
@@ -588,7 +599,8 @@ impl ConflictFile {
         }
     }
 
-    /// The resolved file for `draft`; `None` when this is not a text conflict.
+    /// The resolved file for `draft`, in UTF-8 when it was transcoded (see
+    /// [`ConflictFile::output`]); `None` when this is not a text conflict.
     pub fn render(&self, draft: &Draft) -> Option<Vec<u8>> {
         match &self.content {
             Content::Text { merge, .. } => {
@@ -596,6 +608,21 @@ impl ConflictFile {
             }
             Content::Whole(_) => None,
         }
+    }
+
+    /// The bytes to write for `draft`: line endings made `eol`, and the text
+    /// back in the file's encoding.
+    pub fn output(&self, draft: &Draft, eol: Eol) -> Option<Vec<u8>> {
+        let rendered = self.render(draft)?;
+        let bytes = text::convert_eol(&rendered, eol);
+        if self.transcoded {
+            return Some(self.encoding.encode(&String::from_utf8_lossy(&bytes)));
+        }
+        let bom = Encoding::Utf8Bom.bom();
+        if self.encoding.encoding == Encoding::Utf8Bom && !bytes.is_empty() && !bytes.starts_with(bom) {
+            return Some([bom, &bytes].concat());
+        }
+        Some(bytes.into_owned())
     }
 }
 
@@ -641,6 +668,25 @@ pub fn load(repo: &Repository, path: &str) -> Result<ConflictFile, String> {
         }
         stages[i] = Some(stage);
     }
+
+    // The file's encoding: a byte order mark on a side, else the
+    // repository's setting. Other than UTF-8, the sides are merged and
+    // shown as UTF-8 and the result is turned back when saved. UTF-16 is
+    // binary to git (it is full of zero bytes); as text it merges fine.
+    let default = text::encoding_for(repo.workdir().unwrap_or(repo.path()));
+    let sample = [&blobs[1], &blobs[2], &blobs[0]].into_iter().find(|blob| !blob.is_empty());
+    let encoding = text::detect(sample.map_or(&[][..], |blob| blob.as_slice()), default);
+    let transcoded = !matches!(encoding.encoding, Encoding::Utf8 | Encoding::Utf8Bom);
+    if transcoded {
+        for (blob, stage) in blobs.iter_mut().zip(&mut stages) {
+            if let Some(stage) = stage
+                && !blob.is_empty()
+            {
+                *blob = text::decode_file(blob, encoding.encoding).0.into_bytes();
+                stage.binary = is_binary(blob);
+            }
+        }
+    }
     let [base, ours, theirs] = stages;
 
     let whole = if special {
@@ -668,12 +714,21 @@ pub fn load(repo: &Repository, path: &str) -> Result<ConflictFile, String> {
         Some(whole) => Content::Whole(whole),
         None => {
             let merge = merge_text(&blobs[0], &blobs[1], &blobs[2])?;
-            let worktree = repo.workdir().and_then(|dir| std::fs::read(dir.join(path)).ok());
-            let adopted = worktree.as_deref().and_then(|bytes| adopt(&merge, bytes));
+            let mut worktree = repo.workdir().and_then(|dir| std::fs::read(dir.join(path)).ok());
+            if transcoded {
+                worktree = worktree.map(|bytes| text::decode_file(&bytes, encoding.encoding).0.into_bytes());
+            }
+            // Git leaves its own side of a file it took for binary, without
+            // markers: that is not a resolution to start from.
+            let adopted = worktree
+                .as_deref()
+                .filter(|_| !encoding.encoding.is_utf16())
+                .and_then(|bytes| adopt(&merge, bytes));
             let has_markers = worktree.as_deref().is_some_and(|bytes| {
                 split_lines(bytes).iter().any(|line| line.starts_with(&[b'<'; MARKER_SIZE]))
             });
-            let edited_outside = adopted.is_none() && worktree.is_some() && !has_markers;
+            let edited_outside =
+                adopted.is_none() && worktree.is_some() && !has_markers && !encoding.encoding.is_utf16();
             let draft = adopted.unwrap_or_else(|| Draft::unresolved(&merge));
             Content::Text { merge, draft, edited_outside }
         }
@@ -689,6 +744,9 @@ pub fn load(repo: &Repository, path: &str) -> Result<ConflictFile, String> {
         theirs_info,
         content,
         git_dir: repo.path().to_path_buf(),
+        encoding,
+        transcoded,
+        default_encoding: default,
     })
 }
 
