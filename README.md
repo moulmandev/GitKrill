@@ -11,6 +11,8 @@ middle, and a staging / commit-details panel on the right.
 
 ![Commit graph](docs/graph.png)
 
+![The light theme](docs/light.png)
+
 ![Staging individual lines](docs/staging.png)
 
 ![Resolving a merge conflict](docs/conflict.png)
@@ -91,6 +93,7 @@ Wayland; nothing else has to be installed.
 
 **Shell**
 - Multiple repositories in tabs, restored on start; drop a folder to open it
+- Dark and light themes, or follow the system setting (**View > Theme**)
 - Clone and init
 - Open a terminal in the repository
 

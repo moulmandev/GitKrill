@@ -60,13 +60,13 @@ fn working_tree(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<
             let text = format!("{count} file change{} on", if count == 1 { "" } else { "s" });
             let branch = snap.head_label();
             let text_galley = painter.layout_no_wrap(text, theme::bold(13.0), theme::text_bright());
-            let pill_galley = widgets::elided(painter, &branch, theme::font(12.5), theme::text_bright(), rect.width() * 0.4);
+            let pill_galley = widgets::elided(painter, &branch, theme::font(12.5), theme::on_accent(), rect.width() * 0.4);
             let pill_w = pill_galley.size().x + 12.0;
             let total = text_galley.size().x + 8.0 + pill_w;
             let x = (rect.center().x - total / 2.0).max(trash.right() + 10.0);
             let w = widgets::galley_left(painter, rect, x, text_galley);
             let pill = egui::Rect::from_min_size(pos2(x + w + 8.0, rect.center().y - 10.0), vec2(pill_w, 20.0));
-            painter.rect_filled(pill, 3.0, theme::mix(theme::bg_app(), theme::accent(), 0.6));
+            painter.rect_filled(pill, 3.0, theme::solid(theme::accent(), 0.6));
             widgets::galley_left(painter, pill, pill.left() + 6.0, pill_galley);
         }
 
@@ -206,8 +206,8 @@ fn commit_box(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot) {
         (format!("Commit changes to {staged} file{}", if staged == 1 { "" } else { "s" }), true, false)
     };
 
-    let fill = if enabled { theme::mix(theme::bg_app(), theme::green(), 0.55) } else { theme::green_dark() };
-    let text = RichText::new(label).color(if enabled { theme::text_bright() } else { theme::text_dim() });
+    let fill = if enabled { theme::solid(theme::green(), 0.55) } else { theme::green_dark() };
+    let text = RichText::new(label).color(if enabled { theme::on_accent() } else { theme::text_dim() });
     let button = ui.add_enabled(
         enabled,
         Button::new(text)

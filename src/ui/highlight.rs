@@ -80,11 +80,16 @@ pub enum Class {
 }
 
 impl Class {
-    /// Colours are blends of the theme's accent colours (the lane colours
-    /// used are violet, pink and mint) towards its text colour: light enough
-    /// to read on the plain, the added (green) and the removed (red) line
-    /// backgrounds alike. A test checks the contrast.
+    /// The colour of this class in the theme in use.
     pub fn color(self) -> Color32 {
+        if theme::palette().dark { self.dark_color() } else { self.light_color() }
+    }
+
+    /// Blends of the theme's accent colours (the lane colours used are
+    /// violet, pink and mint) towards its text colour: light enough to read
+    /// on the plain, the added (green) and the removed (red) line backgrounds
+    /// alike. A test checks the contrast.
+    fn dark_color(self) -> Color32 {
         use theme::mix;
         match self {
             Class::Plain => theme::text(),
@@ -102,13 +107,38 @@ impl Class {
             Class::Deleted => mix(theme::red(), theme::text_bright(), 0.35),
         }
     }
+
+    /// The same hues as the dark colours, deep enough for a white page and
+    /// its pale green and red line backgrounds. Blending towards the (nearly
+    /// black) text would make them muddy, so they are picked one by one.
+    fn light_color(self) -> Color32 {
+        let rgb = |hex: u32| Color32::from_rgb((hex >> 16) as u8, (hex >> 8) as u8, hex as u8);
+        match self {
+            Class::Plain => theme::text(),
+            Class::Comment => rgb(0x56616d),
+            Class::Keyword | Class::Operator | Class::Storage => rgb(0x8335c4),
+            Class::String => rgb(0xa34d08),
+            Class::Escape => rgb(0xbb1766),
+            Class::Number => rgb(0x855700),
+            Class::Function => rgb(0x1d5cbd),
+            Class::Type => rgb(0x0a7262),
+            Class::Tag => rgb(0xb3302a),
+            Class::Property => rgb(0x0a6588),
+            Class::Punctuation => theme::mix(theme::text(), theme::text_dim(), 0.35),
+            Class::Inserted => rgb(0x18752f),
+            Class::Deleted => rgb(0xb3302a),
+        }
+    }
 }
 
 /// Background behind the part of an added / removed line that actually
 /// changed, over [`theme::diff_add_bg()`] / [`theme::diff_del_bg()`].
 pub fn emphasis_color(origin: char) -> Color32 {
+    // A little stronger on the light set's paler green, to stay clear of a
+    // selected added line.
+    let added = if theme::palette().dark { 0.3 } else { 0.36 };
     match origin {
-        '+' => theme::mix(theme::diff_add_bg(), theme::green(), 0.3),
+        '+' => theme::mix(theme::diff_add_bg(), theme::green(), added),
         _ => theme::mix(theme::diff_del_bg(), theme::red(), 0.34),
     }
 }
@@ -1360,18 +1390,7 @@ mod tests {
         assert!(far.similarity < close.similarity);
     }
 
-    /// Relative luminance contrast, as WCAG defines it.
-    fn contrast(a: Color32, b: Color32) -> f32 {
-        let luminance = |c: Color32| {
-            let channel = |v: u8| {
-                let v = v as f32 / 255.0;
-                if v <= 0.03928 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) }
-            };
-            0.2126 * channel(c.r()) + 0.7152 * channel(c.g()) + 0.0722 * channel(c.b())
-        };
-        let (a, b) = (luminance(a), luminance(b));
-        (a.max(b) + 0.05) / (a.min(b) + 0.05)
-    }
+    use crate::theme::contrast;
 
     #[test]
     fn every_token_colour_reads_on_every_line_background() {
@@ -1392,18 +1411,27 @@ mod tests {
             Class::Operator,
             Class::Storage,
         ];
-        for class in classes {
+        for light in [false, true] {
+            theme::set_light(light);
+            colours_read_on_line_backgrounds(&classes);
+        }
+        theme::set_light(false);
+    }
+
+    fn colours_read_on_line_backgrounds(classes: &[Class]) {
+        let light = theme::is_light();
+        for &class in classes {
             // Ordinary text contrast on the line backgrounds...
             for bg in [theme::bg_app(), theme::diff_add_bg(), theme::diff_del_bg()] {
                 let ratio = contrast(class.color(), bg);
-                assert!(ratio >= 4.5, "{class:?} on {bg:?}: {ratio:.2}");
+                assert!(ratio >= 4.5, "{class:?} on {bg:?} (light: {light}): {ratio:.2}");
             }
             // ...and still clearly legible on the brighter backgrounds that
             // come and go: selected lines and the word emphasis.
             let selected = ['+', '-'].map(|origin| crate::ui::diff::line_background(origin, true).unwrap());
             for bg in selected.into_iter().chain([emphasis_color('+'), emphasis_color('-')]) {
                 let ratio = contrast(class.color(), bg);
-                assert!(ratio >= 3.0, "{class:?} on {bg:?}: {ratio:.2}");
+                assert!(ratio >= 3.0, "{class:?} on {bg:?} (light: {light}): {ratio:.2}");
             }
         }
         // The emphasis itself has to stand out from the line it sits on,
@@ -1412,7 +1440,7 @@ mod tests {
             for selected in [false, true] {
                 let line = crate::ui::diff::line_background(origin, selected).unwrap();
                 let ratio = contrast(emphasis_color(origin), line);
-                assert!(ratio >= 1.25, "emphasis on {origin} (selected: {selected}): {ratio:.2}");
+                assert!(ratio >= 1.25, "emphasis on {origin} (selected: {selected}, light: {light}): {ratio:.2}");
             }
         }
     }

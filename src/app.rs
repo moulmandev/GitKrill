@@ -294,6 +294,11 @@ impl App {
                         tab.refresh();
                     }
                 }
+                ui.menu_button("Theme", |ui| {
+                    for choice in theme::Choice::ALL {
+                        ui.radio_value(&mut shared.settings.theme, choice, choice.label());
+                    }
+                });
                 ui.separator();
                 let zoom = ui.ctx().zoom_factor();
                 if ui.add(egui::Button::new("Zoom In").shortcut_text("Ctrl++")).clicked() {
@@ -477,7 +482,13 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// Shows through the hairline gaps between panels.
+    fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
+        theme::border().to_normalized_gamma_f32()
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        theme::follow(ui, self.shared.settings.theme);
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
         self.shortcuts(&ctx);

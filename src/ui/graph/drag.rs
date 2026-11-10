@@ -726,7 +726,7 @@ fn ghost(ctx: &Context, dragged: &Dragged, frame: u64) {
     let width = 7.0 + name.size().x + 6.0 + glyph.size().x + 7.0;
     let pill = Rect::from_min_size(pointer + vec2(14.0, 12.0), vec2(width, 22.0));
 
-    painter.rect_filled(pill.translate(vec2(0.0, 2.0)).expand(1.0), 5.0, theme::with_alpha(Color32::BLACK, 90));
+    painter.rect_filled(pill.translate(vec2(0.0, 2.0)).expand(1.0), 5.0, theme::shadow());
     painter.rect(
         pill,
         4.0,
@@ -751,7 +751,7 @@ fn ghost(ctx: &Context, dragged: &Dragged, frame: u64) {
             pos2(pill.right() + 6.0, pill.top()),
             vec2(galley.size().x + 14.0, pill.height()),
         );
-        painter.rect(hint, 4.0, theme::bg_raised(), Stroke::new(1.0, theme::accent()), StrokeKind::Inside);
+        painter.rect(hint, 4.0, theme::bg_float(), Stroke::new(1.0, theme::accent()), StrokeKind::Inside);
         painter.galley(pos2(hint.left() + 7.0, y(galley.size().y)), galley, theme::text_bright());
     } else {
         painter.text(

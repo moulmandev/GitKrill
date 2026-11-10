@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use eframe::egui::{
-    self, Align, Align2, Area, Button, Color32, Frame, Id, Key, Layout, Margin, Modal, Order,
+    self, Align, Align2, Area, Button, Frame, Id, Key, Layout, Margin, Modal, Order,
     RichText, Stroke, TextEdit, Ui, vec2,
 };
 
@@ -58,8 +58,8 @@ fn buttons(ui: &mut Ui, confirm: &str, enabled: bool, danger: bool) -> Option<bo
     let mut result = None;
     ui.add_space(6.0);
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        let fill = if danger { theme::mix(theme::bg_app(), theme::red(), 0.7) } else { theme::mix(theme::bg_app(), theme::accent(), 0.8) };
-        let primary = Button::new(RichText::new(confirm).color(Color32::WHITE))
+        let fill = if danger { theme::solid(theme::red(), 0.7) } else { theme::solid(theme::accent(), 0.8) };
+        let primary = Button::new(RichText::new(confirm).color(theme::on_accent()))
             .fill(if enabled { fill } else { theme::bg_raised() })
             .min_size(vec2(84.0, 28.0));
         if ui.add_enabled(enabled, primary).clicked() {
@@ -206,8 +206,8 @@ fn body(
             let mut outcome = Outcome::Keep;
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let Some(tab) = tab else { return };
-                let pull = Button::new(RichText::new("Pull (rebase)").color(Color32::WHITE))
-                    .fill(theme::mix(theme::bg_app(), theme::accent(), 0.8))
+                let pull = Button::new(RichText::new("Pull (rebase)").color(theme::on_accent()))
+                    .fill(theme::solid(theme::accent(), 0.8))
                     .min_size(vec2(96.0, 28.0));
                 if ui.add(pull).clicked() {
                     tab.run(ops::pull(PullMode::Rebase));
@@ -217,8 +217,8 @@ fn body(
                     tab.run(ops::pull(PullMode::Default));
                     outcome = Outcome::Close;
                 }
-                let force = Button::new(RichText::new("Force push").color(Color32::WHITE))
-                    .fill(theme::mix(theme::bg_app(), theme::red(), 0.7))
+                let force = Button::new(RichText::new("Force push").color(theme::on_accent()))
+                    .fill(theme::solid(theme::red(), 0.7))
                     .min_size(vec2(90.0, 28.0));
                 if ui.add(force).clicked() {
                     if let Some(cmd) = push_cmd(tab, true) {
@@ -322,8 +322,8 @@ pub fn toasts(ctx: &egui::Context, shared: &mut Shared, tab: Option<&RepoTab>) {
             ui.spacing_mut().item_spacing.y = 8.0;
             for label in &running {
                 Frame::new()
-                    .fill(theme::bg_raised())
-                    .stroke(Stroke::new(1.0, theme::mix(theme::bg_raised(), theme::accent(), 0.55)))
+                    .fill(theme::bg_float())
+                    .stroke(Stroke::new(1.0, theme::mix(theme::bg_float(), theme::accent(), 0.55)))
                     .corner_radius(6.0)
                     .inner_margin(Margin::symmetric(12, 9))
                     .show(ui, |ui| {
@@ -345,8 +345,8 @@ pub fn toasts(ctx: &egui::Context, shared: &mut Shared, tab: Option<&RepoTab>) {
                     ToastKind::Error => (theme::red(), icons::WARNING_CIRCLE),
                 };
                 Frame::new()
-                    .fill(theme::bg_raised())
-                    .stroke(Stroke::new(1.0, theme::mix(theme::bg_raised(), accent, 0.55)))
+                    .fill(theme::bg_float())
+                    .stroke(Stroke::new(1.0, theme::mix(theme::bg_float(), accent, 0.55)))
                     .corner_radius(6.0)
                     .inner_margin(Margin::symmetric(12, 9))
                     .show(ui, |ui| {
