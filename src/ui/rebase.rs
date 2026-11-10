@@ -544,9 +544,9 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, plan: &mut Plan, co
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let label = if controls.starting || running { "Starting…" } else { "Start rebase" };
-                    let fill = if can_start { theme::mix(theme::bg_app(), theme::accent(), 0.8) } else { theme::bg_raised() };
+                    let fill = if can_start { theme::solid(theme::accent(), 0.8) } else { theme::bg_raised() };
                     let text = RichText::new(format!("{}  {label}", icons::PLAY))
-                        .color(if can_start { Color32::WHITE } else { theme::text_dim() });
+                        .color(if can_start { theme::on_accent() } else { theme::text_dim() });
                     let button = Button::new(text).fill(fill).min_size(vec2(124.0, 30.0));
                     let response = ui
                         .add_enabled(can_start, button)
@@ -919,7 +919,7 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
                         top.rect(
                             ghost,
                             4.0,
-                            theme::bg_raised(),
+                            theme::bg_float(),
                             Stroke::new(1.0, theme::accent()),
                             StrokeKind::Inside,
                         );

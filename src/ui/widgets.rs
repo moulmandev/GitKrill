@@ -171,7 +171,7 @@ pub fn avatar(painter: &Painter, center: Pos2, radius: f32, name: &str, email: &
         Align2::CENTER_CENTER,
         initials(name),
         theme::bold((radius * 0.95).max(8.0)),
-        Color32::WHITE,
+        theme::on_accent(),
     );
     if let Some(color) = ring {
         painter.circle_stroke(center, radius, Stroke::new(2.0, color));
@@ -195,7 +195,7 @@ pub fn avatar_picture(
     };
     // Pictures with transparent parts are meant to sit on a light page.
     // Slightly smaller, so it never shows as a rim around a dark picture.
-    painter.circle_filled(center, radius - 0.75, theme::text_bright());
+    painter.circle_filled(center, radius - 0.75, theme::picture_bg());
     let whole = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
     painter.add(
         egui::epaint::RectShape::filled(

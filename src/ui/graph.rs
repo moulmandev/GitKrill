@@ -513,7 +513,7 @@ fn paint_row(
                 pos2(text_x - 4.0, cy - 10.0),
                 vec2((galley.size().x + 60.0).min(max_w), 20.0),
             );
-            mp.rect_filled(field, 3.0, theme::with_alpha(Color32::BLACK, 70));
+            mp.rect_filled(field, 3.0, theme::well());
             widgets::galley_left(&mp, rect, text_x + 4.0, galley);
             let x = field.right() + 12.0;
             let w = widgets::text_left(&mp, rect, x, icons::PENCIL_SIMPLE, theme::font(14.0), theme::yellow());
@@ -676,7 +676,7 @@ pub fn layout_pills(painter: &Painter, rect: Rect, cols: &Columns, labels: &[Ref
 
 fn pill_text_colors(label: &RefLabel) -> (Color32, Color32) {
     match label.kind {
-        _ if label.is_head => (Color32::WHITE, Color32::WHITE),
+        _ if label.is_head => (theme::on_accent(), theme::on_accent()),
         RefKind::Local | RefKind::Head => (theme::text_bright(), theme::text()),
         RefKind::Remote => (theme::text(), theme::text_dim()),
         RefKind::Tag => (theme::text(), theme::yellow()),
@@ -713,7 +713,7 @@ fn paint_pills(
         match pill.style {
             PillStyle::Head => {
                 p.rect_filled(pill.rect.expand(1.5), 4.5, theme::with_alpha(color, 90));
-                p.rect_filled(pill.rect, 3.0, theme::mix(Color32::BLACK, color, 0.82));
+                p.rect_filled(pill.rect, 3.0, theme::deep(color));
             }
             PillStyle::Local => {
                 p.rect_filled(pill.rect, 3.0, theme::mix(theme::bg_app(), color, 0.34));

@@ -124,6 +124,8 @@ pub struct Settings {
     /// Show pull requests, issues and CI runs from the hosting service
     /// (GitHub) in the sidebar. Off means no request is ever made.
     pub hosting_integration: bool,
+    /// Dark, light, or whatever the operating system uses.
+    pub theme: crate::theme::Choice,
 }
 
 impl Default for Settings {
@@ -142,6 +144,7 @@ impl Default for Settings {
             graph_width: None,
             fetch_avatars: true,
             hosting_integration: true,
+            theme: crate::theme::Choice::Dark,
         }
     }
 }

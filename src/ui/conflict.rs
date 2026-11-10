@@ -1271,7 +1271,7 @@ fn side_pane(ui: &mut Ui, scene: &Scene<'_>, rect: Rect, side: Side, actions: &m
                 draw_line(&text_painter, text_x, top, &chunk.line(line), &scene.font, theme::text());
                 for row in 1..block.rows {
                     let filler = row_rect(scene.gutter, rect, top + row as f32 * LINE_H);
-                    painter.rect_filled(filler, 0.0, theme::bg_input());
+                    painter.rect_filled(filler, 0.0, theme::bg_void());
                 }
             }
             Kind::Conflict { index } => {
@@ -1336,7 +1336,7 @@ fn side_pane(ui: &mut Ui, scene: &Scene<'_>, rect: Rect, side: Side, actions: &m
                         draw_number(&painter, scene.gutter, rect, y, block.above[pane] + row + 1);
                         draw_line(&text_painter, text_x, y, &chunk.line(row), &scene.font, text_color);
                     } else {
-                        painter.rect_filled(row_rect(scene.gutter, rect, y), 0.0, theme::bg_input());
+                        painter.rect_filled(row_rect(scene.gutter, rect, y), 0.0, theme::bg_void());
                         if chunk.is_empty() && row == 0 {
                             draw_remark(&painter, scene.gutter, rect, y, "no lines on this side", theme::text_faint());
                         }
@@ -1536,7 +1536,7 @@ fn result_pane(
                     }
                     for row in rows.start.max(count)..rows.end {
                         let y = body_top + row as f32 * LINE_H;
-                        painter.rect_filled(row_rect(scene.gutter, rect, y), 0.0, theme::bg_input());
+                        painter.rect_filled(row_rect(scene.gutter, rect, y), 0.0, theme::bg_void());
                         if count == 0 && row == 0 {
                             let remark = "no lines here in the result";
                             draw_remark(&painter, scene.gutter, rect, y, remark, theme::text_faint());
@@ -1739,14 +1739,14 @@ fn ask(ctx: &egui::Context, tab: &mut RepoTab, shared: &mut Shared, view: &mut R
         let mut answer = None;
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let label = if open == 0 { "Save and mark resolved" } else { "Save" };
-            let primary = Button::new(RichText::new(label).color(Color32::WHITE))
-                .fill(theme::mix(theme::bg_app(), theme::green(), 0.6))
+            let primary = Button::new(RichText::new(label).color(theme::on_accent()))
+                .fill(theme::solid(theme::green(), 0.6))
                 .min_size(vec2(84.0, 28.0));
             if ui.add(primary).clicked() {
                 answer = Some(Answer::Save { mark_resolved: open == 0 });
             }
-            let discard = Button::new(RichText::new("Discard").color(Color32::WHITE))
-                .fill(theme::mix(theme::bg_app(), theme::red(), 0.7))
+            let discard = Button::new(RichText::new("Discard").color(theme::on_accent()))
+                .fill(theme::solid(theme::red(), 0.7))
                 .min_size(vec2(84.0, 28.0));
             if ui.add(discard).clicked() {
                 answer = Some(Answer::Discard);

@@ -47,7 +47,11 @@ already shown to the user as a toast).
   functions (`theme::text_dim()`, `theme::lane_color(i)`) that read the
   palette in use, so the theme can change at runtime: call them every frame
   and do not keep their result in a cache or a `const`. Do not hard-code
-  colours in feature code.
+  colours in feature code. Every colour has to work in both sets, `DARK`
+  and `LIGHT`: text on a solid coloured fill is `theme::on_accent()` over
+  `theme::solid(color, amount)` (or `theme::deep(color)`), translucent
+  shades are `theme::shadow()` / `theme::well()`, and floating cards use
+  `theme::bg_float()`. `theme::contrast` measures what a test should check.
 - Lists that can be long are virtualised: allocate the full content size, then
   paint only the rows inside the viewport (`ui/graph.rs`, `ui/diff.rs`).
 - Custom-painted rows use `ui.interact(rect, id, Sense::click())` for input and
@@ -108,6 +112,9 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   `issues.json` and `runs.json` from disk instead of the network.
 - Screenshot runs keep their avatar cache under the config folder too, so
   they never touch the real one.
+- To see the light theme, put `{"theme": "Light"}` in `cfg/settings.json`
+  before the run (`"auto_fetch_minutes": 0` keeps the 8-second fetch from
+  changing the demo mid-script).
 - `tools/shot.sh` keeps settings in a `cfg` folder next to the output. Never
   run the app for testing without `GITKRILL_CONFIG_DIR` set, or the user's real
   tab list gets temp repositories in it.
