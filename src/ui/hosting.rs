@@ -1,12 +1,13 @@
 //! Sidebar sections for pull requests, issues and CI runs.
 
-use eframe::egui::{Align2, Color32, Rect, Response, Sense, Ui, Vec2, pos2};
+use eframe::egui::{Align2, Color32, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2, pos2};
 
 use crate::git::{BranchInfo, Oid, RepoSnapshot};
 use crate::git::ops::GitCmd;
 use crate::hosting::{self, Checks, Feed, Issue, PullRequest, Run, RunState, Shown};
 use crate::state::{RepoTab, Shared};
 use crate::theme::{self, icons};
+use crate::ui::graph::drag::{self, Branch};
 use crate::ui::sidebar::{leaf, row, section};
 use crate::ui::widgets::{elided, elided_pair, menu_item, spinner};
 
@@ -15,6 +16,8 @@ enum Act {
     Refresh,
     Run(GitCmd),
     Jump(Oid),
+    /// Open the "Create pull request" dialog, from this branch if given.
+    NewPull(Option<Branch>),
 }
 
 /// Called at the end of the sidebar, inside its scroll area.
@@ -42,12 +45,18 @@ pub fn sections(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Repo
         .filter(|pr| matches(Some(pr.number), &[&pr.title, &pr.author, &pr.head_ref]))
         .collect();
     let count = (pulls.len(), view.pulls.items.len());
-    if header(ui, tab, &shown, "PULL REQUESTS", icons::GIT_PULL_REQUEST, count, &mut act) {
+    let top = ui.cursor().top();
+    if header(ui, tab, &shown, "PULL REQUESTS", icons::GIT_PULL_REQUEST, count, true, &mut act) {
         notice(ui, &shown, &view.pulls, &mut act);
         for pr in pulls {
             pull_row(ui, snap, &shown, pr, &mut act);
         }
         more(ui, &shown, &view.pulls, &repo.pulls_url());
+    }
+    // A branch dropped anywhere on the list opens the dialog for it.
+    let list = Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top());
+    if let Some(branch) = drop_target(ui, snap, &shown, list) {
+        act = Some(Act::NewPull(Some(branch)));
     }
 
     // ---- issues ----
@@ -58,7 +67,7 @@ pub fn sections(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Repo
         .filter(|issue| matches(Some(issue.number), &[&issue.title, &issue.author]))
         .collect();
     let count = (issues.len(), view.issues.items.len());
-    if header(ui, tab, &shown, "ISSUES", icons::RADIO_BUTTON, count, &mut act) {
+    if header(ui, tab, &shown, "ISSUES", icons::RADIO_BUTTON, count, false, &mut act) {
         notice(ui, &shown, &view.issues, &mut act);
         for issue in issues {
             issue_row(ui, &shown, issue, &mut act);
@@ -74,7 +83,7 @@ pub fn sections(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Repo
         .filter(|run| matches(None, &[&run.workflow, &run.branch, &run.title]))
         .collect();
     let count = (runs.len(), view.runs.items.len());
-    if header(ui, tab, &shown, repo.service.ci_title(), icons::PLAY_CIRCLE, count, &mut act) {
+    if header(ui, tab, &shown, repo.service.ci_title(), icons::PLAY_CIRCLE, count, false, &mut act) {
         notice(ui, &shown, &view.runs, &mut act);
         for run in runs {
             run_row(ui, &shown, run, now, &mut act);
@@ -86,8 +95,33 @@ pub fn sections(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Repo
         Some(Act::Refresh) => tab.hosting.refresh(),
         Some(Act::Run(cmd)) => tab.run(cmd),
         Some(Act::Jump(oid)) => tab.jump_to(oid),
+        Some(Act::NewPull(branch)) => crate::ui::new_pull::open(tab, shared, branch),
         None => {}
     }
+}
+
+/// Makes `rect` (the pull request section) a place to drop a branch: it is
+/// outlined while a branch that can be proposed is dragged, filled while the
+/// pointer is on it, and the branch is returned on the frame it is dropped.
+fn drop_target(ui: &Ui, snap: &RepoSnapshot, shown: &Shown, rect: Rect) -> Option<Branch> {
+    let session = drag::session(ui.ctx())?;
+    if !crate::ui::new_pull::accepts(snap, &shown.remote, session.branch()) {
+        return None;
+    }
+    let clipped = rect.intersect(ui.clip_rect());
+    if !ui.is_rect_visible(clipped) {
+        return None;
+    }
+    if ui.rect_contains_pointer(clipped) {
+        drag::highlight_row(ui.painter(), clipped);
+        if session.over_place(ui.ctx(), "Create pull request") {
+            return Some(session.branch().clone());
+        }
+    } else {
+        let stroke = Stroke::new(1.0, theme::with_alpha(theme::accent(), 150));
+        ui.painter().rect_stroke(clipped.shrink(0.5), 2.0, stroke, StrokeKind::Inside);
+    }
+    None
 }
 
 /// Opens a page in the default browser.
@@ -106,6 +140,9 @@ fn browse(url: &str) {
 /// takes the place of the count at the right edge: while the pointer is over
 /// the header, and as a spinner while a refresh is in flight. Returns whether
 /// the section is open.
+///
+/// With `add`, a "+" next to it opens the "Create pull request" dialog.
+#[allow(clippy::too_many_arguments)]
 fn header(
     ui: &mut Ui,
     tab: &mut RepoTab,
@@ -113,6 +150,7 @@ fn header(
     title: &str,
     icon: &str,
     (visible, total): (usize, usize),
+    add: bool,
     act: &mut Option<Act>,
 ) -> bool {
     let (left, top, width) = (ui.cursor().left(), ui.cursor().top(), ui.available_width());
@@ -149,6 +187,19 @@ fn header(
     }
     if response.clicked() {
         *act = Some(Act::Refresh);
+    }
+    if add && over_header {
+        let plus = button.translate(Vec2::new(-(button.width() + 2.0), 0.0));
+        let plus = Rect::from_center_size(plus.center(), Vec2::splat(22.0));
+        let response = ui.interact(plus, ui.id().with(("hosting-add", title)), Sense::click());
+        let fill = if response.hovered() { theme::bg_raised() } else { theme::bg_hover() };
+        ui.painter().rect_filled(plus, 4.0, fill);
+        let color = if response.hovered() { theme::text_bright() } else { theme::text_dim() };
+        ui.painter().text(plus.center(), Align2::CENTER_CENTER, icons::PLUS, theme::font(13.0), color);
+        if response.clicked() {
+            *act = Some(Act::NewPull(None));
+        }
+        response.on_hover_text("Create pull request");
     }
     response.on_hover_ui(|ui| {
         let service = shown.repo.service.name();

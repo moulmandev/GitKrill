@@ -66,6 +66,10 @@ pub struct Toast {
     pub title: String,
     pub body: String,
     pub born: Instant,
+    /// A button that opens a page: its label and the address. Only for
+    /// addresses built from validated parts (`hosting::RepoId`), since it is
+    /// handed to the operating system.
+    pub link: Option<(String, String)>,
 }
 
 pub enum Dialog {
@@ -77,6 +81,8 @@ pub enum Dialog {
     PushRejected,
     Clone { url: String, dest: String },
     About,
+    /// "Create pull request"; see `ui::new_pull`.
+    NewPull(Box<crate::ui::new_pull::NewPullForm>),
 }
 
 impl Dialog {
@@ -208,7 +214,25 @@ impl Shared {
     }
 
     pub fn toast(&mut self, kind: ToastKind, title: impl Into<String>, body: impl Into<String>) {
-        self.toasts.push(Toast { kind, title: title.into(), body: body.into(), born: Instant::now() });
+        self.push_toast(Toast { kind, title: title.into(), body: body.into(), born: Instant::now(), link: None });
+    }
+
+    /// A toast with a button that opens `url` in the browser. `url` must be
+    /// built by `hosting::RepoId`, never taken from a server's answer.
+    pub fn toast_link(
+        &mut self,
+        kind: ToastKind,
+        title: impl Into<String>,
+        body: impl Into<String>,
+        label: impl Into<String>,
+        url: String,
+    ) {
+        let link = Some((label.into(), url));
+        self.push_toast(Toast { kind, title: title.into(), body: body.into(), born: Instant::now(), link });
+    }
+
+    fn push_toast(&mut self, toast: Toast) {
+        self.toasts.push(toast);
         if self.toasts.len() > 6 {
             self.toasts.remove(0);
         }

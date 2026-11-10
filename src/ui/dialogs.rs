@@ -16,11 +16,17 @@ use crate::ui::widgets::icon_button;
 enum Outcome {
     Keep,
     Close,
+    /// Keep, and ignore Escape and clicks outside: the dialog is working.
+    Hold,
 }
 
-pub fn show(ctx: &egui::Context, shared: &mut Shared, tab: Option<&mut RepoTab>) {
+pub fn show(ctx: &egui::Context, shared: &mut Shared, mut tab: Option<&mut RepoTab>) {
     let Some(mut dialog) = shared.dialog.take() else { return };
     let fresh = std::mem::take(&mut shared.dialog_fresh);
+    let width = match dialog {
+        Dialog::NewPull(_) => 520.0,
+        _ => 400.0,
+    };
 
     let frame = Frame::new()
         .fill(theme::bg_toolbar())
@@ -28,15 +34,21 @@ pub fn show(ctx: &egui::Context, shared: &mut Shared, tab: Option<&mut RepoTab>)
         .corner_radius(8.0)
         .inner_margin(Margin::same(20));
     let modal = Modal::new(Id::new("gitkrill-dialog")).frame(frame).show(ctx, |ui| {
-        ui.set_width(400.0);
+        ui.set_width(width);
         ui.spacing_mut().item_spacing.y = 8.0;
-        body(ui, &mut dialog, shared, tab, fresh)
+        body(ui, &mut dialog, shared, tab.as_deref_mut(), fresh)
     });
 
-    let close = matches!(modal.inner, Outcome::Close) || modal.should_close();
+    let close = match modal.inner {
+        Outcome::Close => true,
+        Outcome::Hold => false,
+        Outcome::Keep => modal.should_close(),
+    };
     // A dialog may have queued a follow-up; never overwrite that.
     if !close && shared.dialog.is_none() {
         shared.dialog = Some(dialog);
+    } else if let Dialog::NewPull(form) = &dialog {
+        crate::ui::new_pull::dropped(form, tab);
     }
 }
 
@@ -257,6 +269,12 @@ fn body(
             }
         }
 
+        Dialog::NewPull(form) => match crate::ui::new_pull::show(ui, form, shared, tab, fresh) {
+            crate::ui::new_pull::Next::Keep => Outcome::Keep,
+            crate::ui::new_pull::Next::Close => Outcome::Close,
+            crate::ui::new_pull::Next::Hold => Outcome::Hold,
+        },
+
         Dialog::About => {
             title(ui, "GitKrill");
             ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
@@ -283,10 +301,13 @@ fn body(
 /// Notifications stacked in the bottom-left corner.
 pub fn toasts(ctx: &egui::Context, shared: &mut Shared, tab: Option<&RepoTab>) {
     const SUCCESS_TTL: Duration = Duration::from_secs(4);
+    /// Long enough to reach for the button of a toast that has one.
+    const LINK_TTL: Duration = Duration::from_secs(12);
+    let ttl = |toast: &crate::state::Toast| if toast.link.is_some() { LINK_TTL } else { SUCCESS_TTL };
     /// Operations quicker than this finish before a progress toast would help.
     const PROGRESS_AFTER: Duration = Duration::from_millis(350);
 
-    shared.toasts.retain(|t| t.kind == ToastKind::Error || t.born.elapsed() < SUCCESS_TTL);
+    shared.toasts.retain(|t| t.kind == ToastKind::Error || t.born.elapsed() < ttl(t));
 
     // Slow operations (push, pull, fetch...) announce themselves while they
     // run, so a click is never met with silence.
@@ -308,7 +329,7 @@ pub fn toasts(ctx: &egui::Context, shared: &mut Shared, tab: Option<&RepoTab>) {
         .toasts
         .iter()
         .filter(|t| t.kind == ToastKind::Success)
-        .map(|t| SUCCESS_TTL.saturating_sub(t.born.elapsed()))
+        .map(|t| ttl(t).saturating_sub(t.born.elapsed()))
         .min()
     {
         ctx.request_repaint_after(remaining + Duration::from_millis(20));
@@ -369,6 +390,12 @@ pub fn toasts(ctx: &egui::Context, shared: &mut Shared, tab: Option<&RepoTab>) {
                             // Git errors can be long; keep the toast a sane size.
                             let shown: String = toast.body.lines().take(8).collect::<Vec<_>>().join("\n");
                             ui.label(RichText::new(shown).size(12.0).color(theme::text_dim()));
+                        }
+                        if let Some((label, url)) = &toast.link {
+                            let text = format!("{}  {label}", icons::ARROW_SQUARE_OUT);
+                            if ui.button(text).on_hover_text(url).clicked() {
+                                crate::platform::open(std::path::Path::new(url));
+                            }
                         }
                     });
             }

@@ -8,6 +8,7 @@ pub mod graph;
 pub mod highlight;
 pub mod history;
 pub mod hosting;
+pub mod new_pull;
 pub mod panel;
 pub mod rebase;
 pub mod sidebar;

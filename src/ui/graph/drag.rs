@@ -574,6 +574,19 @@ impl Session {
         ctx.data_mut(|data| data.insert_temp(menu_id(), Arc::new(dropped)));
         Popup::open_id(ctx, menu_id());
     }
+
+    /// For a place that does one thing with any branch dropped on it (the
+    /// pull request list) rather than offering a menu: call while the
+    /// pointer is on it. Names `what` in the ghost; returns true on the
+    /// frame the branch is released there, which ends the drag.
+    pub fn over_place(&self, ctx: &Context, what: &str) -> bool {
+        let frame = ctx.cumulative_pass_nr();
+        ctx.data_mut(|data| data.insert_temp(Id::new("branch-drag-over"), (frame, what.to_owned())));
+        if self.released {
+            DragAndDrop::clear_payload(ctx);
+        }
+        self.released
+    }
 }
 
 /// Marks a row as the place the dragged branch would land.
