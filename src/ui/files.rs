@@ -255,6 +255,14 @@ pub fn file_list(
                             if menu_item(ui, icons::COPY, "Copy file path") {
                                 ui.ctx().copy_text(file.path.clone());
                             }
+                            if !matches!(source, DiffSource::Commit(_))
+                                && let Some(pattern) = crate::git::lfs::extension_pattern(&file.path)
+                            {
+                                ui.separator();
+                                if menu_item(ui, icons::FILE_ARCHIVE, &format!("Track {pattern} with LFS")) {
+                                    run = Some(crate::git::lfs::track(&pattern));
+                                }
+                            }
                         });
                     }
                 }

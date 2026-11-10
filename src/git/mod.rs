@@ -10,6 +10,7 @@ pub mod cli;
 pub mod conflict;
 pub mod diff;
 pub mod graph;
+pub mod lfs;
 pub mod ops;
 pub mod picture;
 pub mod rebase;
