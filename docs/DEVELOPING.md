@@ -28,6 +28,9 @@ signing, credential helpers and the user's config behave as in a terminal.
 | --- | --- |
 | Read something from the repository without blocking the UI | `tab.spawn_job("feature:key", \|loader\| ...)` then `tab.take_result::<T>("feature:key")` on a later frame. The closure gets a `&Loader`; `loader.repo()` is the `git2::Repository`. It may also shell out with `git::cli::run`. |
 | Change the repository | Build a `GitCmd` (`src/git/ops.rs`: `GitCmd::new`, `.step`, `GitCmd::empty` + `Step::new(...).env(...)`) and call `tab.run(cmd)`. Progress, toasts and the refresh afterwards are automatic. Name it with a short imperative label; set `.done("Past tense")` for the success toast; `.quiet()` for routine operations. |
+| Change several branches and tags in one undoable operation | `.undoable(UndoKind::Refs(vec![RefMove::new("refs/heads/develop"), ...]))`: the operator notes where each ref pointed before and after; undo and redo move them all back (or forth), HEAD included, and refuse if one has moved since. `git::gitflow::finish` uses it. |
+| Say what is left when an operation stops on conflicts | `.after_conflict("Finish … again once the merge is committed.")` on the `GitCmd`: added to the "stopped on conflicts" toast. |
+| Know whether the repository uses Gitflow | `snap.gitflow` (`git::gitflow::Config`, read with every snapshot); `ui::gitflow::open_start` / `open_finish` open the dialogs. |
 | Show a full-size view instead of the graph | Add state to your variant of `Overlay` (`src/state.rs`), set `tab.overlay = Some(...)`. `ui::overlay` calls your `show(ui, tab, shared, view) -> bool` (false closes). Start with `widgets::overlay_bar` for the title bar. Escape closes overlays. |
 | Ask the user something | `shared.show(Dialog::...)` (`src/ui/dialogs.rs`); `Dialog::confirm(title, body, button, cmd)` for destructive confirmations. |
 | Tell the user something | `shared.toast(ToastKind::Success \| Error, title, body)`. |

@@ -9,6 +9,7 @@ pub mod blame;
 pub mod cli;
 pub mod conflict;
 pub mod diff;
+pub mod gitflow;
 pub mod graph;
 pub mod ops;
 pub mod picture;
@@ -217,6 +218,8 @@ pub struct RepoSnapshot {
     pub head_message: String,
     pub history: Arc<History>,
     pub refs_by_oid: HashMap<Oid, Vec<RefLabel>>,
+    /// The repository's Gitflow setup, when it has one.
+    pub gitflow: Option<gitflow::Config>,
 }
 
 impl RepoSnapshot {

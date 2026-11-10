@@ -4,6 +4,7 @@ pub mod conflict;
 pub mod dialogs;
 pub mod diff;
 pub mod files;
+pub mod gitflow;
 pub mod graph;
 pub mod highlight;
 pub mod history;

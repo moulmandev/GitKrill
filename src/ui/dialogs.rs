@@ -91,13 +91,13 @@ pub(crate) fn buttons(ui: &mut Ui, confirm: &str, enabled: bool, danger: bool) -
 }
 
 /// Git ref names cannot contain spaces; typing one inserts a dash instead.
-fn sanitize_ref(name: &mut String) {
+pub(crate) fn sanitize_ref(name: &mut String) {
     if name.contains(' ') {
         *name = name.replace(' ', "-");
     }
 }
 
-fn valid_ref(name: &str) -> bool {
+pub(crate) fn valid_ref(name: &str) -> bool {
     let name = name.trim();
     !name.is_empty()
         && !name.starts_with('-')
@@ -280,6 +280,15 @@ fn body(
             crate::ui::new_pull::Next::Keep => Outcome::Keep,
             crate::ui::new_pull::Next::Close => Outcome::Close,
             crate::ui::new_pull::Next::Hold => Outcome::Hold,
+        },
+
+        Dialog::GitflowStart(form) => match crate::ui::gitflow::start_dialog(ui, form, tab, fresh) {
+            crate::ui::gitflow::Next::Keep => Outcome::Keep,
+            crate::ui::gitflow::Next::Close => Outcome::Close,
+        },
+        Dialog::GitflowFinish(form) => match crate::ui::gitflow::finish_dialog(ui, form, tab) {
+            crate::ui::gitflow::Next::Keep => Outcome::Keep,
+            crate::ui::gitflow::Next::Close => Outcome::Close,
         },
 
         Dialog::Update(release) => {

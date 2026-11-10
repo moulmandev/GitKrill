@@ -153,6 +153,7 @@ impl Loader {
             head_message,
             history,
             refs_by_oid,
+            gitflow: super::gitflow::read(&self.repo),
         })
     }
 

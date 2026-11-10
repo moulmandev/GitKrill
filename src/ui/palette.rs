@@ -404,6 +404,10 @@ pub fn entries(tabs: &[RepoTab], active: usize, settings: &Settings) -> Vec<Entr
         );
     }
 
+    if let (Some(tab), Some(snap)) = (tab, snap) {
+        crate::ui::gitflow::palette_entries(&mut list, tab, snap);
+    }
+
     if let Some(snap) = snap {
         branches_and_tags(&mut list, snap);
     }

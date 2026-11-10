@@ -110,6 +110,12 @@ be installed.
 - File history (following renames) and blame, from any file's context menu
 - Tags: create (lightweight or annotated), delete, push
 - Stash, apply, pop, delete
+- Gitflow without the git-flow program: set it up in **Preferences > Gitflow**
+  (the same `gitflow.*` settings git-flow uses), then start and finish
+  features, releases and hotfixes from Gitflow in the branch menu, a branch's
+  right-click menu or the command palette. Finishing merges without
+  fast-forward, tags releases and hotfixes, and can be undone; one that stops
+  on a conflict carries on from there when run again
 - Undo / redo for commits, checkouts, merges, resets, rebases, branch create
   and delete
 
@@ -237,6 +243,7 @@ src/
     graph.rs     lane layout and line colours
     diff.rs      file diffs and per-hunk / per-line patches
     ops.rs       every mutating operation as git invocations, plus undo
+    gitflow.rs   Gitflow setup, start and finish as plain git commands
     conflict.rs  three-way conflict regions and resolutions
     rebase.rs    interactive rebase plans
     blame.rs     file history and blame
@@ -251,6 +258,7 @@ src/
     conflict.rs  conflict resolver   rebase.rs   interactive rebase
     history.rs   file history, blame
     toolbar.rs   toolbar             dialogs.rs  modals and toasts
+    gitflow.rs   Gitflow dialogs, menus and palette entries
     palette.rs   command palette (Ctrl+P)
     image_diff.rs  image preview     update.rs   update offer, status bar
     widgets.rs   shared widgets
