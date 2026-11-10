@@ -109,11 +109,19 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
 - Find coordinates by taking a screenshot first, then script the clicks.
 - The window is off-screen and takes no focus; runs do not disturb the user.
 - Scripts wait for git operations and reader-thread jobs to finish before each
-  step. Work on other threads (blame, avatars, GitHub) is not waited for: add
+  step. Work on other threads (blame, avatars, hosting) is not waited for: add
   a `sleep:`.
 - `press:x,y` / `move:x,y` / `release:x,y` script a drag.
-- `GITKRILL_HOSTING_FIXTURE=<dir>` makes the GitHub sidebar read `pulls.json`,
-  `issues.json` and `runs.json` from disk instead of the network.
+- `GITKRILL_HOSTING_FIXTURE=<dir>` makes the hosting sidebar answer from
+  `<dir>/<endpoint>.json` instead of the network: `pulls`, `issues` and
+  `runs` for GitHub, `merge_requests`, `issues` and `pipelines` for GitLab,
+  in each API's own JSON. `<endpoint>.head` stages a status and headers
+  (a rate limit, an outage). To show a GitLab or self-hosted remote, point
+  the demo's origin at it (`git remote set-url origin
+  https://gitlab.com/group/app.git`) and put `"auto_fetch_minutes": 0` in
+  the run's `cfg/settings.json` first, so the app never fetches from the
+  real host; `"hosting_servers": {"git.example.com": "gitlab"}` there
+  connects a made-up server without clicking through the offer.
 - Screenshot runs keep their avatar cache under the config folder too, so
   they never touch the real one.
 - To see the light theme, put `{"theme": "Light"}` in `cfg/settings.json`

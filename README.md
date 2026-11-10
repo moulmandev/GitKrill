@@ -92,8 +92,13 @@ Wayland; nothing else has to be installed.
 **Remotes**
 - Fetch, pull (default / ff-only / rebase), push, force push with lease
 - Automatic fetch every five minutes
-- GitHub: open pull requests, issues and Actions runs in the sidebar; check
-  out a pull request as a local branch
+- GitHub, GitHub Enterprise and GitLab (gitlab.com or your own server): open
+  pull requests (merge requests on GitLab), issues and CI runs (Actions,
+  pipelines) in the sidebar, each request with the CI status of its head;
+  check out a pull or merge request as a local branch
+- A remote on a server other than github.com or gitlab.com is offered as
+  "Connect <server>…": say whether it runs GitLab or GitHub Enterprise and
+  its lists appear; right-click the remote to disconnect it again
 
 **Shell**
 - Multiple repositories in tabs, restored on start; drop a folder to open it
@@ -114,8 +119,24 @@ Three features talk to the network on their own. Each has a switch in the
 | Feature | What is sent | Where |
 | --- | --- | --- |
 | Author pictures | SHA-256 of each author's email address, or the GitHub user id from a `noreply` address | gravatar.com, avatars.githubusercontent.com |
-| GitHub sidebar | Requests for the repository's pull requests, issues and workflow runs. A token is used if one is found in `GITHUB_TOKEN` / `GH_TOKEN`, `gh auth token`, or git's credential helper; it is sent only to api.github.com and never stored or logged | api.github.com |
+| Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, with a token when one is found for that host (below) | api.github.com, gitlab.com, and only the servers you connected |
 | Automatic fetch | `git fetch --all --prune`, as you would run it | your remotes |
+
+A server other than github.com and gitlab.com is never sent anything until
+you have said what it runs; the answer is kept in the settings file
+(`hosting_servers`). Tokens are looked for per host and sent only to that
+host's API over HTTPS. They are never stored, logged or shown.
+
+| Service | Token sources, in order |
+| --- | --- |
+| github.com | `GITHUB_TOKEN`, `GH_TOKEN`, `gh auth token --hostname github.com`, git's credential helper for github.com |
+| GitHub Enterprise | `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` (unless `GH_HOST` names another server), `gh auth token --hostname <server>`, git's credential helper for the server |
+| gitlab.com | `GITLAB_TOKEN` (unless `GITLAB_HOST` names another server), `glab config get token --host gitlab.com`, git's credential helper for gitlab.com |
+| Your GitLab | `GITLAB_TOKEN` only when `GITLAB_HOST` names the server, `glab config get token --host <server>`, git's credential helper for the server |
+
+A github.com token never goes to an Enterprise server, nor the other way
+round. `gh` and `glab` are run without the token variables, so they answer
+with what they keep for that exact host.
 
 ## Shortcuts
 
@@ -157,7 +178,8 @@ src/
   worker.rs      reader / operator threads and the file watcher
   theme.rs       colours, fonts, egui style
   avatars.rs     author pictures: fetch, disk cache, textures
-  hosting/       GitHub client for pull requests, issues and Actions
+  hosting/       pull / merge requests, issues and CI: github.rs (GitHub
+                 and Enterprise), gitlab.rs, shared sign-in and network
   git/
     repo.rs      snapshot loading (refs, status, history walk)
     graph.rs     lane layout and line colours
@@ -169,7 +191,7 @@ src/
     cli.rs       running git
   ui/
     graph.rs     commit graph (graph/drag.rs: dragging branches)
-    sidebar.rs   refs sidebar        hosting.rs  GitHub sections
+    sidebar.rs   refs sidebar        hosting.rs  hosting sections
     panel.rs     staging / details   files.rs    changed-file lists
     diff.rs      diff view           highlight.rs  syntax colours
     conflict.rs  conflict resolver   rebase.rs   interactive rebase
@@ -189,8 +211,10 @@ tools/           demo repository and screenshot scripts
 
 - Undo does not cover a rebase that stopped on conflicts and was continued, or
   drag actions that switch branches first (`git reflog` still has them)
-- Pull request review state, creating pull requests, GitHub Enterprise, GitLab
-  and other hosts
+- Pull request review state and merge request approvals; creating pull
+  requests
+- Bitbucket, Gitea, Azure DevOps and other hosts; GitLab installed under a
+  path (`example.com/gitlab`)
 - Interactive rebase refuses ranges that contain merge commits
 - File history and blame always start from HEAD
 - No ancestor pane or syntax colours in the conflict resolver, and text in

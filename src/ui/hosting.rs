@@ -1,13 +1,16 @@
-//! Sidebar sections for pull requests, issues and CI runs.
+//! Sidebar sections for pull requests (merge requests on GitLab), issues and
+//! CI runs, the offer to connect a self-hosted server, and the dialog that
+//! asks what runs on it.
 
-use eframe::egui::{Align2, Color32, Rect, Response, Sense, Ui, Vec2, pos2};
+use eframe::egui::{Align2, Button, Color32, Rect, Response, RichText, Sense, Ui, Vec2, pos2, vec2};
 
-use crate::git::{BranchInfo, Oid, RepoSnapshot};
+use crate::git::{BranchInfo, Oid, RemoteInfo, RepoSnapshot};
 use crate::git::ops::GitCmd;
-use crate::hosting::{self, Checks, Feed, Issue, PullRequest, Run, RunState, Shown};
-use crate::state::{RepoTab, Shared};
+use crate::hosting::{self, Checks, Feed, Issue, Offer, PullRequest, Run, RunState, ServerKind, Service, Shown};
+use crate::state::{Dialog, RepoTab, Shared};
 use crate::theme::{self, icons};
-use crate::ui::sidebar::{leaf, row, section};
+use crate::ui::dialogs;
+use crate::ui::sidebar::{leaf, row, section, section_header};
 use crate::ui::widgets::{elided, elided_pair, menu_item, spinner};
 
 /// What a click or a menu entry asked for; applied once the lists are drawn.
@@ -15,26 +18,60 @@ enum Act {
     Refresh,
     Run(GitCmd),
     Jump(Oid),
+    /// Ask what runs on a server.
+    Connect(Offer),
+    /// Remember what the user said a server is.
+    Choose(String, ServerKind),
+    /// Forget it: the server is no longer contacted, and offered again.
+    Disconnect(String),
 }
 
 /// Called at the end of the sidebar, inside its scroll area.
 pub fn sections(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSnapshot) {
     let enabled = shared.settings.hosting_integration;
     let ctx = ui.ctx().clone();
-    let Some(shown) = tab.hosting.sync(&ctx, &snap.workdir, &snap.remotes, enabled) else { return };
-    let Shown { repo, view, .. } = &shown;
+    let servers = &shared.settings.hosting_servers;
+    let offers = if enabled { hosting::offers(&snap.remotes, servers) } else { Vec::new() };
+    let shown = tab.hosting.sync(&ctx, &snap.workdir, &snap.remotes, servers, enabled);
 
+    let mut act = None;
+    if let Some(shown) = &shown {
+        lists(ui, tab, snap, shown, &mut act);
+    }
+    if !offers.is_empty() {
+        offer_section(ui, tab, &offers, &mut act);
+    }
+
+    match act {
+        Some(Act::Refresh) => tab.hosting.refresh(),
+        Some(Act::Run(cmd)) => tab.run(cmd),
+        Some(Act::Jump(oid)) => tab.jump_to(oid),
+        Some(Act::Connect(offer)) => shared.show(connect_dialog(&offer)),
+        Some(Act::Choose(host, kind)) => {
+            shared.settings.hosting_servers.insert(host, kind);
+        }
+        Some(Act::Disconnect(host)) => {
+            shared.settings.hosting_servers.remove(&host);
+        }
+        None => {}
+    }
+}
+
+/// The three lists for the repository being shown.
+fn lists(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, shown: &Shown, act: &mut Option<Act>) {
+    let Shown { repo, view, .. } = shown;
+    let service = repo.service;
     let filter = tab.sidebar_filter.trim().to_lowercase();
-    // The sidebar's filter box narrows these lists too, by text or `#number`.
+    // The sidebar's filter box narrows these lists too, by text or by
+    // number (`#12`, or `!12` for a merge request).
     let matches = |number: Option<u64>, texts: &[&str]| {
         filter.is_empty()
             || texts.iter().any(|text| text.to_lowercase().contains(&filter))
-            || number.is_some_and(|number| format!("#{number}").contains(&filter))
+            || number.is_some_and(|n| format!("#{n}").contains(&filter) || format!("!{n}").contains(&filter))
     };
     let now = hosting::epoch_now() as i64;
-    let mut act = None;
 
-    // ---- pull requests ----
+    // ---- pull / merge requests ----
     let pulls: Vec<&PullRequest> = view
         .pulls
         .items
@@ -42,12 +79,13 @@ pub fn sections(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Repo
         .filter(|pr| matches(Some(pr.number), &[&pr.title, &pr.author, &pr.head_ref]))
         .collect();
     let count = (pulls.len(), view.pulls.items.len());
-    if header(ui, tab, &shown, "PULL REQUESTS", icons::GIT_PULL_REQUEST, count, &mut act) {
-        notice(ui, &shown, &view.pulls, &mut act);
+    let url = repo.pulls_url();
+    if header(ui, tab, shown, (service.pulls_title(), pull_icon(service), &url), count, act) {
+        notice(ui, shown, &view.pulls, act);
         for pr in pulls {
-            pull_row(ui, snap, &shown, pr, &mut act);
+            pull_row(ui, snap, shown, pr, act);
         }
-        more(ui, &shown, &view.pulls, &repo.pulls_url());
+        more(ui, shown, &view.pulls, &url);
     }
 
     // ---- issues ----
@@ -58,12 +96,13 @@ pub fn sections(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Repo
         .filter(|issue| matches(Some(issue.number), &[&issue.title, &issue.author]))
         .collect();
     let count = (issues.len(), view.issues.items.len());
-    if header(ui, tab, &shown, "ISSUES", icons::RADIO_BUTTON, count, &mut act) {
-        notice(ui, &shown, &view.issues, &mut act);
+    let url = repo.issues_url();
+    if header(ui, tab, shown, ("ISSUES", icons::RADIO_BUTTON, &url), count, act) {
+        notice(ui, shown, &view.issues, act);
         for issue in issues {
-            issue_row(ui, &shown, issue, &mut act);
+            issue_row(ui, shown, issue, act);
         }
-        more(ui, &shown, &view.issues, &repo.issues_url());
+        more(ui, shown, &view.issues, &url);
     }
 
     // ---- CI runs ----
@@ -74,20 +113,18 @@ pub fn sections(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Repo
         .filter(|run| matches(None, &[&run.workflow, &run.branch, &run.title]))
         .collect();
     let count = (runs.len(), view.runs.items.len());
-    if header(ui, tab, &shown, repo.service.ci_title(), icons::PLAY_CIRCLE, count, &mut act) {
-        notice(ui, &shown, &view.runs, &mut act);
+    let url = repo.runs_url();
+    if header(ui, tab, shown, (service.ci_title(), icons::PLAY_CIRCLE, &url), count, act) {
+        notice(ui, shown, &view.runs, act);
         for run in runs {
-            run_row(ui, &shown, run, now, &mut act);
+            run_row(ui, shown, run, now, act);
         }
-        more(ui, &shown, &view.runs, &repo.runs_url());
+        more(ui, shown, &view.runs, &url);
     }
+}
 
-    match act {
-        Some(Act::Refresh) => tab.hosting.refresh(),
-        Some(Act::Run(cmd)) => tab.run(cmd),
-        Some(Act::Jump(oid)) => tab.jump_to(oid),
-        None => {}
-    }
+fn pull_icon(service: Service) -> &'static str {
+    if service.is_gitlab() { icons::GIT_MERGE } else { icons::GIT_PULL_REQUEST }
 }
 
 /// Opens a page in the default browser.
@@ -104,19 +141,19 @@ fn browse(url: &str) {
 ///
 /// The header has no room to spare at the sidebar's narrowest, so the button
 /// takes the place of the count at the right edge: while the pointer is over
-/// the header, and as a spinner while a refresh is in flight. Returns whether
-/// the section is open.
+/// the header, and as a spinner while a refresh is in flight. Right-clicking
+/// the header offers the list's page and, for a self-hosted server, a way to
+/// disconnect it. Returns whether the section is open.
 fn header(
     ui: &mut Ui,
     tab: &mut RepoTab,
     shown: &Shown,
-    title: &str,
-    icon: &str,
+    (title, icon, url): (&str, &str, &str),
     (visible, total): (usize, usize),
     act: &mut Option<Act>,
 ) -> bool {
     let (left, top, width) = (ui.cursor().left(), ui.cursor().top(), ui.available_width());
-    let open = section(ui, tab, title, icon, visible, total);
+    let (open, bar_response) = section_header(ui, tab, title, icon, visible, total);
     let bar = Rect::from_min_max(pos2(left, top), pos2(left + width, ui.cursor().top()));
 
     // Where the header painted its count: right-aligned, 12 points in.
@@ -151,9 +188,8 @@ fn header(
         *act = Some(Act::Refresh);
     }
     response.on_hover_ui(|ui| {
-        let service = shown.repo.service.name();
-        let mut text = format!("Refresh from {service}  ({})", shown.repo.slug());
-        let auth = shown.view.auth.describe();
+        let mut text = format!("Refresh from {}  ({})", shown.repo.site(), shown.repo.slug());
+        let auth = shown.view.auth.describe(shown.repo.service);
         if !auth.is_empty() {
             text.push_str(&format!("\n{auth}"));
         }
@@ -162,7 +198,27 @@ fn header(
         }
         ui.label(text);
     });
+    bar_response.context_menu(|ui| {
+        ui.set_min_width(200.0);
+        refresh_item(ui, act);
+        if menu_item(ui, icons::ARROW_SQUARE_OUT, &format!("Open on {}", shown.repo.site())) {
+            browse(url);
+        }
+        disconnect_item(ui, shown, act);
+    });
     open
+}
+
+/// "Disconnect <host>", for a server the user connected.
+fn disconnect_item(ui: &mut Ui, shown: &Shown, act: &mut Option<Act>) {
+    if !shown.repo.self_hosted() {
+        return;
+    }
+    ui.separator();
+    let host = &shown.repo.host;
+    if menu_item(ui, icons::LINK_BREAK, &format!("Disconnect {host}")) {
+        *act = Some(Act::Disconnect(host.clone()));
+    }
 }
 
 /// The one dim line a section shows when its list could not be refreshed
@@ -193,7 +249,10 @@ fn notice<T>(ui: &mut Ui, shown: &Shown, feed: &Feed<T>, act: &mut Option<Act>) 
         if response.clicked() {
             *act = Some(Act::Refresh);
         }
-        response.context_menu(|ui| refresh_item(ui, act));
+        response.context_menu(|ui| {
+            refresh_item(ui, act);
+            disconnect_item(ui, shown, act);
+        });
         response.on_hover_ui(|ui| {
             ui.set_max_width(320.0);
             ui.label(problem.detail(service));
@@ -208,7 +267,7 @@ fn more<T>(ui: &mut Ui, shown: &Shown, feed: &Feed<T>, url: &str) {
     if !feed.more {
         return;
     }
-    let text = format!("More on {}…", shown.repo.service.name());
+    let text = format!("More on {}…", shown.repo.site());
     let response = leaf(ui, 0, false, icons::ARROW_SQUARE_OUT, &text, theme::text_dim(), "");
     if opened(&response) {
         browse(url);
@@ -269,25 +328,29 @@ fn item_row(
 /// The local branch a pull request is available as: the one "Check out"
 /// creates, or its own head branch when it comes from this repository.
 fn local_branch<'a>(snap: &'a RepoSnapshot, shown: &Shown, pr: &PullRequest) -> Option<&'a BranchInfo> {
-    let checked_out = hosting::pull_branch(pr.number);
+    let checked_out = hosting::pull_branch(shown.repo.service, pr.number);
     snap.branches.iter().find(|branch| branch.name == checked_out).or_else(|| {
         let own = pr.is_from(&shown.repo);
         snap.branches.iter().find(|branch| own && branch.name == pr.head_ref)
     })
 }
 
-fn checks_mark(checks: Checks) -> (&'static str, Color32, &'static str) {
+fn checks_mark(service: Service, checks: Checks) -> (&'static str, Color32, &'static str) {
+    let gitlab = service.is_gitlab();
     match checks {
-        Checks::Passing => (icons::CHECK, theme::green(), "Checks passed"),
-        Checks::Failing => (icons::X, theme::red(), "Checks failed"),
-        Checks::Pending => (icons::CIRCLE_NOTCH, theme::yellow(), "Checks running"),
+        Checks::Passing => (icons::CHECK, theme::green(), if gitlab { "Pipeline passed" } else { "Checks passed" }),
+        Checks::Failing => (icons::X, theme::red(), if gitlab { "Pipeline failed" } else { "Checks failed" }),
+        Checks::Pending => {
+            (icons::CIRCLE_NOTCH, theme::yellow(), if gitlab { "Pipeline running" } else { "Checks running" })
+        }
     }
 }
 
 fn pull_row(ui: &mut Ui, snap: &RepoSnapshot, shown: &Shown, pr: &PullRequest, act: &mut Option<Act>) {
+    let service = shown.repo.service;
     let local = local_branch(snap, shown, pr);
     let current = local.is_some_and(|branch| branch.is_head);
-    let checks = hosting::checks_for(&pr.head_sha, &shown.view.runs.items).map(checks_mark);
+    let checks = hosting::checks_for(&pr.head_sha, &shown.view.runs.items).map(|checks| checks_mark(service, checks));
 
     let (icon_color, title_color) = match (pr.draft, current) {
         (true, _) => (theme::text_faint(), theme::text_dim()),
@@ -301,11 +364,11 @@ fn pull_row(ui: &mut Ui, snap: &RepoSnapshot, shown: &Shown, pr: &PullRequest, a
     if pr.draft {
         marks.push(("Draft", 11.0, theme::text_dim()));
     }
-    let number = format!("#{}", pr.number);
+    let number = service.pull_number(pr.number);
     let response = item_row(
         ui,
         current,
-        (icons::GIT_PULL_REQUEST, icon_color),
+        (pull_icon(service), icon_color),
         (&number, &pr.title, title_color),
         &marks,
     );
@@ -324,20 +387,15 @@ fn pull_row(ui: &mut Ui, snap: &RepoSnapshot, shown: &Shown, pr: &PullRequest, a
 
     response.context_menu(|ui| {
         ui.set_min_width(220.0);
-        let branch = hosting::pull_branch(pr.number);
+        let branch = hosting::pull_branch(service, pr.number);
         let on_branch = snap.head.branch.as_deref() == Some(branch.as_str());
         let label = if on_branch {
-            format!("Update {branch} from {}", shown.repo.service.name())
+            format!("Update {branch} from {}", shown.repo.site())
         } else {
             format!("Check out as {branch}")
         };
         if menu_item(ui, icons::CHECK, &label) {
-            *act = Some(Act::Run(hosting::checkout_pull(
-                &shown.remote,
-                shown.repo.service,
-                pr.number,
-                on_branch,
-            )));
+            *act = Some(Act::Run(hosting::checkout_pull(&shown.remote, service, pr.number, on_branch)));
         }
         if let Some(oid) = target
             && menu_item(ui, icons::GIT_COMMIT, "Show in graph")
@@ -355,7 +413,7 @@ fn pull_row(ui: &mut Ui, snap: &RepoSnapshot, shown: &Shown, pr: &PullRequest, a
 
     response.on_hover_ui(|ui| {
         ui.set_max_width(360.0);
-        let mut text = format!("#{}  {}\n{}  {}  {}", pr.number, pr.title, pr.head_ref, icons::ARROW_RIGHT, pr.base_ref);
+        let mut text = format!("{number}  {}\n{}  {}  {}", pr.title, pr.head_ref, icons::ARROW_RIGHT, pr.base_ref);
         text.push_str(&format!("\nby {}", pr.author));
         if pr.draft {
             text.push_str("  ·  draft");
@@ -464,4 +522,137 @@ fn run_row(ui: &mut Ui, shown: &Shown, run: &Run, now: i64, act: &mut Option<Act
         }
         ui.label(text);
     });
+}
+
+// ---- self-hosted servers --------------------------------------------------
+
+/// Servers the remotes point at that the user has not said anything about:
+/// one row each, which asks what runs there. Nothing is sent to a server
+/// before that.
+fn offer_section(ui: &mut Ui, tab: &mut RepoTab, offers: &[Offer], act: &mut Option<Act>) {
+    if !section(ui, tab, "HOSTING", icons::PLUGS, offers.len(), offers.len()) {
+        return;
+    }
+    for offer in offers {
+        let text = format!("Connect {}…", offer.host);
+        let response = leaf(ui, 0, false, icons::PLUG, &text, theme::text(), "");
+        if response.clicked() {
+            *act = Some(Act::Connect(offer.clone()));
+        }
+        response.context_menu(|ui| {
+            ui.set_min_width(200.0);
+            if menu_item(ui, icons::PLUGS_CONNECTED, &text) {
+                *act = Some(Act::Connect(offer.clone()));
+            }
+            if menu_item(ui, icons::EYE_SLASH, "Don't offer again") {
+                *act = Some(Act::Choose(offer.host.clone(), ServerKind::Ignored));
+            }
+        });
+        response.on_hover_ui(|ui| {
+            ui.set_max_width(320.0);
+            ui.label(format!(
+                "{} is on {}. Say whether it runs GitLab or GitHub Enterprise to see its \
+                 requests, issues and CI here. Nothing is sent to {} until then.",
+                offer.path, offer.host, offer.host
+            ));
+        });
+    }
+}
+
+/// The dialog that asks what runs on the server of `offer`, with the guess
+/// its name suggests already chosen.
+fn connect_dialog(offer: &Offer) -> Dialog {
+    Dialog::ConnectServer { host: offer.host.clone(), path: offer.path.clone(), choice: offer.guess }
+}
+
+/// Entries for a remote's context menu in the REMOTE section: connect the
+/// self-hosted server it points at, or disconnect it again.
+pub fn remote_menu(ui: &mut Ui, shared: &mut Shared, remote: &RemoteInfo) {
+    if !shared.settings.hosting_integration {
+        return;
+    }
+    let Some(offer) = hosting::offer_for(remote) else { return };
+    let connected = shared.settings.hosting_servers.get(&offer.host).and_then(|kind| kind.service());
+    ui.separator();
+    match connected {
+        Some(service) => {
+            let label = format!("Disconnect {} ({})", offer.host, service.name());
+            if menu_item(ui, icons::LINK_BREAK, &label) {
+                shared.settings.hosting_servers.remove(&offer.host);
+            }
+        }
+        None => {
+            if menu_item(ui, icons::PLUGS_CONNECTED, &format!("Connect {}…", offer.host)) {
+                shared.show(connect_dialog(&offer));
+            }
+        }
+    }
+}
+
+/// The body of [`Dialog::ConnectServer`]. Returns true when it should close.
+pub fn connect_body(ui: &mut Ui, shared: &mut Shared, host: &str, path: &str, choice: &mut Option<ServerKind>) -> bool {
+    dialogs::title(ui, &format!("Connect {host}"));
+    ui.label(
+        RichText::new(format!(
+            "What runs on {host}? Once you say, the sidebar shows the requests, issues and CI \
+             of {path} from there. Nothing is sent to {host} before."
+        ))
+        .color(theme::text_dim()),
+    );
+    ui.add_space(2.0);
+    let options = [
+        (ServerKind::GitLab, icons::GITLAB_LOGO, "GitLab"),
+        (ServerKind::GitHubEnterprise, icons::GITHUB_LOGO, "GitHub Enterprise"),
+        (ServerKind::Ignored, icons::PROHIBIT, "Neither: don't offer again"),
+    ];
+    for (kind, icon, label) in options {
+        let selected = *choice == Some(kind);
+        let color = if selected { theme::text_bright() } else { theme::text() };
+        let text = RichText::new(format!("{icon}   {label}")).font(theme::font(13.5)).color(color);
+        let option = Button::selectable(selected, text)
+            .frame_when_inactive(true)
+            .min_size(vec2(ui.available_width(), 30.0));
+        if ui.add(option).clicked() {
+            *choice = Some(kind);
+        }
+    }
+
+    let explanation = match *choice {
+        Some(ServerKind::GitLab) => format!(
+            "Requests go to {} only. A token is used if one is found for this server: \
+             GITLAB_TOKEN when GITLAB_HOST names it, glab's sign-in, or Git's credential \
+             manager.",
+            hosting::api_base(Service::GitLab, host)
+        ),
+        Some(ServerKind::GitHubEnterprise) => format!(
+            "Requests go to {} only. A token is used if one is found for this server: \
+             GH_ENTERPRISE_TOKEN, gh's sign-in, or Git's credential manager. github.com \
+             tokens are never sent to it.",
+            hosting::api_base(Service::GitHubEnterprise, host)
+        ),
+        Some(ServerKind::Ignored) => format!(
+            "{host} is not contacted, and not offered again. Right-click the remote to \
+             connect it later."
+        ),
+        None => "Choose one to see where requests would go and which sign-in would be used.".to_owned(),
+    };
+    ui.add_space(2.0);
+    // Room for the longest explanation, so the dialog (centred on screen)
+    // does not move under the pointer when the choice changes.
+    ui.scope(|ui| {
+        ui.set_min_height(50.0);
+        ui.label(RichText::new(explanation).font(theme::font(12.0)).color(theme::text_dim()));
+    });
+
+    let button = if *choice == Some(ServerKind::Ignored) { "Save" } else { "Connect" };
+    match dialogs::buttons(ui, button, choice.is_some(), false) {
+        Some(true) => {
+            if let Some(kind) = *choice {
+                shared.settings.hosting_servers.insert(host.to_owned(), kind);
+            }
+            true
+        }
+        Some(false) => true,
+        None => false,
+    }
 }

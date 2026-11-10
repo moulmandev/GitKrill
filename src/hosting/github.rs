@@ -1,184 +1,17 @@
-//! GitHub: remote URLs, sign-in, REST endpoints and their JSON.
+//! GitHub, on github.com and on Enterprise servers: the REST endpoints and
+//! their JSON. Both speak the same API; only its address differs.
 
 use serde::Deserialize;
 
 use super::*;
 
-/// The only place a token is ever sent.
+/// github.com's API. Enterprise servers have theirs at `/api/v3` on their
+/// own host (see [`RepoId::api_base`]).
 pub const API: &str = "https://api.github.com";
 
-pub(super) fn is_api(url: &str) -> bool {
-    url.strip_prefix(API).is_some_and(|rest| rest.starts_with('/'))
-}
-
-/// Understands `https://github.com/o/r(.git)`, `git@github.com:o/r.git`,
-/// `ssh://git@github.com/o/r` and their variations (user names, ports,
-/// trailing slashes, `ssh.github.com`). Anything else, including other
-/// hosts whose name merely contains "github.com", is `None`.
-pub fn parse_remote(url: &str) -> Option<RepoId> {
-    let url = url.trim();
-    let (host, path) = match url.split_once("://") {
-        Some((scheme, rest)) => {
-            let known = ["https", "http", "ssh", "git", "git+ssh", "ssh+git"];
-            if !known.contains(&scheme.to_ascii_lowercase().as_str()) {
-                return None;
-            }
-            let (authority, path) = rest.split_once('/')?;
-            let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
-            (host.split_once(':').map_or(host, |(host, _port)| host), path)
-        }
-        // scp-like: [user@]host:path. A slash before the colon means a
-        // local path (`C:/x` has a one-letter "host" and fails below).
-        None => {
-            let (left, path) = url.split_once(':')?;
-            if left.contains('/') || left.contains('\\') {
-                return None;
-            }
-            (left.rsplit_once('@').map_or(left, |(_, host)| host), path)
-        }
-    };
-    let hosts = ["github.com", "www.github.com", "ssh.github.com"];
-    if !hosts.contains(&host.to_ascii_lowercase().as_str()) {
-        return None;
-    }
-
-    let mut parts = path.trim_matches('/').split('/');
-    let (owner, name) = (parts.next()?, parts.next()?);
-    if parts.next().is_some() {
-        return None;
-    }
-    let name = name.strip_suffix(".git").unwrap_or(name);
-    let valid = |part: &str| {
-        !part.is_empty()
-            && part != "."
-            && part != ".."
-            && part.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    };
-    (valid(owner) && valid(name)).then(|| RepoId {
-        service: Service::GitHub,
-        owner: owner.to_owned(),
-        name: name.to_owned(),
-    })
-}
-
-// ---- sign-in ----
-
-/// The real environment: variables, `gh`, and `git credential`.
-pub struct System {
-    workdir: PathBuf,
-}
-
-impl System {
-    pub fn new(workdir: &Path) -> Self {
-        System { workdir: workdir.to_path_buf() }
-    }
-}
-
-impl Secrets for System {
-    fn env(&self, name: &str) -> Option<String> {
-        std::env::var(name).ok()
-    }
-
-    fn cli(&self) -> Option<String> {
-        let mut cmd = Command::new("gh");
-        cmd.args(["auth", "token", "--hostname", "github.com"]).env("GH_PROMPT_DISABLED", "1");
-        capture(cmd, b"", Duration::from_secs(10))
-    }
-
-    fn credential_helper(&self) -> Option<String> {
-        // Asked so that nothing can open a window or wait for a
-        // keyboard: the credential manager is told not to interact, and
-        // every askpass fallback and the terminal prompt are disabled.
-        // With nothing stored, git simply fails.
-        let mut cmd = Command::new("git");
-        cmd.current_dir(&self.workdir)
-            .args(["-c", "core.askPass=", "credential", "fill"])
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("GCM_INTERACTIVE", "Never")
-            .env("GIT_ASKPASS", "")
-            .env("SSH_ASKPASS", "");
-        let answer = capture(cmd, b"protocol=https\nhost=github.com\n\n", Duration::from_secs(15))?;
-        password_from(&answer)
-    }
-}
-
-/// The `password=` line of `git credential fill` output.
-pub fn password_from(answer: &str) -> Option<String> {
-    answer.lines().find_map(|line| line.strip_prefix("password=")).map(str::to_owned)
-}
-
-// ---- the wire ----
-
-/// The real network, through `ureq`.
-pub struct Wire {
-    agent: ureq::Agent,
-}
-
-impl Wire {
-    pub fn new() -> Self {
-        let config = ureq::Agent::config_builder()
-            .https_only(true)
-            // Statuses are data here (304, 403, 404 all mean something).
-            .http_status_as_error(false)
-            // Redirects come back to the client, which only follows
-            // them within the API host.
-            .max_redirects(0)
-            .max_redirects_will_error(false)
-            .timeout_global(Some(Duration::from_secs(25)))
-            .user_agent(concat!("GitKrill/", env!("CARGO_PKG_VERSION")))
-            .build();
-        Wire { agent: config.into() }
-    }
-}
-
-impl Transport for Wire {
-    fn get(&mut self, request: &HttpRequest<'_>) -> Result<HttpResponse, String> {
-        let mut call = self
-            .agent
-            .get(request.url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28");
-        if let Some(etag) = request.etag {
-            call = call.header("If-None-Match", etag);
-        }
-        // The one line where a token leaves the process, and only
-        // towards the API host over HTTPS.
-        if let Some(token) = request.token
-            && is_api(request.url)
-        {
-            call = call.header("Authorization", token.authorization());
-        }
-
-        let mut response = call.call().map_err(explain)?;
-        let status = response.status().as_u16();
-        let headers = response
-            .headers()
-            .iter()
-            .filter_map(|(name, value)| Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned())))
-            .collect();
-        let body = match status {
-            304 => String::new(),
-            _ => response
-                .body_mut()
-                .with_config()
-                .limit(32 * 1024 * 1024)
-                .read_to_string()
-                .map_err(explain)?,
-        };
-        Ok(HttpResponse { status, headers, body })
-    }
-}
-
-/// A transport failure in a few plain words. Built from the kind of
-/// error, never from request contents.
-fn explain(error: ureq::Error) -> String {
-    match error {
-        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => "no connection".to_owned(),
-        ureq::Error::Timeout(_) => "timed out".to_owned(),
-        ureq::Error::Io(io) => format!("network error ({})", io.kind()),
-        other => other.to_string(),
-    }
-}
+/// Sent with every request, to github.com and to Enterprise servers alike.
+pub const HEADERS: &[(&str, &str)] =
+    &[("Accept", "application/vnd.github+json"), ("X-GitHub-Api-Version", "2022-11-28")];
 
 // ---- JSON ----
 
@@ -360,8 +193,8 @@ enum List {
 }
 
 impl List {
-    fn url(self, repo: &RepoId) -> String {
-        let base = format!("{API}/repos/{}/{}", repo.owner, repo.name);
+    fn url(self, api: &str, repo: &RepoId) -> String {
+        let base = format!("{api}/repos/{}/{}", repo.owner, repo.name);
         match self {
             List::Pulls => format!("{base}/pulls?state=open&per_page=30"),
             // Pull requests come back mixed in and are filtered out, so
@@ -385,6 +218,8 @@ enum Got {
 
 pub struct Client {
     repo: RepoId,
+    /// [`RepoId::api_base`]: every request goes below it.
+    api: String,
     transport: Box<dyn Transport>,
     secrets: Box<dyn Secrets>,
     token: Option<(Token, TokenSource)>,
@@ -400,6 +235,7 @@ pub struct Client {
 impl Client {
     pub fn new(repo: RepoId, transport: Box<dyn Transport>, secrets: Box<dyn Secrets>) -> Self {
         Client {
+            api: repo.api_base(),
             repo,
             transport,
             secrets,
@@ -423,17 +259,17 @@ impl Client {
     }
 
     fn get(&mut self, list: List, now: u64) -> Result<Got, Problem> {
-        let mut url = list.url(&self.repo);
+        let mut url = list.url(&self.api, &self.repo);
         let mut hops = 0;
         loop {
             if !self.looked {
-                let found = find_token(self.secrets.as_ref(), &self.rejected);
+                let found = find_token(self.secrets.as_ref(), &self.repo, &self.rejected);
                 self.sign_in(found);
             }
             if let Some(until) = self.limiter.blocked(now) {
                 return Err(Problem::RateLimited { until });
             }
-            // Every address requested is on the API host; redirects
+            // Every address requested is below the API's; redirects
             // elsewhere are refused below before anything is sent.
             let request = HttpRequest {
                 url: &url,
@@ -457,12 +293,12 @@ impl Client {
                 // A renamed or transferred repository answers with a
                 // redirect to its permanent API address.
                 301 | 302 | 307 | 308 => match response.header("location") {
-                    Some(location) if is_api(location) && hops < 3 => {
+                    Some(location) if within(&self.api, location) && hops < 3 => {
                         url = location.to_owned();
                         hops += 1;
                         continue;
                     }
-                    _ => Err(Problem::Failed("GitHub sent an unexpected redirect".to_owned())),
+                    _ => Err(Problem::Failed(format!("{} sent an unexpected redirect", self.repo.service.name()))),
                 },
                 // A bad or expired token: forget it and try the next
                 // source, ending with no token at all.
@@ -470,7 +306,7 @@ impl Client {
                     if let Some((token, _)) = self.token.take() {
                         self.rejected.push(token);
                     }
-                    let found = find_token(self.secrets.as_ref(), &self.rejected);
+                    let found = find_token(self.secrets.as_ref(), &self.repo, &self.rejected);
                     self.sign_in(found);
                     continue;
                 }
@@ -483,7 +319,7 @@ impl Client {
                 404 => Err(Problem::NoAccess),
                 410 => Ok(Got::Nothing),
                 403 if !message.is_empty() => Err(Problem::Refused(message)),
-                status => Err(Problem::Failed(format!("GitHub answered {status}"))),
+                status => Err(Problem::Failed(format!("{} answered {status}", self.repo.service.name()))),
             };
         }
     }
@@ -503,7 +339,8 @@ impl Client {
                     // Do not let a later "not modified" vouch for an
                     // answer we could not read.
                     self.etags[list as usize] = None;
-                    Outcome::Failed(Problem::Failed(format!("Unreadable answer from GitHub ({error})")))
+                    let service = self.repo.service.name();
+                    Outcome::Failed(Problem::Failed(format!("Unreadable answer from {service} ({error})")))
                 }
             },
             Err(problem) => Outcome::Failed(problem),

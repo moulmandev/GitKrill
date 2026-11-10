@@ -40,7 +40,7 @@ pub fn show(ctx: &egui::Context, shared: &mut Shared, tab: Option<&mut RepoTab>)
     }
 }
 
-fn title(ui: &mut Ui, text: &str) {
+pub(crate) fn title(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).font(theme::bold(16.0)).color(theme::text_bright()));
     ui.add_space(2.0);
 }
@@ -54,7 +54,7 @@ fn field(ui: &mut Ui, value: &mut String, hint: &str, focus: bool) -> egui::Resp
 }
 
 /// Cancel / confirm row. Returns `Some(true)` on confirm, `Some(false)` on cancel.
-fn buttons(ui: &mut Ui, confirm: &str, enabled: bool, danger: bool) -> Option<bool> {
+pub(crate) fn buttons(ui: &mut Ui, confirm: &str, enabled: bool, danger: bool) -> Option<bool> {
     let mut result = None;
     ui.add_space(6.0);
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -254,6 +254,13 @@ fn body(
                 }
                 Some(false) => Outcome::Close,
                 None => Outcome::Keep,
+            }
+        }
+
+        Dialog::ConnectServer { host, path, choice } => {
+            match crate::ui::hosting::connect_body(ui, shared, host, path, choice) {
+                true => Outcome::Close,
+                false => Outcome::Keep,
             }
         }
 
