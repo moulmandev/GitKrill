@@ -9,6 +9,7 @@ use std::sync::Arc;
 use git2::{BranchType, ReferenceType, Repository, RepositoryState, Sort, Status, StatusOptions};
 
 use super::graph::Graph;
+use super::hidden::Hidden;
 use super::{
     BranchInfo, ChangeKind, CommitDetails, CommitInfo, FileChange, Head, History, Oid, RefKind,
     RefLabel, RemoteBranch, RemoteInfo, RepoSnapshot, RepoState, RowKind, StashInfo,
@@ -51,7 +52,10 @@ impl Loader {
         &self.repo
     }
 
-    pub fn snapshot(&mut self, limit: usize) -> Result<RepoSnapshot, String> {
+    /// Everything the UI shows about the repository now. Refs that `hidden`
+    /// hides are listed but not walked and not labelled; the checked out
+    /// branch is never hidden.
+    pub fn snapshot(&mut self, limit: usize, hidden: &Hidden) -> Result<RepoSnapshot, String> {
         let workdir = self.repo.workdir().ok_or("Repository has no working directory")?.to_path_buf();
         let head = read_head(&self.repo);
         let state = match self.repo.state() {
@@ -87,7 +91,9 @@ impl Loader {
         for st in &stashes {
             st.oid.hash(&mut hasher);
         }
+        hidden.hash(&mut hasher);
         let fingerprint = hasher.finish();
+        let shown = Shown::new(hidden, &branches, &remote_branches, &tags);
 
         let has_wip = !status.is_clean();
         let history = match &self.history_cache {
@@ -98,9 +104,9 @@ impl Loader {
                     _ => {
                         let mut tips: Vec<Oid> = Vec::new();
                         tips.extend(head.oid);
-                        tips.extend(branches.iter().filter_map(|b| b.oid));
-                        tips.extend(remote_branches.iter().map(|b| b.oid));
-                        tips.extend(tags.iter().map(|t| t.oid));
+                        tips.extend(shown.branches(&branches).filter_map(|b| b.oid));
+                        tips.extend(shown.remotes(&remote_branches).map(|b| b.oid));
+                        tips.extend(shown.tags(&tags).map(|t| t.oid));
                         let (commits, more) = self.walk(&tips, limit, &stashes);
                         let base = Arc::new(commits);
                         self.walk_cache = Some((fingerprint, base.clone(), more));
@@ -132,7 +138,7 @@ impl Loader {
             }
         };
 
-        let refs_by_oid = build_labels(&head, &branches, &remote_branches, &tags);
+        let refs_by_oid = build_labels(&head, &branches, &remote_branches, &tags, &shown);
         let head_message = head
             .oid
             .and_then(|oid| self.repo.find_commit(oid).ok())
@@ -631,11 +637,42 @@ pub fn branch_oid(repo: &Repository, name: &str) -> Option<Oid> {
     repo.find_branch(name, BranchType::Local).ok()?.get().target()
 }
 
+/// Which refs the graph shows: one flag per entry of the snapshot's branch,
+/// remote branch and tag lists.
+struct Shown {
+    branches: Vec<bool>,
+    remotes: Vec<bool>,
+    tags: Vec<bool>,
+}
+
+impl Shown {
+    fn new(hidden: &Hidden, branches: &[BranchInfo], remotes: &[RemoteBranch], tags: &[TagInfo]) -> Self {
+        Shown {
+            branches: branches.iter().map(|b| b.is_head || !hidden.hides_local(&b.name)).collect(),
+            remotes: remotes.iter().map(|b| !hidden.hides_remote(&b.full)).collect(),
+            tags: tags.iter().map(|t| !hidden.hides_tag(&t.name)).collect(),
+        }
+    }
+
+    fn branches<'a>(&'a self, all: &'a [BranchInfo]) -> impl Iterator<Item = &'a BranchInfo> {
+        all.iter().zip(&self.branches).filter(|(_, shown)| **shown).map(|(b, _)| b)
+    }
+
+    fn remotes<'a>(&'a self, all: &'a [RemoteBranch]) -> impl Iterator<Item = &'a RemoteBranch> {
+        all.iter().zip(&self.remotes).filter(|(_, shown)| **shown).map(|(b, _)| b)
+    }
+
+    fn tags<'a>(&'a self, all: &'a [TagInfo]) -> impl Iterator<Item = &'a TagInfo> {
+        all.iter().zip(&self.tags).filter(|(_, shown)| **shown).map(|(t, _)| t)
+    }
+}
+
 fn build_labels(
     head: &Head,
     branches: &[BranchInfo],
     remote_branches: &[RemoteBranch],
     tags: &[TagInfo],
+    shown: &Shown,
 ) -> HashMap<Oid, Vec<RefLabel>> {
     let mut map: HashMap<Oid, Vec<RefLabel>> = HashMap::new();
 
@@ -648,8 +685,10 @@ fn build_labels(
         });
     }
 
-    for branch in branches {
+    for branch in shown.branches(branches) {
         let Some(oid) = branch.oid else { continue };
+        // Whether or not that remote branch is hidden: it is a fact about
+        // this branch.
         let synced_remote =
             remote_branches.iter().any(|r| r.name == branch.name && r.oid == oid);
         map.entry(oid).or_default().push(RefLabel {
@@ -660,10 +699,10 @@ fn build_labels(
         });
     }
 
-    for remote in remote_branches {
+    for remote in shown.remotes(remote_branches) {
         // Folded into the local label above when both sit on the same commit.
-        let folded = branches
-            .iter()
+        let folded = shown
+            .branches(branches)
             .any(|b| b.name == remote.name && b.oid == Some(remote.oid));
         if folded {
             continue;
@@ -676,7 +715,7 @@ fn build_labels(
         });
     }
 
-    for tag in tags {
+    for tag in shown.tags(tags) {
         map.entry(tag.oid).or_default().push(RefLabel {
             name: tag.name.clone(),
             kind: RefKind::Tag,

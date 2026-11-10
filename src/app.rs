@@ -604,7 +604,7 @@ impl eframe::App for App {
         if self.active < self.tabs.len() {
             let App { tabs, active, shared, .. } = self;
             let tab = &mut tabs[*active];
-            tab.start(&ctx);
+            tab.start(&ctx, &shared.settings);
 
             bar("toolbar", 54.0, theme::bg_toolbar()).show(ui, |ui| {
                 ui::toolbar::show(ui, tab, shared);

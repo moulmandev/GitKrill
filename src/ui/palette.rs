@@ -403,6 +403,16 @@ pub fn entries(tabs: &[RepoTab], active: usize, settings: &Settings) -> Vec<Entr
         );
     }
 
+    if tab.is_some_and(|tab| !tab.hidden.is_empty()) {
+        list.push(
+            Entry::on_tab("show-hidden", icons::EYE, "Show everything hidden from the graph", |tab, shared| {
+                tab.set_hidden(&mut shared.settings, "refs/", false)
+            })
+            .detail("branches, folders, remotes and tags")
+            .keywords("hidden unhide reveal show all branches folders tags remotes graph"),
+        );
+    }
+
     if let Some(snap) = snap {
         branches_and_tags(&mut list, snap);
     }

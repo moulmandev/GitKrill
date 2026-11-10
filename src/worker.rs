@@ -9,7 +9,7 @@
 
 use std::any::Any;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread;
@@ -17,6 +17,7 @@ use std::thread;
 use eframe::egui;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
+use crate::git::hidden::Hidden;
 use crate::git::ops::{GitCmd, UndoEntry, UndoKind, build_undo};
 use crate::git::repo::{Loader, branch_oid, read_head};
 use crate::git::{CommitDetails, DiffTarget, FileDiff, Oid, RepoSnapshot, cli};
@@ -62,6 +63,8 @@ pub struct RepoHandle {
     op_tx: Sender<(GitCmd, Origin)>,
     pub rx: Receiver<Response>,
     limit: Arc<AtomicUsize>,
+    /// Refs left out of the graph; read by every refresh.
+    hidden: Arc<Mutex<Hidden>>,
     /// Set by the file watcher; cleared by the UI when it schedules a refresh.
     pub fs_dirty: Arc<AtomicBool>,
     _watcher: Option<RecommendedWatcher>,
@@ -73,6 +76,7 @@ impl RepoHandle {
         let (op_tx, op_rx) = channel::<(GitCmd, Origin)>();
         let (res_tx, rx) = channel::<Response>();
         let limit = Arc::new(AtomicUsize::new(limit));
+        let hidden = Arc::new(Mutex::new(Hidden::default()));
         let fs_dirty = Arc::new(AtomicBool::new(false));
 
         {
@@ -80,9 +84,10 @@ impl RepoHandle {
             let ctx = ctx.clone();
             let res_tx = res_tx.clone();
             let limit = limit.clone();
+            let hidden = hidden.clone();
             thread::Builder::new()
                 .name("git-reader".into())
-                .spawn(move || reader(&workdir, req_rx, res_tx, &limit, &ctx))
+                .spawn(move || reader(&workdir, req_rx, res_tx, &limit, &hidden, &ctx))
                 .expect("spawn reader thread");
         }
         {
@@ -96,7 +101,7 @@ impl RepoHandle {
         }
 
         let watcher = start_watcher(&workdir, fs_dirty.clone(), ctx);
-        RepoHandle { req_tx, op_tx, rx, limit, fs_dirty, _watcher: watcher }
+        RepoHandle { req_tx, op_tx, rx, limit, hidden, fs_dirty, _watcher: watcher }
     }
 
     pub fn refresh(&self) {
@@ -105,6 +110,11 @@ impl RepoHandle {
 
     pub fn set_limit(&self, limit: usize) {
         self.limit.store(limit, Ordering::Relaxed);
+    }
+
+    /// Which refs the graph leaves out, from the next refresh on.
+    pub fn set_hidden(&self, hidden: Hidden) {
+        *self.hidden.lock().unwrap_or_else(|e| e.into_inner()) = hidden;
     }
 
     pub fn diff(&self, target: DiffTarget) {
@@ -140,6 +150,7 @@ fn reader(
     req_rx: Receiver<Request>,
     res_tx: Sender<Response>,
     limit: &AtomicUsize,
+    hidden: &Mutex<Hidden>,
     ctx: &egui::Context,
 ) {
     let mut loader = match Loader::open(workdir) {
@@ -186,7 +197,8 @@ fn reader(
             ctx.request_repaint();
         }
         if refresh {
-            let response = match loader.snapshot(limit.load(Ordering::Relaxed)) {
+            let hidden = hidden.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let response = match loader.snapshot(limit.load(Ordering::Relaxed), &hidden) {
                 Ok(snapshot) => Response::Snapshot(Arc::new(snapshot)),
                 Err(e) => Response::LoadError(e),
             };

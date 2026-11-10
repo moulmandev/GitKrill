@@ -37,6 +37,9 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Do network or other non-repository background work | Spawn your own thread, send results over a channel, call `ctx.request_repaint()` when something arrives, and poll the channel from your UI code. Never block in UI code. |
 
 `tab.jump_to(oid)` selects a commit and scrolls the graph to it.
+`tab.hidden` says which refs the graph leaves out (`src/git/hidden.rs`;
+the snapshot still lists them) and `tab.set_hidden(settings, path, hide)`
+changes that for a ref or a folder.
 `tab.is_running("Label prefix")` tells whether an operation is in flight, and
 `tab.take_outcome(label, since)` how one you started ended (its failure is
 already shown to the user as a toast).

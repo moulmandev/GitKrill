@@ -98,6 +98,13 @@ be installed.
 - Optional Author / Date / SHA columns (gear icon), resizable columns
 - Drag a branch onto another branch, a remote or a commit to merge, rebase,
   fast-forward, push or reset
+- Hide branches, whole folders of branches (say, the ones coding agents
+  create for their worktrees), remotes or tags from the graph: click the eye on their
+  sidebar row or right-click them, here or on their label in the graph.
+  Hidden ones stay in the sidebar, dimmed, and their commits leave the graph
+  unless something shown still reaches them. A hidden folder also hides
+  branches created in it later, one branch inside it can still be shown, and
+  the checked out branch is always shown. Remembered per repository
 
 **Working tree**
 - Unstaged / staged lists as paths or a folder tree

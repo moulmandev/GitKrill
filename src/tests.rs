@@ -573,3 +573,60 @@ fn jobs_run_on_the_reader_thread_with_repository_access() {
     });
     assert_eq!(summary, "base");
 }
+
+#[test]
+fn hidden_branches_folders_and_tags_leave_the_graph() {
+    use crate::git::hidden::{self, HEADS, Hidden, TAGS};
+
+    let fx = Fixture::new("hidden");
+    fx.write("a.txt", "base\n");
+    fx.commit_all("base");
+    for name in ["t3/one", "t3/two", "feature"] {
+        git(&fx.dir, &["checkout", "-q", "-b", name, "main"]);
+        fx.write("a.txt", &format!("{name}\n"));
+        fx.commit_all(&format!("on {name}"));
+    }
+    git(&fx.dir, &["checkout", "-q", "main"]);
+    git(&fx.dir, &["tag", "v1", "feature"]);
+
+    let summaries = |snap: &RepoSnapshot| -> Vec<String> {
+        let mut found: Vec<String> = snap.history.commits.iter().map(|c| c.summary.clone()).collect();
+        found.sort();
+        found
+    };
+    let labelled = |snap: &RepoSnapshot, name: &str| {
+        snap.refs_by_oid.values().flatten().any(|label| label.name == name)
+    };
+    assert_eq!(summaries(&fx.snapshot()), ["base", "on feature", "on t3/one", "on t3/two"]);
+
+    // The folder: its commits and labels go, the branches stay listed.
+    let mut rules = Hidden::default();
+    rules.set(&hidden::folder(HEADS, "t3"), true);
+    fx.handle.set_hidden(rules.clone());
+    let snap = fx.snapshot();
+    assert_eq!(summaries(&snap), ["base", "on feature"]);
+    assert!(!labelled(&snap, "t3/one") && labelled(&snap, "feature"));
+    assert_eq!(snap.branches.len(), 4);
+
+    // One branch shown again inside the hidden folder.
+    rules.set(&hidden::local("t3/two"), false);
+    fx.handle.set_hidden(rules.clone());
+    assert_eq!(summaries(&fx.snapshot()), ["base", "on feature", "on t3/two"]);
+
+    // A commit reached by a hidden branch and a shown tag stays, unlabelled
+    // by the branch; hiding the tags too takes it away.
+    rules.set(&hidden::local("feature"), true);
+    fx.handle.set_hidden(rules.clone());
+    let snap = fx.snapshot();
+    assert!(summaries(&snap).contains(&"on feature".to_owned()));
+    assert!(!labelled(&snap, "feature") && labelled(&snap, "v1"));
+    rules.set(TAGS, true);
+    fx.handle.set_hidden(rules.clone());
+    assert_eq!(summaries(&fx.snapshot()), ["base", "on t3/two"]);
+
+    // The checked out branch is always shown, even in a hidden folder.
+    git(&fx.dir, &["checkout", "-q", "t3/one"]);
+    let snap = fx.snapshot();
+    assert!(summaries(&snap).contains(&"on t3/one".to_owned()));
+    assert!(labelled(&snap, "t3/one"));
+}
