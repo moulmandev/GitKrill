@@ -285,26 +285,48 @@ pub fn sum_for(sums: &str, name: &str) -> Option<String> {
     })
 }
 
-/// The release notes as a few plain lines: headings and bullets kept,
-/// links and GitHub's "by @someone in <link>" tails dropped.
-pub fn plain_notes(notes: &str) -> Vec<String> {
-    notes
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with("**Full Changelog**") && !line.starts_with("<!--"))
-        .map(|line| {
-            let line = line.trim_start_matches('#').trim();
-            let (bullet, text) = match line.strip_prefix("* ").or_else(|| line.strip_prefix("- ")) {
-                Some(text) => ("•  ", text),
-                None => ("", line),
-            };
-            let text = match text.find(" by @") {
-                Some(at) if text[at..].contains(" in http") => &text[..at],
-                _ => text,
-            };
-            format!("{bullet}{}", text.replace("**", "").replace('`', ""))
-        })
-        .collect()
+/// One line of release notes, ready to show.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Note {
+    Heading(String),
+    Bullet(String),
+    Text(String),
+}
+
+/// The release notes (Markdown) as headings, bullets and paragraphs, with
+/// wrapped lines joined, emphasis marks and GitHub's "by @someone in <link>"
+/// tails dropped, and the "Full Changelog" link left out.
+pub fn plain_notes(notes: &str) -> Vec<Note> {
+    let clean = |text: &str| {
+        let text = match text.find(" by @") {
+            Some(at) if text[at..].contains(" in http") => &text[..at],
+            _ => text,
+        };
+        text.replace("**", "").replace('`', "")
+    };
+    let mut out: Vec<Note> = Vec::new();
+    let mut joinable = false;
+    for line in notes.lines().map(str::trim) {
+        if line.is_empty() || line.starts_with("**Full Changelog**") || line.starts_with("<!--") {
+            joinable = false;
+            continue;
+        }
+        if line.starts_with('#') {
+            out.push(Note::Heading(clean(line.trim_start_matches('#').trim())));
+            joinable = false;
+        } else if let Some(item) = line.strip_prefix("* ").or_else(|| line.strip_prefix("- ")) {
+            out.push(Note::Bullet(clean(item)));
+            joinable = true;
+        } else if joinable && let Some(Note::Bullet(text) | Note::Text(text)) = out.last_mut() {
+            // A wrapped line belongs to the bullet or paragraph above.
+            text.push(' ');
+            text.push_str(&clean(line));
+        } else {
+            out.push(Note::Text(clean(line)));
+            joinable = true;
+        }
+    }
+    out
 }
 
 // ---- the network ---------------------------------------------------------------
@@ -736,7 +758,14 @@ mod tests {
         assert_eq!(release.assets.len(), 3);
         assert_eq!(release.assets[0].sha256.as_deref(), Some("ab12000000000000000000000000000000000000000000000000000000000000"));
         assert_eq!(release.assets[1].sha256, None);
-        assert_eq!(plain_notes(&release.notes), ["What's Changed", "•  Preview images in diffs", "•  Faster graph"]);
+        assert_eq!(
+            plain_notes(&release.notes),
+            [
+                Note::Heading("What's Changed".into()),
+                Note::Bullet("Preview images in diffs".into()),
+                Note::Bullet("Faster graph".into()),
+            ]
+        );
         assert_eq!(Source::github().page(&release), "https://github.com/moulmandev/GitKrill/releases/tag/v9.1.0");
 
         // Drafts, pre-releases and odd tags are not updates.
@@ -749,6 +778,30 @@ mod tests {
         ] {
             assert!(parse_release(json).is_err(), "{json}");
         }
+    }
+
+    #[test]
+    fn wrapped_changelog_lines_are_joined() {
+        let notes = "- Windows installer that keeps GitKrill up to date, and portable
+  builds that ask
+- Light theme
+
+Thanks for
+trying it.";
+        assert_eq!(
+            plain_notes(notes),
+            [
+                Note::Bullet("Windows installer that keeps GitKrill up to date, and portable builds that ask".into()),
+                Note::Bullet("Light theme".into()),
+                Note::Text("Thanks for trying it.".into()),
+            ]
+        );
+        // The section CI publishes for this version reads cleanly too.
+        let changelog = include_str!("../CHANGELOG.md");
+        let section = changelog.split("\n## ").find(|s| s.starts_with(env!("CARGO_PKG_VERSION"))).expect("a changelog section for this version");
+        let body = section.split_once("\n").map_or("", |(_, body)| body);
+        let notes = plain_notes(body);
+        assert!(!notes.is_empty() && notes.iter().all(|note| matches!(note, Note::Bullet(_))), "{notes:?}");
     }
 
     #[test]

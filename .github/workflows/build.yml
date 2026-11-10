@@ -201,6 +201,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
+
       - uses: actions/download-artifact@v8
         with:
           path: packages
@@ -214,7 +219,18 @@ jobs:
           mv ../SHA256SUMS.txt .
           cat SHA256SUMS.txt
 
+      # This version's section of CHANGELOG.md, followed by GitHub's notes.
+      - name: Release notes
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" '/^## / { if (on) exit; on = ($2 == v); next } on' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::warning title=No release notes::CHANGELOG.md has no section for $version"
+          fi
+          cat notes.md
+
       - uses: softprops/action-gh-release@v3
         with:
           files: packages/*
+          body_path: notes.md
           generate_release_notes: true

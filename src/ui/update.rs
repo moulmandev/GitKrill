@@ -8,7 +8,7 @@ use eframe::egui::{self, Align, Button, Layout, RichText, Ui, vec2};
 
 use crate::state::{Dialog, Shared, ToastKind};
 use crate::theme::{self, icons};
-use crate::update::{self, Kind, Notice, Release, Status, Version};
+use crate::update::{self, Kind, Note, Notice, Release, Status, Version};
 
 /// Once a frame: runs the timer and reacts to what the updater found.
 pub fn poll(ctx: &egui::Context, shared: &mut Shared) {
@@ -97,10 +97,12 @@ pub fn dialog(ui: &mut Ui, shared: &mut Shared, release: &Arc<Release>) -> bool 
         egui::Frame::new().fill(theme::bg_input()).corner_radius(6.0).inner_margin(10.0).show(ui, |ui| {
             ui.set_width(ui.available_width());
             egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                for line in &notes {
-                    let heading = !line.starts_with('•');
-                    let text = RichText::new(line).color(if heading { theme::text_bright() } else { theme::text() });
-                    ui.label(if heading { text.strong() } else { text });
+                for note in &notes {
+                    match note {
+                        Note::Heading(text) => ui.label(RichText::new(text).strong().color(theme::text_bright())),
+                        Note::Bullet(text) => ui.label(RichText::new(format!("•  {text}")).color(theme::text())),
+                        Note::Text(text) => ui.label(RichText::new(text).color(theme::text_dim())),
+                    };
                 }
             });
         });
