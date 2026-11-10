@@ -88,6 +88,10 @@ Wayland; nothing else has to be installed.
 - Automatic fetch every five minutes
 - GitHub: open pull requests, issues and Actions runs in the sidebar; check
   out a pull request as a local branch
+- Open a pull request: drop a branch on the pull request list, right-click
+  it, or use the list's + button. Title and description are filled in from
+  the commits, the branch is pushed first when the remote lacks it, and
+  "Open on GitHub" works without signing in
 
 **Shell**
 - Multiple repositories in tabs, restored on start; drop a folder to open it
@@ -105,7 +109,7 @@ Three features talk to the network on their own. Each has a switch in the
 | Feature | What is sent | Where |
 | --- | --- | --- |
 | Author pictures | SHA-256 of each author's email address, or the GitHub user id from a `noreply` address | gravatar.com, avatars.githubusercontent.com |
-| GitHub sidebar | Requests for the repository's pull requests, issues and workflow runs. A token is used if one is found in `GITHUB_TOKEN` / `GH_TOKEN`, `gh auth token`, or git's credential helper; it is sent only to api.github.com and never stored or logged | api.github.com |
+| GitHub sidebar | Requests for the repository's pull requests, issues and workflow runs, and the pull requests you open. A token is used if one is found in `GITHUB_TOKEN` / `GH_TOKEN`, `gh auth token`, or git's credential helper; it is sent only to api.github.com and never stored or logged | api.github.com |
 | Automatic fetch | `git fetch --all --prune`, as you would run it | your remotes |
 
 ## Shortcuts
@@ -159,6 +163,7 @@ src/
   ui/
     graph.rs     commit graph (graph/drag.rs: dragging branches)
     sidebar.rs   refs sidebar        hosting.rs  GitHub sections
+    new_pull.rs  creating a pull request
     panel.rs     staging / details   files.rs    changed-file lists
     diff.rs      diff view           highlight.rs  syntax colours
     conflict.rs  conflict resolver   rebase.rs   interactive rebase
@@ -177,8 +182,8 @@ tools/           demo repository and screenshot scripts
 
 - Undo does not cover a rebase that stopped on conflicts and was continued, or
   drag actions that switch branches first (`git reflog` still has them)
-- Pull request review state, creating pull requests, GitHub Enterprise, GitLab
-  and other hosts
+- Pull request review state, GitHub Enterprise, GitLab and other hosts;
+  pull requests from a fork of the repository
 - Interactive rebase refuses ranges that contain merge commits
 - File history and blame always start from HEAD
 - No ancestor pane or syntax colours in the conflict resolver; no text

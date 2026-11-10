@@ -394,7 +394,7 @@ pub fn toasts(ctx: &egui::Context, shared: &mut Shared, tab: Option<&RepoTab>) {
                         if let Some((label, url)) = &toast.link {
                             let text = format!("{}  {label}", icons::ARROW_SQUARE_OUT);
                             if ui.button(text).on_hover_text(url).clicked() {
-                                crate::platform::open(std::path::Path::new(url));
+                                crate::ui::hosting::open_link(url);
                             }
                         }
                     });

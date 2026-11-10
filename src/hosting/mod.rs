@@ -673,8 +673,11 @@ pub trait Transport: Send {
 /// Opening a pull request (a POST) is answered from `create.json` and
 /// `create.head` the same way, with 201 as the default status; the body that
 /// was sent is left in `create.sent.json` to check what the dialog asked for.
+/// Once one has been opened, `pulls.after.json` (if present) takes the place
+/// of `pulls.json`, so the list can be seen to pick it up.
 struct Canned {
     dir: PathBuf,
+    created: bool,
 }
 
 impl Canned {
@@ -704,6 +707,9 @@ impl Transport for Canned {
         let path = request.url.split('?').next().unwrap_or_default();
         let list = ["pulls", "issues", "runs"].into_iter().find(|list| path.ends_with(list));
         let list = list.ok_or("no fixture for this address")?;
+        if list == "pulls" && self.created && self.dir.join("pulls.after.json").exists() {
+            return Ok(self.answer("pulls.after", 200));
+        }
         Ok(self.answer(list, 200))
     }
 
@@ -712,7 +718,9 @@ impl Transport for Canned {
             return Err("no fixture for this address".to_owned());
         }
         let _ = std::fs::write(self.dir.join("create.sent.json"), body);
-        Ok(self.answer("create", 201))
+        let response = self.answer("create", 201);
+        self.created |= response.status == 201;
+        Ok(response)
     }
 }
 
@@ -859,7 +867,7 @@ fn connect(repo: &RepoId, workdir: &Path) -> Box<dyn Backend> {
                 let dir = PathBuf::from(dir);
                 let secrets: Box<dyn Secrets> =
                     if dir.join("signed-in").exists() { Box::new(FixtureSignIn) } else { Box::new(NoSecrets) };
-                Box::new(github::Client::new(repo.clone(), Box::new(Canned { dir }), secrets))
+                Box::new(github::Client::new(repo.clone(), Box::new(Canned { dir, created: false }), secrets))
             }
             None => Box::new(github::Client::new(
                 repo.clone(),
@@ -1265,11 +1273,11 @@ pub fn create_problem(problem: &Problem, service: Service) -> String {
         }
     };
     match problem {
-        Problem::NotSignedIn => {
-            format!("Opening a pull request needs a {host} sign-in. {sign_in} Or use Open on {host}.")
-        }
+        Problem::NotSignedIn => format!(
+            "Opening a pull request from here needs a {host} sign-in. {sign_in} Open on {host} works without one."
+        ),
         Problem::SignInRejected => format!(
-            "{host} refused the saved sign-in (expired or revoked?). {sign_in} Or use Open on {host}."
+            "{host} refused the saved sign-in (expired or revoked?). {sign_in} Open on {host} works without one."
         ),
         Problem::NoAccess => format!(
             "{host} answered \"not found\": the signed-in account cannot see this repository, or \
@@ -2394,7 +2402,7 @@ mod tests {
         std::fs::write(dir.join("issues.head"), "403\nRetry-After: 120\n").unwrap();
         std::fs::write(dir.join("issues.json"), r#"{"message": "slow down"}"#).unwrap();
 
-        let mut client = Client::new(repo(), Box::new(Canned { dir: dir.clone() }), Box::new(NoSecrets));
+        let mut client = Client::new(repo(), Box::new(Canned { dir: dir.clone(), created: false }), Box::new(NoSecrets));
         assert!(matches!(client.pulls(NOW), Outcome::Fresh { ref items, .. } if items.len() == 2));
         assert_eq!(failure(client.issues(NOW)), Problem::RateLimited { until: NOW + 120 });
         // No runs.json: the list does not exist.
@@ -2526,7 +2534,9 @@ mod tests {
             r#"{"resource": "PullRequest", "code": "custom", "message": "A pull request already exists for octo:feature/dark."}"#,
         );
         assert_eq!(refused(422, &exists), "GitHub refused: A pull request from feature/dark into main is already open");
-        let empty = validation(r#"{"resource": "PullRequest", "code": "custom", "message": "No commits between main and feature/dark"}"#);
+        let empty = validation(
+            r#"{"resource": "PullRequest", "code": "custom", "message": "No commits between main and feature/dark"}"#,
+        );
         assert_eq!(
             refused(422, &empty),
             "GitHub refused: No commits between main and feature/dark: there is nothing to merge"
@@ -2559,7 +2569,8 @@ mod tests {
         assert!(text.contains("not allowed to open pull requests"), "{text}");
 
         // Slow down, and when to try again.
-        let (problem, text) = line(vec![reply(403, &[("retry-after", "120")], r#"{"message": "You have exceeded a secondary rate limit"}"#)]);
+        let secondary = r#"{"message": "You have exceeded a secondary rate limit"}"#;
+        let (problem, text) = line(vec![reply(403, &[("retry-after", "120")], secondary)]);
         assert_eq!(problem, Problem::RateLimited { until: NOW + 120 });
         assert_eq!(text, format!("GitHub asked us to slow down. Try again after {}.", clock(NOW + 120)));
 
@@ -2690,8 +2701,19 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("create.json"), CREATED).unwrap();
 
-        let mut client = Client::new(repo(), Box::new(Canned { dir: dir.clone() }), Box::new(FixtureSignIn));
+        std::fs::write(dir.join("pulls.json"), PULLS).unwrap();
+        std::fs::write(dir.join("pulls.after.json"), format!("[{CREATED}]")).unwrap();
+
+        let canned = Canned { dir: dir.clone(), created: false };
+        let mut client = Client::new(repo(), Box::new(canned), Box::new(FixtureSignIn));
+        let numbers = |outcome: Outcome<PullRequest>| match outcome {
+            Outcome::Fresh { items, .. } => items.iter().map(|pull| pull.number).collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(numbers(client.pulls(NOW)), [12, 9]);
         assert_eq!(client.create_pull(&new_pull(), NOW).unwrap().number, 42);
+        // The list the fixture serves from then on has it.
+        assert_eq!(numbers(client.pulls(NOW)), [42]);
         let sent: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.join("create.sent.json")).unwrap()).unwrap();
         assert_eq!(sent["title"], "Add dark mode");
@@ -2699,12 +2721,13 @@ mod tests {
 
         // A staged refusal.
         std::fs::write(dir.join("create.head"), "422\n").unwrap();
-        std::fs::write(dir.join("create.json"), validation(r#"{"message": "A pull request already exists for octo:feature/dark."}"#)).unwrap();
+        let exists = validation(r#"{"message": "A pull request already exists for octo:feature/dark."}"#);
+        std::fs::write(dir.join("create.json"), exists).unwrap();
         let problem = client.create_pull(&new_pull(), NOW).unwrap_err();
         assert!(create_problem(&problem, Service::GitHub).contains("already open"));
 
         // Without the sign-in file the fixture has no token, as before.
-        let mut anonymous = Client::new(repo(), Box::new(Canned { dir: dir.clone() }), Box::new(NoSecrets));
+        let mut anonymous = Client::new(repo(), Box::new(Canned { dir: dir.clone(), created: false }), Box::new(NoSecrets));
         assert_eq!(anonymous.create_pull(&new_pull(), NOW).unwrap_err(), Problem::NotSignedIn);
         let _ = std::fs::remove_dir_all(&dir);
     }

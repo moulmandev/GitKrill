@@ -13,7 +13,7 @@
 //!   ([`compare`]); the prefill and the push decision are pure functions of
 //!   that and the snapshot, tested below.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Instant;
 
 use eframe::egui::{self, Align, Button, ComboBox, Key, Layout, RichText, TextEdit, Ui, vec2};
@@ -25,6 +25,7 @@ use crate::hosting::{self, NewPull, PullRequest, RepoId};
 use crate::state::{BusyOp, Dialog, RepoTab, Shared, ToastKind};
 use crate::theme::{self, icons};
 use crate::ui::graph::drag::Branch;
+use crate::ui::hosting::open_link;
 use crate::ui::widgets::spinner;
 
 /// Reader-thread job that lists the commits between the two branches.
@@ -130,11 +131,17 @@ pub fn default_base(remote_head: Option<&str>, on_remote: &[String], local: &[St
 
 /// A branch name as a title: its last part, words instead of dashes and
 /// underscores, first letter capitalised. `feature/add-login_form` reads
-/// "Add login form".
+/// "Add login form". A `fix/` (or `bugfix/`, `hotfix/`) prefix is kept as
+/// the word "Fix", since the rest rarely says so itself.
 pub fn readable(branch: &str) -> String {
     let last = branch.rsplit('/').find(|part| !part.is_empty()).unwrap_or(branch);
     let words: Vec<&str> = last.split(['-', '_', '.']).filter(|word| !word.is_empty()).collect();
-    let text = if words.is_empty() { last.to_owned() } else { words.join(" ") };
+    let mut text = if words.is_empty() { last.to_owned() } else { words.join(" ") };
+    let kind = branch.split_once('/').map(|(kind, _)| kind.to_ascii_lowercase());
+    let fix = matches!(kind.as_deref(), Some("fix" | "bugfix" | "hotfix"));
+    if fix && !text.to_lowercase().starts_with("fix") {
+        text = format!("fix {text}");
+    }
     let mut chars = text.chars();
     match chars.next() {
         Some(first) => first.to_uppercase().chain(chars).collect(),
@@ -326,10 +333,17 @@ pub struct NewPullForm {
 
 enum Step {
     Editing,
-    /// The head branch is being pushed by the git command labelled `label`.
-    Pushing { label: String, since: Instant, new: NewPull },
+    /// The head branch is being pushed by the git command labelled `label`;
+    /// `then` is what comes once it is there.
+    Pushing { label: String, since: Instant, then: Then },
     /// The service has the request; its answer comes back under `id`.
     Sending { id: u64 },
+}
+
+enum Then {
+    Create(NewPull),
+    /// Open the service's own form at this address.
+    Browse(String),
 }
 
 /// What the dialog wants from `ui::dialogs` after a frame.
@@ -390,7 +404,8 @@ impl NewPullForm {
         self.compared.as_ref().and_then(|found| found.commits.as_ref().ok())
     }
 
-    /// Why Create cannot be pressed yet, if anything stands in the way.
+    /// Why there is no pull request to open for this pair, if there is not:
+    /// neither Create nor the service's own form can help.
     fn blocker(&self, snap: &RepoSnapshot, open: &[PullRequest]) -> Option<String> {
         let plan = push_plan(&snap.branches, &snap.remote_branches, &self.remote, &self.head);
         if self.base.is_empty() {
@@ -419,30 +434,49 @@ impl NewPullForm {
             }
             _ => {}
         }
-        if self.title.trim().is_empty() {
-            return Some("Add a title.".to_owned());
-        }
         None
     }
 
-    /// The press of Create: push first when the remote needs it.
-    fn submit(&mut self, tab: &mut RepoTab, snap: &RepoSnapshot) {
+    /// The press of Create, or of the browser button (`browse` is then the
+    /// address): push first when the remote needs it. True when the dialog
+    /// has done its job already.
+    fn submit(&mut self, tab: &mut RepoTab, snap: &RepoSnapshot, browse: Option<String>) -> bool {
         let plan = push_plan(&snap.branches, &snap.remote_branches, &self.remote, &self.head);
-        let new = NewPull {
-            head: plan.head.clone(),
-            base: self.base.clone(),
-            title: self.title.trim().to_owned(),
-            body: self.body.trim_end().to_owned(),
-            draft: self.draft,
+        let then = match browse {
+            Some(url) => Then::Browse(url),
+            None => Then::Create(NewPull {
+                head: plan.head.clone(),
+                base: self.base.clone(),
+                title: self.title.trim().to_owned(),
+                body: self.body.trim_end().to_owned(),
+                draft: self.draft,
+            }),
         };
         self.problem = None;
         if plan.push {
             let cmd = ops::push_branch(&self.remote, &self.head_name());
             let label = cmd.label.clone();
             tab.run(cmd);
-            self.step = Step::Pushing { label, since: Instant::now(), new };
+            self.step = Step::Pushing { label, since: Instant::now(), then };
+            false
         } else {
-            self.send(tab, new);
+            self.then(tab, then)
+        }
+    }
+
+    /// What comes once the branch is on the remote. True when the dialog
+    /// has done its job.
+    fn then(&mut self, tab: &mut RepoTab, then: Then) -> bool {
+        match then {
+            Then::Create(new) => {
+                self.send(tab, new);
+                false
+            }
+            Then::Browse(url) => {
+                self.step = Step::Editing;
+                open_link(&url);
+                true
+            }
         }
     }
 
@@ -463,10 +497,12 @@ impl NewPullForm {
     fn advance(&mut self, tab: &mut RepoTab, shared: &mut Shared) -> bool {
         match &self.step {
             Step::Editing => {}
-            Step::Pushing { label, since, new } => match tab.take_outcome(label, *since) {
+            Step::Pushing { label, since, .. } => match tab.take_outcome(label, *since) {
                 Some(true) => {
-                    let new = new.clone();
-                    self.send(tab, new);
+                    let Step::Pushing { then, .. } = std::mem::replace(&mut self.step, Step::Editing) else {
+                        return false;
+                    };
+                    return self.then(tab, then);
                 }
                 Some(false) => {
                     // git's own message is already in a toast.
@@ -526,12 +562,6 @@ pub fn dropped(form: &NewPullForm, tab: Option<&mut RepoTab>) {
     }
 }
 
-/// Opens a page in the browser. Only links [`RepoId`] builds, from
-/// validated parts and escaped branch names, ever get here.
-fn browse(url: &str) {
-    crate::platform::open(Path::new(url));
-}
-
 /// Draws the dialog for one frame.
 pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Option<&mut RepoTab>, fresh: bool) -> Next {
     let Some(tab) = tab.filter(|tab| tab.path == form.repo_path) else { return Next::Close };
@@ -569,6 +599,8 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
     let mut summary = match (form.commits(), &form.compared) {
         (Some(commits), _) => match (commits.count, commits.more) {
             (_, true) => format!("More than {COUNT_LIMIT} commits"),
+            // The warning below says it.
+            (0, _) => String::new(),
             (1, _) => "1 commit".to_owned(),
             (n, _) => format!("{n} commits"),
         },
@@ -578,11 +610,14 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
     if !summary.is_empty() && form.commits().is_some_and(|commits| commits.count > 0) {
         summary.push_str(&format!(" from {} into {}", form.head_name(), form.base));
     }
-    if plan.push {
+    if plan.head == form.base {
+        // The warning below says what is wrong; nothing would happen.
+        summary.clear();
+    } else if plan.push {
         let push = match plan.ahead {
-            0 => format!("{} is pushed to {} first", form.head_name(), form.remote),
-            1 => format!("1 new commit is pushed to {} first", form.remote),
-            n => format!("{n} new commits are pushed to {} first", form.remote),
+            0 => format!("{} will be pushed to {} first", form.head_name(), form.remote),
+            1 => format!("1 new commit will be pushed to {} first", form.remote),
+            n => format!("{n} new commits will be pushed to {} first", form.remote),
         };
         summary = if summary.is_empty() { push } else { format!("{summary}  ·  {push}") };
     }
@@ -612,10 +647,14 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
 
     // Whatever stands in the way, or went wrong, or is happening now.
     let blocker = form.blocker(&snap, &open_pulls);
+    let untitled = form.title.trim().is_empty();
+    // Known to have no usable sign-in: Create would only be refused.
+    let signed_out = matches!(auth, hosting::Auth::Anonymous | hosting::Auth::Rejected);
     let existing = open_pulls.iter().find(|pull| {
         pull.head_ref == plan.head && pull.base_ref == form.base && pull.is_from(&form.repo)
     });
     ui.add_space(2.0);
+    let mut check_again = false;
     match &form.step {
         Step::Pushing { .. } => working(ui, &format!("Pushing {} to {}…", form.head_name(), form.remote)),
         Step::Sending { .. } => working(ui, &format!("Opening the pull request on {service}…")),
@@ -624,39 +663,55 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
                 ui.label(RichText::new(format!("{}  {problem}", icons::WARNING_CIRCLE)).color(theme::red()));
             } else if let Some(blocker) = &blocker {
                 ui.label(RichText::new(format!("{}  {blocker}", icons::WARNING)).color(theme::orange()));
+            } else if untitled {
+                ui.label(RichText::new(format!("{}  Add a title.", icons::WARNING)).color(theme::orange()));
             }
-            if matches!(auth, hosting::Auth::Anonymous | hosting::Auth::Rejected) && form.problem.is_none() {
+            if signed_out && form.problem.is_none() {
                 let text = hosting::create_problem(&hosting::Problem::NotSignedIn, form.repo.service);
                 ui.label(RichText::new(text).size(12.0).color(theme::text_dim()));
+                let busy = shown.as_ref().is_some_and(|shown| shown.view.busy);
+                let button = Button::new(format!("{}  Check again", icons::ARROWS_CLOCKWISE)).small();
+                check_again = ui.add_enabled(!busy, button).clicked();
             }
         }
+    }
+    if check_again {
+        // A manual refresh looks for a sign-in again.
+        tab.hosting.refresh();
     }
 
     // Buttons: the browser on the left, Cancel and Create on the right.
     ui.add_space(6.0);
     let mut next = if form.busy() { Next::Hold } else { Next::Keep };
-    let ready = blocker.is_none() && !form.busy();
+    let ready = blocker.is_none() && !untitled && !signed_out && !form.busy();
     ui.horizontal(|ui| {
-        let compare = form.repo.compare_url(&form.base, &plan.head);
         match existing {
             Some(pull) => {
                 let url = form.repo.pull_url(pull.number);
-                if ui.add(Button::new(format!("{}  Open #{}", icons::ARROW_SQUARE_OUT, pull.number)).min_size(vec2(0.0, 28.0))).on_hover_text(&url).clicked() {
-                    browse(&url);
+                let label = format!("{}  Open #{}", icons::ARROW_SQUARE_OUT, pull.number);
+                let button = Button::new(label).min_size(vec2(0.0, 28.0));
+                if ui.add(button).on_hover_text(&url).clicked() {
+                    open_link(&url);
                 }
             }
             None => {
-                let enabled = !plan.push && !form.base.is_empty() && plan.head != form.base;
-                let tip = if plan.push {
-                    format!("{} is not on {} yet: push it first, or press Create", form.head_name(), form.remote)
-                } else {
-                    format!("Opens {service}'s own form in the browser; no sign-in needed here")
+                // The service's own form needs the branch there too, so it
+                // is pushed first, as for Create.
+                let enabled = blocker.is_none() && !form.busy();
+                let label = match plan.push {
+                    true => format!("{}  Push and open on {service}", icons::ARROW_SQUARE_OUT),
+                    false => format!("{}  Open on {service}", icons::ARROW_SQUARE_OUT),
                 };
-                let button = Button::new(format!("{}  Open on {service}", icons::ARROW_SQUARE_OUT)).min_size(vec2(0.0, 28.0));
-                let response = ui.add_enabled(enabled, button);
-                let response = if enabled { response.on_hover_text(&tip) } else { response.on_disabled_hover_text(&tip) };
+                let tip = format!("Opens the form on {service} in the browser: no sign-in needed here");
+                let response = ui.add_enabled(enabled, Button::new(label).min_size(vec2(0.0, 28.0)));
+                let response = if enabled { response.on_hover_text(tip) } else { response };
                 if response.clicked() {
-                    browse(&compare);
+                    let compare = form.repo.compare_url(&form.base, &plan.head);
+                    if form.submit(tab, &snap, Some(compare)) {
+                        next = Next::Close;
+                    } else {
+                        next = Next::Hold;
+                    }
                 }
             }
         }
@@ -666,14 +721,20 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
                 .fill(if ready { theme::mix(theme::bg_app(), theme::accent(), 0.8) } else { theme::bg_raised() })
                 .min_size(vec2(84.0, 28.0));
             let response = ui.add_enabled(ready, primary);
-            let response = match &blocker {
+            let reason = match (&blocker, untitled, signed_out) {
+                (Some(reason), _, _) => Some(reason.clone()),
+                (None, true, _) => Some("Add a title.".to_owned()),
+                (None, false, true) => Some(format!("Not signed in to {service}.")),
+                (None, false, false) => None,
+            };
+            let response = match reason {
                 Some(reason) if !form.busy() => response.on_disabled_hover_text(reason),
                 _ => response,
             };
             let pressed = response.clicked()
                 || (ready && (entered || ui.input(|i| i.key_pressed(Key::Enter) && i.modifiers.command)));
             if pressed {
-                form.submit(tab, &snap);
+                form.submit(tab, &snap, None);
                 next = Next::Hold;
             }
             let cancel = ui.add_enabled(!form.busy(), Button::new("Cancel").min_size(vec2(72.0, 28.0)));
@@ -774,7 +835,9 @@ mod tests {
         for (branch, title) in [
             ("feature/add-login_form", "Add login form"),
             ("fix-crash", "Fix crash"),
-            ("hotfix/crash", "Crash"),
+            ("hotfix/crash", "Fix crash"),
+            ("fix/typo-in-readme", "Fix typo in readme"),
+            ("bugfix/fix-the-build", "Fix the build"),
             ("main", "Main"),
             ("user/ada/dark.mode", "Dark mode"),
             ("trailing/", "Trailing"),
@@ -817,7 +880,7 @@ mod tests {
         assert_eq!(prefill("x", &huge).1, "- a\n- …and 999+ more");
 
         // Nothing yet: the branch name alone.
-        assert_eq!(prefill("fix/typo", &Commits::default()), ("Typo".to_owned(), String::new()));
+        assert_eq!(prefill("docs/typo", &Commits::default()), ("Typo".to_owned(), String::new()));
     }
 
     fn oid(n: u8) -> Oid {

@@ -128,10 +128,21 @@ fn drop_target(ui: &Ui, snap: &RepoSnapshot, shown: &Shown, rect: Rect) -> Optio
 ///
 /// Not `ctx.open_url`: eframe is built without its `links` feature here,
 /// which turns that call into a silent no-op. Every address passed in is
-/// assembled by [`hosting::RepoId`] from validated parts and numbers, never
-/// taken from a server's answer.
-fn browse(url: &str) {
+/// assembled by [`hosting::RepoId`] from validated parts, numbers and
+/// percent-escaped branch names, never taken from a server's answer.
+///
+/// A scripted screenshot run (`GITKRILL_SHOT`) prints the address instead,
+/// so trying the links never opens the real site on someone's desktop.
+pub fn open_link(url: &str) {
+    if std::env::var_os("GITKRILL_SHOT").is_some() {
+        eprintln!("would open {url}");
+        return;
+    }
     crate::platform::open(std::path::Path::new(url));
+}
+
+fn browse(url: &str) {
+    open_link(url);
 }
 
 /// The sidebar's own section header with a refresh button on top of it.
@@ -188,18 +199,23 @@ fn header(
     if response.clicked() {
         *act = Some(Act::Refresh);
     }
+    // "+" just left of the refresh button, over the end of the title.
     if add && over_header {
-        let plus = button.translate(Vec2::new(-(button.width() + 2.0), 0.0));
-        let plus = Rect::from_center_size(plus.center(), Vec2::splat(22.0));
-        let response = ui.interact(plus, ui.id().with(("hosting-add", title)), Sense::click());
-        let fill = if response.hovered() { theme::bg_raised() } else { theme::bg_hover() };
-        ui.painter().rect_filled(plus, 4.0, fill);
-        let color = if response.hovered() { theme::text_bright() } else { theme::text_dim() };
-        ui.painter().text(plus.center(), Align2::CENTER_CENTER, icons::PLUS, theme::font(13.0), color);
-        if response.clicked() {
+        let plus = Rect::from_min_size(pos2(button.left() - 24.0, button.top()), Vec2::new(22.0, button.height()));
+        let add_response = ui.interact(plus, ui.id().with(("hosting-add", title)), Sense::click());
+        // The header behind is hovered unless one of the buttons is.
+        let behind = if add_response.hovered() || response.hovered() { theme::bg_panel() } else { theme::bg_hover() };
+        let painter = ui.painter();
+        let cover = Rect::from_min_max(pos2(plus.left() - 4.0, bar.top() + 1.0), pos2(button.left(), bar.bottom()));
+        painter.rect_filled(cover, 0.0, behind);
+        let fill = if add_response.hovered() { theme::bg_raised() } else { behind };
+        painter.rect_filled(plus, 4.0, fill);
+        let color = if add_response.hovered() { theme::text_bright() } else { theme::text_dim() };
+        painter.text(plus.center(), Align2::CENTER_CENTER, icons::PLUS, theme::font(14.0), color);
+        if add_response.clicked() {
             *act = Some(Act::NewPull(None));
         }
-        response.on_hover_text("Create pull request");
+        add_response.on_hover_text("Create pull request");
     }
     response.on_hover_ui(|ui| {
         let service = shown.repo.service.name();
