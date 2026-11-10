@@ -13,6 +13,7 @@ use crate::git::cli;
 use crate::platform;
 use crate::state::{AppAction, Dialog, RepoTab, Settings, Shared, ToastKind};
 use crate::theme::{self, icons};
+use crate::ui::prefs::{PrefsView, Section};
 use crate::ui::{self, widgets};
 use crate::workspace::Opens;
 
@@ -33,6 +34,7 @@ impl App {
         theme::install(&cc.egui_ctx);
 
         let settings = Settings::load();
+        crate::prefs::apply(&cc.egui_ctx, &settings);
         let mut app = App {
             tabs: Vec::new(),
             active: 0,
@@ -45,6 +47,7 @@ impl App {
                 actions: Vec::new(),
                 updater: crate::update::Updater::new(),
                 workspaces: Default::default(),
+                prefs: None,
             },
             cloning: None,
             saved_settings: String::new(),
@@ -181,6 +184,11 @@ impl App {
                         }
                     }
                 }
+                AppAction::OpenPreferences(section) => match &mut self.shared.prefs {
+                    Some(view) => view.open(section),
+                    None => self.shared.prefs = Some(Box::new(PrefsView::new(section))),
+                },
+                AppAction::ClosePreferences => self.shared.prefs = None,
                 AppAction::Quit => ctx.send_viewport_cmd(ViewportCommand::Close),
             }
         }
@@ -247,6 +255,20 @@ impl App {
         if !modal && pressed(Modifiers::COMMAND, Key::W) {
             self.shared.actions.push(AppAction::CloseTab(self.active));
         }
+        if !modal && pressed(Modifiers::COMMAND, Key::Comma) {
+            self.shared.actions.push(match self.shared.prefs {
+                Some(_) => AppAction::ClosePreferences,
+                None => AppAction::OpenPreferences(Section::General),
+            });
+        }
+        // The preferences page has the window: Escape leaves it, and the
+        // repository's own shortcuts wait until it is closed.
+        if self.shared.prefs.is_some() {
+            if !modal && !egui::Popup::is_any_open(ctx) && !ctx.egui_wants_keyboard_input() && pressed(Modifiers::NONE, Key::Escape) {
+                self.shared.actions.push(AppAction::ClosePreferences);
+            }
+            return;
+        }
         if !modal && !self.tabs.is_empty() && pressed(Modifiers::CTRL, Key::Tab) {
             self.active = (self.active + 1) % self.tabs.len();
         }
@@ -283,9 +305,15 @@ impl App {
         }
         self.shared.settings.tabs = self.tabs.iter().map(|t| t.path.clone()).collect();
         self.shared.settings.active = self.active;
+        crate::prefs::tidy(&mut self.shared.settings);
         if let Ok(json) = serde_json::to_string(&self.shared.settings)
             && json != self.saved_settings {
                 self.shared.settings.save();
+                // The first comparison is against nothing: the settings were
+                // applied as loaded already.
+                if !self.saved_settings.is_empty() {
+                    crate::prefs::apply(ctx, &self.shared.settings);
+                }
                 self.saved_settings = json;
             }
     }
@@ -323,6 +351,11 @@ impl App {
                 if ui.add_enabled(!tabs.is_empty(), egui::Button::new("Close Tab").shortcut_text("Ctrl+W")).clicked() {
                     shared.actions.push(AppAction::CloseTab(*active));
                 }
+                ui.separator();
+                if ui.add(egui::Button::new("Preferences…").shortcut_text("Ctrl+,")).clicked() {
+                    shared.actions.push(AppAction::OpenPreferences(Section::General));
+                }
+                ui.separator();
                 if ui.button("Exit").clicked() {
                     shared.actions.push(AppAction::Quit);
                 }
@@ -384,7 +417,8 @@ impl App {
         painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::border()));
 
         let count = self.tabs.len().max(1) as f32;
-        let max_w = ((rect.width() - 44.0) / count).clamp(70.0, 220.0);
+        // Room at the right end for "+" and the preferences gear.
+        let max_w = ((rect.width() - 44.0 - GEAR_ROOM) / count).clamp(70.0, 220.0);
         let mut x = rect.left();
 
         for (i, tab) in self.tabs.iter().enumerate() {
@@ -452,6 +486,20 @@ impl App {
         let response = if open { response } else { response.on_hover_text("Open a repository in a new tab") };
         let current = self.tabs.get(self.active).map(|t| t.path.clone());
         ui::workspace::new_tab_menu(&response, &mut self.shared, current.as_deref());
+
+        let gear = Rect::from_center_size(pos2(rect.right() - GEAR_ROOM / 2.0, rect.center().y), vec2(28.0, 26.0));
+        let response = ui.interact(gear, ui.id().with("prefs-gear"), Sense::click());
+        let open = self.shared.prefs.is_some();
+        if open {
+            painter.rect_filled(gear, 4.0, theme::bg_selected());
+        } else if response.hovered() {
+            painter.rect_filled(gear, 4.0, theme::bg_raised());
+        }
+        let color = if open || response.hovered() { theme::text_bright() } else { theme::text_dim() };
+        painter.text(gear.center(), Align2::CENTER_CENTER, icons::GEAR, theme::font(16.0), color);
+        if response.on_hover_text(if open { "Close preferences (Ctrl+,)" } else { "Preferences (Ctrl+,)" }).clicked() {
+            self.shared.actions.push(if open { AppAction::ClosePreferences } else { AppAction::OpenPreferences(Section::General) });
+        }
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
@@ -545,6 +593,9 @@ impl App {
     }
 }
 
+/// Width kept free at the right of the tab strip for the preferences gear.
+const GEAR_ROOM: f32 = 44.0;
+
 pub enum Zoom {
     In,
     Out,
@@ -598,7 +649,12 @@ impl eframe::App for App {
             .frame(Frame::new().fill(theme::bg_tabbar()).inner_margin(Margin::symmetric(10, 0)))
             .show(ui, |ui| self.status_bar(ui));
 
-        if self.active < self.tabs.len() {
+        if self.shared.prefs.is_some() {
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.start(&ctx);
+            }
+            ui::prefs::show(ui, &mut self.shared, self.tabs.get_mut(self.active));
+        } else if self.active < self.tabs.len() {
             let App { tabs, active, shared, .. } = self;
             let tab = &mut tabs[*active];
             tab.start(&ctx);

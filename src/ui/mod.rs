@@ -12,6 +12,7 @@ pub mod hosting;
 pub mod palette;
 pub mod new_pull;
 pub mod panel;
+pub mod prefs;
 pub mod rebase;
 pub mod sidebar;
 pub mod textsel;

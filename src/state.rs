@@ -119,6 +119,9 @@ pub enum AppAction {
     Activate(usize),
     Clone { url: String, dest: PathBuf },
     InitDialog,
+    /// Opens the preferences page at a section (or moves it there).
+    OpenPreferences(crate::ui::prefs::Section),
+    ClosePreferences,
     Quit,
 }
 
@@ -157,6 +160,17 @@ pub struct Settings {
     pub skipped_update: Option<String>,
     /// Folders of repositories to pick from; see `crate::workspace`.
     pub workspaces: Vec<crate::workspace::Workspace>,
+
+    // File > Preferences (`crate::prefs`): one struct per area, each in
+    // its own module.
+    pub general: crate::prefs::general::General,
+    pub tools: crate::prefs::tools::Tools,
+    pub identity: crate::prefs::identity::Identity,
+    pub graph: crate::prefs::graph::GraphPrefs,
+    pub appearance: crate::prefs::appearance::Appearance,
+    pub editor: crate::prefs::editor::Editor,
+    /// Repository-specific preferences, by working directory.
+    pub repos: std::collections::BTreeMap<PathBuf, crate::prefs::RepoPrefs>,
 }
 
 impl Default for Settings {
@@ -180,6 +194,13 @@ impl Default for Settings {
             skipped_update: None,
             hosting_servers: Default::default(),
             workspaces: Vec::new(),
+            general: Default::default(),
+            tools: Default::default(),
+            identity: Default::default(),
+            graph: Default::default(),
+            appearance: Default::default(),
+            editor: Default::default(),
+            repos: Default::default(),
         }
     }
 }
@@ -240,6 +261,8 @@ pub struct Shared {
     pub updater: crate::update::Updater,
     /// Workspace scans and repository summaries; see `crate::workspace`.
     pub workspaces: crate::workspace::Workspaces,
+    /// The preferences page, while it is open (`crate::ui::prefs`).
+    pub prefs: Option<Box<crate::ui::prefs::PrefsView>>,
 }
 
 impl Shared {

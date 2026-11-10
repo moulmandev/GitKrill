@@ -3,6 +3,29 @@
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::RwLock;
+
+/// Environment every git command gets on top of GitKrill's own: the SSH key
+/// and the author of the profile in use (`crate::prefs::identity::apply`).
+static SESSION_ENV: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
+
+/// Replaces the environment [`command`] adds to every git command.
+#[allow(dead_code)] // TODO(prefs scaffold): used by Profiles and SSH.
+pub fn set_session_env(env: Vec<(String, String)>) {
+    if let Ok(mut current) = SESSION_ENV.write() {
+        *current = env;
+    }
+}
+
+/// Puts [`set_session_env`]'s variables on `cmd`; for the few places that
+/// start git without [`command`].
+pub fn apply_session_env(cmd: &mut Command) {
+    if let Ok(env) = SESSION_ENV.read() {
+        for (key, value) in env.iter() {
+            cmd.env(key, value);
+        }
+    }
+}
 
 /// A `git` command rooted at `dir`, set up so it can never block on a prompt
 /// or flash a console window.
@@ -14,6 +37,7 @@ pub fn command(dir: &Path) -> Command {
         .env("GIT_SEQUENCE_EDITOR", "true")
         .env("GIT_MERGE_AUTOEDIT", "no")
         .args(["-c", "color.ui=false", "-c", "core.quotepath=false"]);
+    apply_session_env(&mut cmd);
     hide_window(&mut cmd);
     cmd
 }

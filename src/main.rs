@@ -8,6 +8,7 @@ mod avatars;
 mod git;
 mod hosting;
 mod platform;
+mod prefs;
 mod shot;
 mod state;
 #[cfg(test)]

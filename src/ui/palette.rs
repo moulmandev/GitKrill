@@ -22,6 +22,7 @@ use crate::git::{Oid, RepoSnapshot, RowKind, short};
 use crate::platform;
 use crate::state::{AppAction, Dialog, RepoTab, Settings, Shared};
 use crate::theme::{self, icons};
+use crate::ui::prefs::Section;
 use crate::ui::widgets::elided;
 use crate::ui::{graph, sidebar, toolbar};
 
@@ -575,6 +576,19 @@ fn app_actions(list: &mut Vec<Entry>, has_tab: bool, settings: &Settings) {
     list.push(action("zoom-out", icons::MAGNIFYING_GLASS_MINUS, "Zoom out", |env| zoom(env.ctx, Zoom::Out)).shortcut("Ctrl+-"));
     list.push(action("zoom-reset", icons::MAGNIFYING_GLASS, "Reset zoom", |env| zoom(env.ctx, Zoom::Reset)).shortcut("Ctrl+0"));
     list.push(action("about", icons::INFO, "About GitKrill", |env| env.shared.show(Dialog::About)).keywords("version"));
+
+    list.push(
+        action("prefs", icons::GEAR, "Preferences", |env| env.shared.actions.push(AppAction::OpenPreferences(Section::General)))
+            .shortcut("Ctrl+,")
+            .keywords("settings options configure"),
+    );
+    for section in Section::APP.into_iter().chain(Section::REPO.into_iter().filter(|_| has_tab)) {
+        let label = format!("Preferences: {}", section.title());
+        let entry = Entry::new(Kind::Action, format!("prefs-{}", section.title()), section.icon(), label, move |env: &mut Env<'_>| {
+            env.shared.actions.push(AppAction::OpenPreferences(section))
+        });
+        list.push(entry.detail(if section.is_repo() { "this repository" } else { "" }).keywords(section.keywords()));
+    }
 }
 
 fn branches_and_tags(list: &mut Vec<Entry>, snap: &RepoSnapshot) {

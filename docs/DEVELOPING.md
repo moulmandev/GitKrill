@@ -33,13 +33,49 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Tell the user something | `shared.toast(ToastKind::Success \| Error, title, body)`. |
 | Offer an action in the command palette (`Ctrl+P`) | Push an `Entry` in `entries` (`src/ui/palette.rs`, see "More actions") whose closure calls the function the button or menu already calls. Leave the entry out while it cannot run. |
 | Offer a list of repositories to open | `ui::workspace::list` (filter, workspaces, recent, branch and changes per row); the summaries come from `shared.workspaces.summary`, read in the background |
-| Persist a preference | Add a field to `Settings` (`src/state.rs`) and to its `Default`; it is saved automatically. |
+| Persist a preference | Add a field to your area's struct in `src/prefs/<area>.rs` (held by `Settings::<area>`; per repository: `RepoPrefs` via `prefs::repo` / `prefs::repo_mut`); it is saved automatically. Older top-level fields of `Settings` stay where they are. |
+| Show a preference | Its section's page in `src/ui/prefs/<section>.rs` (see "Preferences" below). |
+| Read or change git's configuration | `crate::prefs::gitconfig`: `page.global` / `page.repo` on a preferences page (`get`, `get_bool`, `set`, `set_bool`; read in the background, written through `git config`); `gitconfig::read` / `write` / `effective` from background code. |
+| Give every git command an environment variable | `git::cli::set_session_env` (the SSH key and author of the profile in use). |
 | Do network or other non-repository background work | Spawn your own thread, send results over a channel, call `ctx.request_repaint()` when something arrives, and poll the channel from your UI code. Never block in UI code. |
 
 `tab.jump_to(oid)` selects a commit and scrolls the graph to it.
 `tab.is_running("Label prefix")` tells whether an operation is in flight, and
 `tab.take_outcome(label, since)` how one you started ended (its failure is
 already shown to the user as a toast).
+
+## Preferences
+
+File > Preferences (Ctrl+, or the gear at the right end of the tab strip)
+replaces the repository view with a page of sections (`src/ui/prefs/mod.rs`,
+`Section`). Each section is one file, `src/ui/prefs/<section>.rs`, with a
+`State` (kept while the page is open) and `show(ui, page, state)`. `Page`
+gives the egui context, `shared` (settings, toasts, dialogs), the tab in
+front, and the global and repository git configuration files.
+
+- Build pages from `ui::prefs::form`: `row(ui, label, |ui| ...)` puts the label
+  in the left column and the controls on the right, then `help`, `warning`
+  or `error` under the control; `checkbox`, `text`, `number`, `choice`,
+  `path` (with Browse), `button` (tinted: accent for Browse, green for
+  Generate, red for Disconnect), `heading` for groups, `intro` for a
+  paragraph under the title. `config_bool` and `config_text` bind a control
+  straight to a git setting.
+- Settings GitKrill owns live in `src/prefs/<area>.rs`; settings git owns
+  stay in git's files (`core.autocrlf`, `commit.gpgsign`, `gitflow.*`) so
+  every git tool sees them.
+- Anything that must be put into effect outside `Settings` (environment of
+  git commands, fonts, theme files) goes in the area's `apply(ctx,
+  settings)`, called at start and after each change of any setting: compare
+  with what was applied last and return early when nothing of yours changed.
+- Nothing may cost anything while the page is closed, or slow a frame
+  while it is open: run git, gpg, ssh, font scans and network requests on a
+  background thread (`ConfigFile` does this for configuration).
+- Tests and scripted runs must never write the user's own git
+  configuration. `Scope::Global` is `<GITKRILL_CONFIG_DIR>/gitconfig`
+  whenever `GITKRILL_CONFIG_DIR` is set without `GIT_CONFIG_GLOBAL`, and
+  `tools/shot.sh` points `GIT_CONFIG_GLOBAL` at `cfg/gitconfig`; in `cargo
+  test` use `Scope::File` with a temporary file.
+- The command palette lists "Preferences: <section>" for every section.
 
 ## Conventions
 
