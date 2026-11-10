@@ -137,6 +137,14 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
 - To see the light theme, put `{"theme": "Light"}` in `cfg/settings.json`
   before the run (`"auto_fetch_minutes": 0` keeps the 8-second fetch from
   changing the demo mid-script).
+- Updates (`src/update.rs`) are off in builds made from source. To try them,
+  serve a folder on the loopback address (`python -m http.server 8765 --bind
+  127.0.0.1`) holding `latest.json` in the shape of GitHub's
+  `releases/latest` answer and the files under `download/<tag>/`, then run with
+  `GITKRILL_UPDATE_FEED=http://127.0.0.1:8765`, and `GITKRILL_UPDATE_KIND=
+  installed|portable|browser` to pick the flow. Screenshot runs only check
+  against such a feed, and print instead of restarting. A portable run
+  really replaces the executable it runs as: point `BIN` at a copy.
 - `tools/shot.sh` keeps settings in a `cfg` folder next to the output. Never
   run the app for testing without `GITKRILL_CONFIG_DIR` set, or the user's real
   tab list gets temp repositories in it.

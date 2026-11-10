@@ -550,6 +550,11 @@ fn app_actions(list: &mut Vec<Entry>, has_tab: bool, settings: &Settings) {
         "avatars gravatar",
         |s| s.fetch_avatars = !s.fetch_avatars,
     ));
+    if crate::update::Kind::detect() != crate::update::Kind::Off {
+        list.push(action("updates", icons::ARROW_CIRCLE_UP, "Check for updates", |env| {
+            crate::ui::update::check_now(env.ctx, env.shared)
+        }));
+    }
     list.push(toggle(
         "hosting",
         icons::GIT_PULL_REQUEST,

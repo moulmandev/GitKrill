@@ -1,6 +1,6 @@
 [package]
 name = "gitkrill"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "A fast, native Git client with a commit graph, written in Rust"
 license = "MIT"
@@ -23,6 +23,14 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 ureq = "3.5.1"
+
+# Replacing the running executable when a portable copy updates itself
+# (Windows keeps a running .exe locked; this works around that).
+self-replace = "1.5"
+
+[build-dependencies]
+# The executable's icon and version details on Windows (see build.rs).
+winresource = "0.1"
 
 # Linux needs a window-system backend chosen explicitly because eframe's
 # default features are off; with both, the app runs on X11 and Wayland.

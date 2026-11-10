@@ -42,6 +42,7 @@ impl App {
                 dialog_fresh: false,
                 toasts: Vec::new(),
                 actions: Vec::new(),
+                updater: crate::update::Updater::new(),
             },
             cloning: None,
             saved_settings: String::new(),
@@ -321,6 +322,9 @@ impl App {
                 if ui.add(egui::Button::new("Command Palette").shortcut_text("Ctrl+P")).clicked() {
                     palette.open(ui.ctx());
                 }
+                ui.separator();
+                ui::update::menu(ui, shared);
+                ui.separator();
                 if ui.button("About GitKrill").clicked() {
                     shared.show(Dialog::About);
                 }
@@ -440,6 +444,7 @@ impl App {
 
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(dim(format!("v{}", env!("CARGO_PKG_VERSION"))));
+                ui::update::status_item(ui, &mut self.shared);
                 let zoom = (ui.ctx().zoom_factor() * 100.0).round();
                 if zoom != 100.0 {
                     ui.label(dim(format!("{zoom}%")));
@@ -516,6 +521,7 @@ impl eframe::App for App {
         theme::follow(ui, self.shared.settings.theme);
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
+        ui::update::poll(&ctx, &mut self.shared);
         self.shortcuts(&ctx);
 
         let title = match self.tabs.get(self.active) {
@@ -615,5 +621,6 @@ impl eframe::App for App {
         self.shared.settings.tabs = self.tabs.iter().map(|t| t.path.clone()).collect();
         self.shared.settings.active = self.active;
         self.shared.settings.save();
+        ui::update::on_exit(&mut self.shared);
     }
 }

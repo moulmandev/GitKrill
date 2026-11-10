@@ -14,6 +14,7 @@ mod state;
 mod tests;
 mod theme;
 mod ui;
+mod update;
 mod worker;
 
 use std::path::PathBuf;

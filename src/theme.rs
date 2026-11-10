@@ -582,10 +582,18 @@ fn visuals(p: &Palette) -> Visuals {
 
 /// A window icon drawn in code: three graph nodes on a dark tile.
 pub fn app_icon() -> egui::IconData {
-    const N: usize = 64;
-    let mut rgba = vec![0u8; N * N * 4];
+    egui::IconData { rgba: icon_rgba(64), width: 64, height: 64 }
+}
+
+/// The app icon as `n` by `n` RGBA pixels. Drawn on a 64-unit grid and
+/// scaled, with edges smoothed over one pixel at every size, so the same
+/// picture serves the window, the executable and the installer
+/// (`assets/gitkrill.ico`, written by the ignored `write_app_icon` test).
+pub fn icon_rgba(n: usize) -> Vec<u8> {
+    let scale = n as f32 / 64.0;
+    let mut rgba = vec![0u8; n * n * 4];
     let put = |rgba: &mut [u8], x: usize, y: usize, c: Color32, a: f32| {
-        let i = (y * N + x) * 4;
+        let i = (y * n + x) * 4;
         let blend = |dst: u8, src: u8| (dst as f32 + (src as f32 - dst as f32) * a) as u8;
         rgba[i] = blend(rgba[i], c.r());
         rgba[i + 1] = blend(rgba[i + 1], c.g());
@@ -600,19 +608,21 @@ pub fn app_icon() -> egui::IconData {
         let t = ((px * bx + py * by) / (bx * bx + by * by)).clamp(0.0, 1.0);
         ((px - bx * t).powi(2) + (py - by * t).powi(2)).sqrt()
     };
-    let cover = |d: f32| (0.5 - d).clamp(0.0, 1.0);
+    // Coverage of a pixel by a shape, from the distance to its edge in grid
+    // units (negative inside).
+    let cover = |d: f32| (0.5 - d * scale).clamp(0.0, 1.0);
 
     let nodes = [((20.0, 14.0), DARK.lanes[0]), ((20.0, 50.0), DARK.lanes[0]), ((44.0, 30.0), DARK.lanes[1])];
-    for y in 0..N {
-        for x in 0..N {
-            let p = (x as f32 + 0.5, y as f32 + 0.5);
+    for y in 0..n {
+        for x in 0..n {
+            let p = ((x as f32 + 0.5) / scale, (y as f32 + 0.5) / scale);
 
             // Rounded tile.
             let r = 13.0;
             let dx = (p.0 - 32.0).abs() - (32.0 - r);
             let dy = (p.1 - 32.0).abs() - (32.0 - r);
             let outside = dx.max(0.0).hypot(dy.max(0.0)) + dx.max(dy).min(0.0) - r;
-            put(&mut rgba, x, y, DARK.bg_toolbar, cover(outside + 0.5));
+            put(&mut rgba, x, y, DARK.bg_toolbar, cover(outside + 0.5 / scale));
 
             let trunk = seg(p, (20.0, 14.0), (20.0, 50.0)) - 2.5;
             put(&mut rgba, x, y, DARK.lanes[0], cover(trunk));
@@ -626,12 +636,27 @@ pub fn app_icon() -> egui::IconData {
             }
         }
     }
-
-    egui::IconData { rgba, width: N as u32, height: N as u32 }
+    rgba
 }
 
 #[cfg(test)]
 mod tests {
+    /// Writes `assets/gitkrill.ico` (the executable's and the installer's
+    /// icon) from [`super::icon_rgba`]. Run after changing the icon:
+    /// `cargo test write_app_icon -- --ignored`.
+    #[test]
+    #[ignore]
+    fn write_app_icon() {
+        use image::codecs::ico::{IcoEncoder, IcoFrame};
+        let frames: Vec<IcoFrame> = [16u32, 20, 24, 32, 40, 48, 64, 128, 256]
+            .iter()
+            .map(|&n| IcoFrame::as_png(&super::icon_rgba(n as usize), n, n, image::ExtendedColorType::Rgba8).unwrap())
+            .collect();
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets").join("gitkrill.ico");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        IcoEncoder::new(std::fs::File::create(&path).unwrap()).encode_images(&frames).unwrap();
+    }
+
     use super::*;
 
     #[test]

@@ -16,6 +16,7 @@ pub mod rebase;
 pub mod sidebar;
 pub mod textsel;
 pub mod toolbar;
+pub mod update;
 pub mod widgets;
 
 use eframe::egui::Ui;

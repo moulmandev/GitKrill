@@ -21,9 +21,26 @@ middle, and a staging / commit-details panel on the right.
 
 ## Install
 
-Download the build for your system from the
-[latest release](https://github.com/moulmandev/GitKrill/releases/latest),
-unpack it and run it. Git must be installed and on `PATH`.
+From the [latest release](https://github.com/moulmandev/GitKrill/releases/latest).
+Git must be installed and on `PATH`.
+
+| System | Download | Updates |
+| --- | --- | --- |
+| Windows | `GitKrill-Setup-x64.exe`: installs for you only, no administrator rights, with a Start menu entry | Automatic: a new version is downloaded in the background and installed when you close GitKrill, or straight away with **Restart to update** in the status bar |
+| Windows | `gitkrill-portable-windows-x64.exe`: one file, runs from anywhere, nothing installed | Asks first; on yes it replaces itself and restarts |
+| Linux | `gitkrill-portable-linux-x64` (or the same in `gitkrill-linux-x64.tar.gz`) | Asks first; on yes it replaces itself and restarts |
+| macOS | `gitkrill-macos-universal.zip` (Apple silicon and Intel) | Asks first, then opens the download page |
+
+Every update is checked against its SHA-256 (GitHub's record of the file and
+the release's `SHA256SUMS.txt`) before it is used. **Help > Check for
+Updates** looks right away; the automatic check can be switched off there.
+"Skip this version" stops a version from being offered again. Both Windows
+downloads keep their settings in the same place, so you can switch between
+them.
+
+The downloads are not signed with a paid certificate: on first launch Windows
+SmartScreen may say it does not know the app (**More info > Run anyway**),
+and macOS needs right-click > Open.
 
 Or build it yourself with a recent Rust toolchain:
 
@@ -32,20 +49,24 @@ cargo run --release            # start with the tabs from last time
 cargo run --release -- <path>  # open the repository containing <path>
 ```
 
-The binary ends up in `target/release/`.
+The binary ends up in `target/release/`. Builds made from source never
+update themselves.
 
 ## Builds for Windows, Linux and macOS
 
 `.github/workflows/build.yml` tests and builds all three on GitHub Actions:
 
-- every push: the packaged apps are attached to the workflow run as artifacts;
-- pushing a tag such as `v0.2.0`: a GitHub release is published with
-  `gitkrill-windows-x64.zip`, `gitkrill-linux-x64.tar.gz` and
-  `gitkrill-macos-universal.zip` (Apple silicon and Intel) attached.
+- every push: the packaged apps are attached to the workflow run as artifacts,
+  and the Windows installer is tried out (silent install, run, uninstall);
+- pushing a tag such as `v0.2.0` (it must match the version in `Cargo.toml`):
+  a GitHub release is published with every download above and
+  `SHA256SUMS.txt`. Running copies find it within six hours.
 
-The macOS app is not signed with an Apple Developer ID, so the first launch
-needs right-click > Open. On Linux the app needs OpenGL and either X11 or
-Wayland; nothing else has to be installed.
+To release: bump `version` in `Cargo.toml`, commit, then
+`git tag v0.3.0 && git push origin v0.3.0`.
+
+On Linux the app needs OpenGL and either X11 or Wayland; nothing else has to
+be installed.
 
 ## What works
 
@@ -120,14 +141,15 @@ pull requests) for the relevant actions. Double-click a branch to check it out.
 
 ## Network and privacy
 
-Three features talk to the network on their own. Each has a switch in the
-**View** menu.
+Four features talk to the network on their own. Each has a switch: updates
+in the **Help** menu, the others in the **View** menu.
 
 | Feature | What is sent | Where |
 | --- | --- | --- |
 | Author pictures | SHA-256 of each author's email address, or the GitHub user id from a `noreply` address | gravatar.com, avatars.githubusercontent.com |
 | Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, and the requests you open, with a token when one is found for that host (below) | api.github.com, gitlab.com, and only the servers you connected |
 | Automatic fetch | `git fetch --all --prune`, as you would run it | your remotes |
+| Updates | A request for the latest release shortly after start and every six hours; the download when there is a newer one | api.github.com, github.com and its download host |
 
 A server other than github.com and gitlab.com is never sent anything until
 you have said what it runs; the answer is kept in the settings file
@@ -185,6 +207,7 @@ src/
   worker.rs      reader / operator threads and the file watcher
   theme.rs       colours, fonts, egui style
   avatars.rs     author pictures: fetch, disk cache, textures
+  update.rs      checking for, downloading and applying updates
   hosting/       pull / merge requests, issues and CI: github.rs (GitHub
                  and Enterprise), gitlab.rs, shared sign-in and network
   git/
@@ -195,6 +218,7 @@ src/
     conflict.rs  three-way conflict regions and resolutions
     rebase.rs    interactive rebase plans
     blame.rs     file history and blame
+    picture.rs   decoding images for the image preview
     cli.rs       running git
   ui/
     graph.rs     commit graph (graph/drag.rs: dragging branches)
@@ -206,10 +230,14 @@ src/
     history.rs   file history, blame
     toolbar.rs   toolbar             dialogs.rs  modals and toasts
     palette.rs   command palette (Ctrl+P)
+    image_diff.rs  image preview     update.rs   update offer, status bar
     widgets.rs   shared widgets
   shot.rs        scripted screenshots for development
   tests.rs       end-to-end backend tests against real temp repositories
 tools/           demo repository and screenshot scripts
+installer/       the Windows installer (Inno Setup)
+assets/          the app icon
+build.rs         the Windows executable's icon and version details
 ```
 
 `cargo test` runs the test suite. Settings live in

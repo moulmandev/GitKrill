@@ -81,6 +81,8 @@ pub enum Dialog {
     PushRejected,
     Clone { url: String, dest: String },
     About,
+    /// A newer release to update to; see `ui::update`.
+    Update(std::sync::Arc<crate::update::Release>),
     /// What runs on a self-hosted server (`crate::ui::hosting::connect_body`).
     ConnectServer { host: String, path: String, choice: Option<crate::hosting::ServerKind> },
     /// "Create pull request"; see `ui::new_pull`.
@@ -139,6 +141,10 @@ pub struct Settings {
     /// gitlab.com, only servers listed here are ever contacted.
     #[serde(default)]
     pub hosting_servers: crate::hosting::Servers,
+    /// Look for a newer release now and then (official builds only).
+    pub check_updates: bool,
+    /// A version the user chose to skip: not offered again by itself.
+    pub skipped_update: Option<String>,
 }
 
 impl Default for Settings {
@@ -158,6 +164,8 @@ impl Default for Settings {
             fetch_avatars: true,
             hosting_integration: true,
             theme: crate::theme::Choice::Dark,
+            check_updates: true,
+            skipped_update: None,
             hosting_servers: Default::default(),
         }
     }
@@ -216,6 +224,7 @@ pub struct Shared {
     pub dialog_fresh: bool,
     pub toasts: Vec<Toast>,
     pub actions: Vec<AppAction>,
+    pub updater: crate::update::Updater,
 }
 
 impl Shared {

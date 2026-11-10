@@ -2,3 +2,6 @@
 # on Windows.
 * text=auto eol=lf
 *.png binary
+# Inno Setup reads its scripts best with Windows line endings.
+*.iss text eol=crlf
+*.ico binary

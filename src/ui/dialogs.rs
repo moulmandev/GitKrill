@@ -25,6 +25,7 @@ pub fn show(ctx: &egui::Context, shared: &mut Shared, mut tab: Option<&mut RepoT
     let fresh = std::mem::take(&mut shared.dialog_fresh);
     let width = match dialog {
         Dialog::NewPull(_) => 520.0,
+        Dialog::Update(_) => 460.0,
         _ => 400.0,
     };
 
@@ -280,6 +281,14 @@ fn body(
             crate::ui::new_pull::Next::Close => Outcome::Close,
             crate::ui::new_pull::Next::Hold => Outcome::Hold,
         },
+
+        Dialog::Update(release) => {
+            let release = release.clone();
+            match crate::ui::update::dialog(ui, shared, &release) {
+                true => Outcome::Close,
+                false => Outcome::Keep,
+            }
+        }
 
         Dialog::About => {
             title(ui, "GitKrill");

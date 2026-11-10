@@ -2,8 +2,16 @@
 #
 # - Every push and pull request: test and build on all three, and attach the
 #   packaged apps to the workflow run (Actions tab > the run > Artifacts).
-# - Pushing a tag such as v0.2.0: the same, then publish a GitHub release with
-#   the three downloads attached.
+# - Pushing a tag such as v0.2.0 (it must match the version in Cargo.toml):
+#   the same, then publish a GitHub release with every download and a
+#   SHA256SUMS.txt that the apps check their updates against.
+#
+# Downloads, as the updater in src/update.rs expects them:
+#   GitKrill-Setup-x64.exe              Windows installer (updates itself)
+#   gitkrill-portable-windows-x64.exe   Windows, standalone (asks to update)
+#   gitkrill-portable-linux-x64         Linux binary (asks to update)
+#   gitkrill-linux-x64.tar.gz           the same, with the README
+#   gitkrill-macos-universal.zip        macOS app
 
 name: Build
 
@@ -34,15 +42,12 @@ jobs:
         include:
           - name: Windows
             os: windows-latest
-            package: gitkrill-windows-x64.zip
           # The oldest Ubuntu image on offer, so the binary also runs on
           # distributions with an older glibc.
           - name: Linux
             os: ubuntu-22.04
-            package: gitkrill-linux-x64.tar.gz
           - name: macOS
             os: macos-latest
-            package: gitkrill-macos-universal.zip
 
     steps:
       - uses: actions/checkout@v7
@@ -57,6 +62,16 @@ jobs:
           fi
 
       - uses: Swatinem/rust-cache@v2
+
+      - name: Check the tag against the version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error title=Version mismatch::The tag is $GITHUB_REF_NAME but Cargo.toml says $version"
+            exit 1
+          fi
 
       # The tests create real repositories and commits. When some fail, their
       # output is repeated as an annotation on the run's summary page, so the
@@ -74,13 +89,18 @@ jobs:
           echo "::error title=Tests failed on ${RUNNER_OS}::${details:-see the log}"
           exit 1
 
+      # Official builds look for updates; builds made from source do not.
       - name: Build (Windows, Linux)
         if: runner.os != 'macOS'
+        env:
+          GITKRILL_OFFICIAL_BUILD: "1"
         run: cargo build --release --locked
 
       # One binary that runs natively on both Apple silicon and Intel Macs.
       - name: Build (macOS universal)
         if: runner.os == 'macOS'
+        env:
+          GITKRILL_OFFICIAL_BUILD: "1"
         run: |
           cargo build --release --locked --target aarch64-apple-darwin
           cargo build --release --locked --target x86_64-apple-darwin
@@ -93,16 +113,48 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist/GitKrill | Out-Null
-          Copy-Item target/release/gitkrill.exe, README.md dist/GitKrill/
-          Compress-Archive -Path dist/GitKrill -DestinationPath ${{ matrix.package }}
+          New-Item -ItemType Directory -Force upload | Out-Null
+          Copy-Item target/release/gitkrill.exe upload/gitkrill-portable-windows-x64.exe
+
+      # Inno Setup is not on every Windows runner image any more.
+      - name: Installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress | Out-Null
+          }
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          & $iscc /Qp "/DAppVersion=$version" installer\gitkrill.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item dist/GitKrill-Setup-x64.exe upload/
+
+      # Install silently as an update would, run the result, uninstall.
+      - name: Try the installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          Start-Process -Wait -FilePath upload/GitKrill-Setup-x64.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-'
+          $dir = "$env:LOCALAPPDATA\Programs\GitKrill"
+          if (-not (Test-Path "$dir\gitkrill-installed")) { throw "The install marker is missing from $dir" }
+          $out = (& "$dir\gitkrill.exe" --version | Out-String).Trim()
+          if ($out -ne "gitkrill $version") { throw "Unexpected --version output: '$out'" }
+          if (-not (Test-Path "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\GitKrill.lnk")) { throw "No Start menu entry" }
+          Start-Process -Wait -FilePath "$dir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
+          # The uninstaller hands over to a copy of itself; give it time.
+          for ($i = 0; $i -lt 60 -and (Test-Path "$dir\gitkrill.exe"); $i++) { Start-Sleep -Milliseconds 500 }
+          if (Test-Path "$dir\gitkrill.exe") { throw "The uninstaller left gitkrill.exe behind" }
+          Write-Output "Installed, ran ($out) and uninstalled."
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
         run: |
-          mkdir -p dist/gitkrill
+          mkdir -p dist/gitkrill upload
           cp target/release/gitkrill README.md dist/gitkrill/
-          tar -C dist -czf ${{ matrix.package }} gitkrill
+          tar -C dist -czf upload/gitkrill-linux-x64.tar.gz gitkrill
+          cp target/release/gitkrill upload/gitkrill-portable-linux-x64
 
       # A minimal .app bundle so it can be launched from Finder. It is signed
       # ad hoc only: without an Apple Developer ID, macOS asks the user to
@@ -132,12 +184,13 @@ jobs:
           </plist>
           EOF
           codesign --force --deep --sign - "$app"
-          ditto -c -k --keepParent "$app" ${{ matrix.package }}
+          mkdir -p upload
+          ditto -c -k --keepParent "$app" upload/gitkrill-macos-universal.zip
 
       - uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.package }}
-          path: ${{ matrix.package }}
+          name: gitkrill-${{ matrix.name }}
+          path: upload/*
           if-no-files-found: error
 
   release:
@@ -152,6 +205,14 @@ jobs:
         with:
           path: packages
           merge-multiple: true
+
+      # What the apps check each update against, besides GitHub's own record.
+      - name: Checksums
+        run: |
+          cd packages
+          sha256sum -- * > ../SHA256SUMS.txt
+          mv ../SHA256SUMS.txt .
+          cat SHA256SUMS.txt
 
       - uses: softprops/action-gh-release@v3
         with:
