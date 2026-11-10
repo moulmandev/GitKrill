@@ -93,6 +93,8 @@ pub enum Dialog {
     GitflowStart(crate::ui::gitflow::StartForm),
     /// Gitflow: finish one; see `ui::gitflow`.
     GitflowFinish(Box<crate::ui::gitflow::FinishForm>),
+    /// Delete every local branch in a folder; see `ui::branch_folder`.
+    DeleteFolder(Box<crate::ui::branch_folder::DeleteForm>),
     /// Git is missing: the offer to get it; see `ui::git_setup`.
     GitSetup,
 }

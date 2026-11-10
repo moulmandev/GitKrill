@@ -6,6 +6,7 @@
 //! helpers, LFS and the user's config behave exactly as they do in a terminal.
 
 pub mod blame;
+pub mod branch_folder;
 pub mod cli;
 pub mod conflict;
 pub mod diff;

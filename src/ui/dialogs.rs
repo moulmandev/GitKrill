@@ -25,7 +25,7 @@ pub fn show(ctx: &egui::Context, shared: &mut Shared, mut tab: Option<&mut RepoT
     let fresh = std::mem::take(&mut shared.dialog_fresh);
     let width = match dialog {
         Dialog::NewPull(_) => 520.0,
-        Dialog::Update(_) | Dialog::GitSetup => 460.0,
+        Dialog::Update(_) | Dialog::GitSetup | Dialog::DeleteFolder(_) => 460.0,
         _ => 400.0,
     };
 
@@ -289,6 +289,10 @@ fn body(
         Dialog::GitflowFinish(form) => match crate::ui::gitflow::finish_dialog(ui, form, tab) {
             crate::ui::gitflow::Next::Keep => Outcome::Keep,
             crate::ui::gitflow::Next::Close => Outcome::Close,
+        },
+        Dialog::DeleteFolder(form) => match crate::ui::branch_folder::dialog(ui, form, tab) {
+            crate::ui::branch_folder::Next::Keep => Outcome::Keep,
+            crate::ui::branch_folder::Next::Close => Outcome::Close,
         },
 
         Dialog::Update(release) => {

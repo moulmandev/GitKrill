@@ -53,8 +53,10 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                 drag::source(&response, || Some(Branch::local(&branch.name)), theme::accent());
                 landing(ui, tab, &snap, session, &response, || Target::Branch(Branch::local(&branch.name)));
             });
-            if let Some((path, hide)) = change {
-                tab.set_hidden(&mut shared.settings, &path, hide);
+            match change {
+                Some(FolderAction::Hide(path, hide)) => tab.set_hidden(&mut shared.settings, &path, hide),
+                Some(FolderAction::Delete(folder)) => crate::ui::branch_folder::delete_local(tab, shared, &folder),
+                None => {}
             }
         }
 
@@ -118,8 +120,12 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                     drag::source(&response, || Some(Branch::remote(branch)), theme::accent());
                     landing(ui, tab, &snap, session, &response, || Target::Branch(Branch::remote(branch)));
                 });
-                if let Some((path, hide)) = change {
-                    tab.set_hidden(&mut shared.settings, &path, hide);
+                match change {
+                    Some(FolderAction::Hide(path, hide)) => tab.set_hidden(&mut shared.settings, &path, hide),
+                    Some(FolderAction::Delete(folder)) => {
+                        crate::ui::branch_folder::delete_remote(tab, shared, &remote.name, &folder);
+                    }
+                    None => {}
                 }
             }
         }
@@ -414,10 +420,19 @@ fn paint_leaf(
     painter.galley(pos2(x + 20.0, (y - galley.size().y / 2.0).round()), galley, color);
 }
 
+/// What a folder's eye or context menu asked for, for the caller of [`tree`]
+/// to do.
+enum FolderAction {
+    /// Hide or show this folder (its full path) in the graph.
+    Hide(String, bool),
+    /// Delete every branch in this folder (its path within the tree).
+    Delete(String),
+}
+
 /// Renders `items` (slash-separated path, payload index) as a folder tree.
-/// `ref_prefix` followed by an item's path is its full ref name; folders can
-/// be hidden from the graph, and the change asked for (folder, hide) is
-/// returned for the caller to make.
+/// `ref_prefix` followed by an item's path is its full ref name. A folder's
+/// eye and menu hide it from the graph or delete its branches; that is
+/// returned for the caller to do.
 #[allow(clippy::too_many_arguments)]
 fn tree(
     ui: &mut Ui,
@@ -428,7 +443,7 @@ fn tree(
     base_depth: usize,
     force_open: bool,
     leaf_ui: &mut dyn FnMut(&mut Ui, &mut RepoTab, usize, &str, usize),
-) -> Option<(String, bool)> {
+) -> Option<FolderAction> {
     let mut change = None;
     let mut sorted: Vec<&(String, usize)> = items.iter().collect();
     sorted.sort_by_key(|a| a.0.to_lowercase());
@@ -465,18 +480,23 @@ fn tree(
                 painter.galley(pos2(x + 20.0, (y - galley.size().y / 2.0).round()), galley, color);
             });
             if eye {
-                change = Some((folder.clone(), !is_hidden));
+                change = Some(FolderAction::Hide(folder.clone(), !is_hidden));
             } else if response.clicked() {
                 toggle(tab, &key);
             }
             response.context_menu(|ui| {
                 ui.set_min_width(200.0);
                 if hide_item(ui, is_hidden, "in graph") {
-                    change = Some((folder.clone(), !is_hidden));
+                    change = Some(FolderAction::Hide(folder.clone(), !is_hidden));
                 }
                 let (icon, label) = if collapsed { (icons::FOLDER_OPEN, "Expand") } else { (icons::FOLDER, "Collapse") };
                 if !force_open && menu_item(ui, icon, label) {
                     toggle(tab, &key);
+                }
+                ui.separator();
+                let path = stack.join("/");
+                if menu_item(ui, icons::TRASH, &format!("Delete all branches in {path}…")) {
+                    change = Some(FolderAction::Delete(path));
                 }
             });
             if collapsed {

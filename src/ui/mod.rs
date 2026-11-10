@@ -1,5 +1,6 @@
 //! User interface, one module per region of the window.
 
+pub mod branch_folder;
 pub mod commit_button;
 pub mod conflict;
 pub mod dialogs;

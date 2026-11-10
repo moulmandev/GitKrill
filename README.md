@@ -151,6 +151,10 @@ be installed.
 
 **History**
 - Checkout (branch, remote branch, commit, tag), create / rename / delete branch
+- Delete a whole folder of branches at once (right-click the folder). A
+  branch checked out in a worktree goes with that worktree, unless it has
+  uncommitted changes or is locked; undo brings the branches back. On a
+  remote, the folder's branches are deleted there in one push
 - Merge, rebase, cherry-pick, revert, reset (soft / mixed / hard)
 - Interactive rebase: pick, reword, squash, fixup, drop and reorder
 - File history (following renames) and blame, from any file's context menu
