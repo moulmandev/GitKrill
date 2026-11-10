@@ -76,6 +76,18 @@ front, and the global and repository git configuration files.
   `tools/shot.sh` points `GIT_CONFIG_GLOBAL` at `cfg/gitconfig`; in `cargo
   test` use `Scope::File` with a temporary file.
 - The command palette lists "Preferences: <section>" for every section.
+- Colours of a custom theme (`crate::prefs::appearance`) are read by name
+  from the `Palette` fields: a colour added to `Palette` must also go in
+  `colours()` there (a test fails otherwise), and gets the base set's value
+  in theme files that do not name it.
+- Dates go through `state::format_time` (with the time of day) or
+  `prefs::appearance::custom_date`, so they follow Preferences > UI
+  Customization > Date/Time Short Format; do not call chrono's `format`
+  for a date shown to the user.
+- In a text field that keeps what is typed aside until it loses focus, ask
+  `ui.memory(|m| m.has_focus(response.id))`: `response.has_focus()` is also
+  false while the window is in the background (and always in scripted
+  screenshot runs), which would drop what was typed.
 
 ## Conventions
 

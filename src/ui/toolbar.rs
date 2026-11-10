@@ -7,30 +7,56 @@ use eframe::egui::{
 
 use crate::git::ops::{self, PullMode};
 use crate::platform;
-use crate::state::{Dialog, RepoTab, Shared};
+use crate::state::{Dialog, RepoTab, Settings, Shared};
 use crate::theme::{self, icons};
 use crate::ui::widgets::{elided, icon_button, menu_item};
 
+/// A button with its label above the icon, and without
+/// (Preferences > UI Customization > Show toolbar icon labels).
 const BUTTON: egui::Vec2 = vec2(54.0, 46.0);
+const BUTTON_ICON_ONLY: egui::Vec2 = vec2(40.0, 32.0);
+
+/// Height of the toolbar, which is shorter without labels.
+pub fn height(settings: &Settings) -> f32 {
+    if settings.appearance.toolbar_labels { 54.0 } else { 40.0 }
+}
 
 pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
     let rect = ui.max_rect();
     let snap = tab.snap.clone();
+    let labels = shared.settings.appearance.toolbar_labels;
+    let button = if labels { BUTTON } else { BUTTON_ICON_ONLY };
 
-    // ---- left: repository > branch ----
-    ui.scope_builder(
+    // ---- left: [workspace >] repository > branch ----
+    let workspace = shared
+        .settings
+        .appearance
+        .workspace_breadcrumb
+        .then(|| workspace_of(&shared.settings, &tab.path))
+        .flatten();
+    let pickers = ui.scope_builder(
         egui::UiBuilder::new()
             .max_rect(rect.shrink2(vec2(10.0, 0.0)))
             .layout(Layout::left_to_right(Align::Center)),
         |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            let response = picker(ui, "repository", &tab.name, 190.0);
+            // The workspace opens the same list as the repository: the
+            // repositories of every workspace, this one among them.
+            let workspace = workspace.map(|name| {
+                let response = picker(ui, "workspace", &name, 160.0, button.y, labels);
+                ui.label(egui::RichText::new(icons::CARET_RIGHT).size(12.0).color(theme::text_faint()));
+                response
+            });
+            let response = picker(ui, "repository", &tab.name, 190.0, button.y, labels);
             crate::ui::workspace::repository_menu(&response, shared, &tab.path);
+            if let Some(response) = workspace {
+                crate::ui::workspace::repository_menu(&response, shared, &tab.path);
+            }
 
             ui.label(egui::RichText::new(icons::CARET_RIGHT).size(12.0).color(theme::text_faint()));
 
             let branch = snap.as_ref().map(|s| s.head_label()).unwrap_or_default();
-            let response = picker(ui, "branch", &branch, 220.0);
+            let response = picker(ui, "branch", &branch, 220.0, button.y, labels);
             if let Some(snap) = &snap {
                 Popup::menu(&response).show(|ui| {
                     ui.set_min_width(240.0);
@@ -62,10 +88,13 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
     let on_branch = snap.as_ref().is_some_and(|s| s.current_branch().is_some());
     let ready = snap.is_some();
 
-    let group_w = BUTTON.x * 8.0 + 16.0 + 14.0 + 13.0 + 8.0 * 2.0;
-    let center = Rect::from_center_size(rect.center(), vec2(group_w, BUTTON.y));
+    let group_w = button.x * 8.0 + 16.0 + 14.0 + 13.0 + 8.0 * 2.0;
+    let center = Rect::from_center_size(rect.center(), vec2(group_w, button.y));
     // Keep clear of the pickers on narrow windows.
-    let center = center.translate(vec2((rect.left() + 440.0 - center.left()).max(0.0), 0.0));
+    let center = center.translate(vec2((pickers.response.rect.right() + 20.0 - center.left()).max(0.0), 0.0));
+    let tool_button = |ui: &mut Ui, label: &str, icon: &str, enabled: bool, busy: bool, tooltip: &str| {
+        tool_button(ui, button, labels, label, icon, enabled, busy, tooltip)
+    };
 
     ui.scope_builder(
         egui::UiBuilder::new().max_rect(center).layout(Layout::left_to_right(Align::Center)),
@@ -92,12 +121,12 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
             if tool_button(ui, "Pull", icons::ARROW_LINE_DOWN, has_remote && on_branch, tab.is_running("Pull") || tab.is_running("Fetch"), pull_tip).clicked() {
                 pull(tab, PullMode::Default);
             }
-            let (caret, response) = ui.allocate_exact_size(vec2(14.0, BUTTON.y), Sense::click());
+            let (caret, response) = ui.allocate_exact_size(vec2(14.0, button.y), Sense::click());
             if response.hovered() {
                 ui.painter().rect_filled(caret, 4.0, theme::bg_raised());
             }
             ui.painter().text(
-                pos2(caret.center().x, caret.top() + 31.0),
+                pos2(caret.center().x, if labels { caret.top() + 31.0 } else { caret.center().y + 1.0 }),
                 Align2::CENTER_CENTER,
                 icons::CARET_DOWN,
                 theme::font(10.0),
@@ -148,7 +177,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                 pop_stash(tab);
             }
 
-            let (sep, _) = ui.allocate_exact_size(vec2(13.0, BUTTON.y), Sense::hover());
+            let (sep, _) = ui.allocate_exact_size(vec2(13.0, button.y), Sense::hover());
             ui.painter().vline(sep.center().x, sep.shrink2(vec2(0.0, 6.0)).y_range(), egui::Stroke::new(1.0, theme::border()));
 
             if tool_button(ui, "Terminal", icons::TERMINAL_WINDOW, true, false, "Open a terminal in this repository").clicked() {
@@ -243,32 +272,68 @@ pub fn push_cmd(tab: &RepoTab, force: bool) -> Option<ops::GitCmd> {
     }
 }
 
-/// A caption-over-value dropdown trigger ("repository / MelonLoader7").
-fn picker(ui: &mut Ui, caption: &str, value: &str, max_width: f32) -> Response {
-    let font = theme::bold(15.0);
+/// The workspace `repo` belongs to, by name: the innermost one whose
+/// folder holds it.
+fn workspace_of(settings: &Settings, repo: &std::path::Path) -> Option<String> {
+    settings
+        .workspaces
+        .iter()
+        .filter(|w| repo.starts_with(&w.root))
+        .max_by_key(|w| w.root.components().count())
+        .map(|w| w.name())
+}
+
+/// A caption-over-value dropdown trigger ("repository / MelonLoader7"), or
+/// the value alone when the toolbar has no labels.
+fn picker(ui: &mut Ui, caption: &str, value: &str, max_width: f32, height: f32, labels: bool) -> Response {
+    let font = theme::bold(if labels { 15.0 } else { 14.0 });
     let galley = elided(ui.painter(), value, font, theme::text_bright(), max_width - 34.0);
-    let width = (galley.size().x + 34.0).max(70.0);
-    let (rect, response) = ui.allocate_exact_size(vec2(width, BUTTON.y), Sense::click());
+    let width = (galley.size().x + 34.0).max(if labels { 70.0 } else { 50.0 });
+    let (rect, response) = ui.allocate_exact_size(vec2(width, height), Sense::click());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         if response.hovered() {
             painter.rect_filled(rect, 4.0, theme::bg_raised());
         }
-        painter.text(pos2(rect.left() + 8.0, rect.top() + 12.0), Align2::LEFT_CENTER, caption, theme::font(10.5), theme::text_dim());
-        let y = rect.top() + 30.0;
+        let y = if labels {
+            painter.text(pos2(rect.left() + 8.0, rect.top() + 12.0), Align2::LEFT_CENTER, caption, theme::font(10.5), theme::text_dim());
+            rect.top() + 30.0
+        } else {
+            rect.center().y
+        };
         let text_w = galley.size().x;
         painter.galley(pos2(rect.left() + 8.0, (y - galley.size().y / 2.0).round()), galley, theme::text_bright());
         painter.text(pos2(rect.left() + 14.0 + text_w, y + 1.0), Align2::LEFT_CENTER, icons::CARET_DOWN, theme::font(11.0), theme::text_dim());
     }
-    response
+    if labels {
+        response
+    } else {
+        // The caption is not shown: it names the picker in its tooltip.
+        response.on_hover_ui(|ui| {
+            let mut name = caption.to_owned();
+            name[..1].make_ascii_uppercase();
+            ui.label(name);
+        })
+    }
 }
 
-/// Label above icon, like the reference toolbar. While `busy`, the icon is
-/// replaced by a spinner and the button ignores clicks, so a slow push or pull
-/// visibly "took".
-fn tool_button(ui: &mut Ui, label: &str, icon: &str, enabled: bool, busy: bool, tooltip: &str) -> Response {
+/// Label above icon, like the reference toolbar, or the icon alone without
+/// `labels`, the label then in the tooltip. While `busy`, the icon is
+/// replaced by a spinner and the button ignores clicks, so a slow push or
+/// pull visibly "took".
+#[allow(clippy::too_many_arguments)]
+fn tool_button(
+    ui: &mut Ui,
+    size: egui::Vec2,
+    labels: bool,
+    label: &str,
+    icon: &str,
+    enabled: bool,
+    busy: bool,
+    tooltip: &str,
+) -> Response {
     let clickable = enabled && !busy;
-    let (rect, response) = ui.allocate_exact_size(BUTTON, if clickable { Sense::click() } else { Sense::hover() });
+    let (rect, response) = ui.allocate_exact_size(size, if clickable { Sense::click() } else { Sense::hover() });
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         let pressed = clickable && response.is_pointer_button_down_on();
@@ -290,21 +355,31 @@ fn tool_button(ui: &mut Ui, label: &str, icon: &str, enabled: bool, busy: bool, 
         }
         // The content sinks a pixel while held, like a physical key.
         let nudge = if pressed { 1.0 } else { 0.0 };
-        painter.text(
-            pos2(rect.center().x, rect.top() + 11.0 + nudge),
-            Align2::CENTER_CENTER,
-            label,
-            theme::font(11.0),
-            label_color,
-        );
-        let icon_at = pos2(rect.center().x, rect.top() + 30.0 + nudge);
+        if labels {
+            painter.text(
+                pos2(rect.center().x, rect.top() + 11.0 + nudge),
+                Align2::CENTER_CENTER,
+                label,
+                theme::font(11.0),
+                label_color,
+            );
+        }
+        let icon_y = if labels { rect.top() + 30.0 } else { rect.center().y };
+        let icon_at = pos2(rect.center().x, icon_y + nudge);
         if busy {
             crate::ui::widgets::spinner(painter, icon_at, 8.0, theme::accent());
         } else {
             painter.text(icon_at, Align2::CENTER_CENTER, icon, theme::font(20.0), icon_color);
         }
     }
-    response.on_hover_text(tooltip)
+    if labels || tooltip.to_lowercase().contains(&label.to_lowercase()) {
+        response.on_hover_text(tooltip)
+    } else {
+        // The label is not on the button: name the button in its tooltip.
+        response.on_hover_ui(|ui| {
+            ui.label(format!("{label}: {tooltip}"));
+        })
+    }
 }
 
 /// A thin sweeping bar along the bottom of the toolbar while work is running.

@@ -330,7 +330,8 @@ fn busy(ui: &mut Ui, text: &str) {
     ui.ctx().request_repaint();
 }
 
-/// `Oct 12, 2026`, or `3 days ago` while that says more.
+/// `Oct 12, 2026` (or the date format chosen in preferences), or `3 days
+/// ago` while that says more.
 fn short_date(secs: i64) -> String {
     use chrono::{Local, TimeZone};
     let ago = relative_time(secs);
@@ -338,7 +339,8 @@ fn short_date(secs: i64) -> String {
         return ago;
     }
     match Local.timestamp_opt(secs, 0).single() {
-        Some(time) => time.format("%b %-d, %Y").to_string(),
+        Some(time) => crate::prefs::appearance::custom_date(&time, false)
+            .unwrap_or_else(|| time.format("%b %-d, %Y").to_string()),
         None => String::new(),
     }
 }

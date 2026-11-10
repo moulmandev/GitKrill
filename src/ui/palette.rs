@@ -558,6 +558,14 @@ fn app_actions(list: &mut Vec<Entry>, has_tab: bool, settings: &Settings) {
         "avatars gravatar",
         |s| s.fetch_avatars = !s.fetch_avatars,
     ));
+    list.push(toggle(
+        "toolbar-labels",
+        icons::TEXT_AA,
+        settings.appearance.toolbar_labels,
+        ("Hide toolbar labels", "Show toolbar labels"),
+        "icons compact toolbar",
+        |s| s.appearance.toolbar_labels = !s.appearance.toolbar_labels,
+    ));
     if crate::update::Kind::detect() != crate::update::Kind::Off {
         list.push(action("updates", icons::ARROW_CIRCLE_UP, "Check for updates", |env| {
             crate::ui::update::check_now(env.ctx, env.shared)

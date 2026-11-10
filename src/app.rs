@@ -381,8 +381,22 @@ impl App {
                     }
                 }
                 ui.menu_button("Theme", |ui| {
+                    let appearance = &mut shared.settings.appearance;
                     for choice in theme::Choice::ALL {
-                        ui.radio_value(&mut shared.settings.theme, choice, choice.label());
+                        let picked = appearance.custom_theme.is_none() && shared.settings.theme == choice;
+                        if ui.radio(picked, choice.label()).clicked() {
+                            shared.settings.theme = choice;
+                            appearance.custom_theme = None;
+                        }
+                    }
+                    // Custom themes are listed in preferences, which read
+                    // the themes folder; the menu only shows the one in use.
+                    if let Some(name) = &appearance.custom_theme {
+                        let _ = ui.radio(true, name.as_str());
+                    }
+                    ui.separator();
+                    if ui.button("Custom Themes…").clicked() {
+                        shared.actions.push(AppAction::OpenPreferences(Section::Appearance));
                     }
                 });
                 ui.separator();
@@ -659,7 +673,7 @@ impl eframe::App for App {
             let tab = &mut tabs[*active];
             tab.start(&ctx);
 
-            bar("toolbar", 54.0, theme::bg_toolbar()).show(ui, |ui| {
+            bar("toolbar", ui::toolbar::height(&shared.settings), theme::bg_toolbar()).show(ui, |ui| {
                 ui::toolbar::show(ui, tab, shared);
                 let rect = ui.max_rect();
                 ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::border()));

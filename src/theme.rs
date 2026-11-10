@@ -1,8 +1,9 @@
 //! Colours, fonts and the egui style.
 
-use std::sync::Arc;
+use std::cell::Cell;
+use std::sync::{Arc, Mutex, PoisonError};
 #[cfg(not(test))]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use eframe::egui::{
     self, Color32, CornerRadius, FontData, FontDefinitions, FontFamily, FontId, Margin, Stroke,
@@ -18,8 +19,10 @@ const fn rgb(hex: u32) -> Color32 {
 
 /// Every colour the UI paints with. [`DARK`] and [`LIGHT`] are the two sets;
 /// [`follow`] chooses one and the functions below read the chosen set, so
-/// call them each frame rather than keeping their result.
-#[derive(Clone, Copy, Debug)]
+/// call them each frame rather than keeping their result. A custom theme
+/// file (`crate::prefs::appearance`) is one of the two with some colours
+/// replaced.
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Palette {
     /// Whether this set is meant for a dark background.
     pub dark: bool,
@@ -251,48 +254,128 @@ impl Choice {
     }
 }
 
-// Which set is in use. Tests get one per thread so that a test looking at the
-// light set cannot change the colours another test sees.
-#[cfg(not(test))]
-static LIGHT_ON: AtomicBool = AtomicBool::new(false);
+// The built-in sets at fixed addresses, so that the set in use is told apart
+// by address (a `const` has none of its own).
+static DARK_SET: Palette = DARK;
+static LIGHT_SET: Palette = LIGHT;
+
+// Which set is in use, and the custom set of a theme file when one is picked
+// (`crate::prefs::appearance`). Tests get their own per thread so that a test
+// looking at the light set cannot change the colours another test sees.
 #[cfg(test)]
 thread_local! {
-    static LIGHT_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static ACTIVE: Cell<&'static Palette> = const { Cell::new(&DARK_SET) };
+    static CUSTOM: Cell<Option<&'static Palette>> = const { Cell::new(None) };
 }
 
-/// Whether the light set is in use.
-pub fn is_light() -> bool {
-    #[cfg(not(test))]
-    return LIGHT_ON.load(Ordering::Relaxed);
-    #[cfg(test)]
-    return LIGHT_ON.with(|on| on.get());
+#[cfg(test)]
+fn set_active(palette: &'static Palette) {
+    ACTIVE.with(|active| active.set(palette));
+}
+
+#[cfg(test)]
+fn custom() -> Option<&'static Palette> {
+    CUSTOM.with(Cell::get)
 }
 
 /// The set in use.
+#[cfg(test)]
 pub fn palette() -> &'static Palette {
-    if is_light() { &LIGHT } else { &DARK }
+    ACTIVE.with(Cell::get)
 }
 
-/// Switch sets. The egui style still has to be applied again afterwards;
-/// [`follow`] does both.
+#[cfg(test)]
+pub fn set_custom(palette: Option<Palette>) {
+    CUSTOM.with(|custom| custom.set(palette.map(intern)));
+}
+
+// Every colour reads the set in use, so it has to cost no more than an atomic
+// load: each thread keeps its own copy of the reference and takes the lock
+// only after `GENERATION` moved.
+#[cfg(not(test))]
+static GENERATION: AtomicU32 = AtomicU32::new(0);
+#[cfg(not(test))]
+static ACTIVE: Mutex<&'static Palette> = Mutex::new(&DARK_SET);
+#[cfg(not(test))]
+static CUSTOM: Mutex<Option<&'static Palette>> = Mutex::new(None);
+#[cfg(not(test))]
+thread_local! {
+    static SEEN: Cell<(u32, &'static Palette)> = const { Cell::new((0, &DARK_SET)) };
+}
+
+#[cfg(not(test))]
+fn set_active(palette: &'static Palette) {
+    *ACTIVE.lock().unwrap_or_else(PoisonError::into_inner) = palette;
+    GENERATION.fetch_add(1, Ordering::Release);
+}
+
+#[cfg(not(test))]
+fn custom() -> Option<&'static Palette> {
+    *CUSTOM.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The set in use.
+#[cfg(not(test))]
+pub fn palette() -> &'static Palette {
+    let generation = GENERATION.load(Ordering::Acquire);
+    SEEN.with(|seen| {
+        let (seen_generation, palette) = seen.get();
+        if seen_generation == generation {
+            return palette;
+        }
+        let palette = *ACTIVE.lock().unwrap_or_else(PoisonError::into_inner);
+        seen.set((generation, palette));
+        palette
+    })
+}
+
+/// Uses `palette` (a theme file's set) in place of the built-in sets, or
+/// the built-in sets again for `None`, from the next [`follow`] on.
+#[cfg(not(test))]
+pub fn set_custom(palette: Option<Palette>) {
+    *CUSTOM.lock().unwrap_or_else(PoisonError::into_inner) = palette.map(intern);
+}
+
+/// A lasting copy of `palette`. Sets are kept for the life of the program,
+/// since a colour read just before a switch may still be in use; an equal
+/// one is reused, so switching back and forth keeps nothing more.
+fn intern(palette: Palette) -> &'static Palette {
+    static KEPT: Mutex<Vec<&'static Palette>> = Mutex::new(Vec::new());
+    let mut kept = KEPT.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(same) = kept.iter().find(|kept| ***kept == palette) {
+        return same;
+    }
+    let lasting: &'static Palette = Box::leak(Box::new(palette));
+    kept.push(lasting);
+    lasting
+}
+
+/// Whether the set in use is meant for a light background.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn is_light() -> bool {
+    !palette().dark
+}
+
+/// Switch to a built-in set. The egui style still has to be applied again
+/// afterwards; [`follow`] does both. For tests that look at both sets.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn set_light(light: bool) {
-    #[cfg(not(test))]
-    LIGHT_ON.store(light, Ordering::Relaxed);
-    #[cfg(test)]
-    LIGHT_ON.with(|on| on.set(light));
+    set_active(if light { &LIGHT_SET } else { &DARK_SET });
 }
 
-/// Puts the theme `choice` stands for into effect if it is not already: the
-/// palette, the context's egui style, and the style of `ui`, the frame's root
-/// Ui, which took its copy of the style before this was called. Call it at
-/// the start of every frame, before anything is laid out; "Match system"
-/// then follows the OS as it switches.
+/// Puts the theme `choice` stands for (or the custom set, while there is
+/// one) into effect if it is not already: the palette, the context's egui
+/// style, and the style of `ui`, the frame's root Ui, which took its copy of
+/// the style before this was called. Call it at the start of every frame,
+/// before anything is laid out; "Match system" then follows the OS as it
+/// switches.
 pub fn follow(ui: &mut egui::Ui, choice: Choice) {
-    let light = choice.is_light(ui.ctx().system_theme());
-    if light == is_light() {
+    let built_in = if choice.is_light(ui.ctx().system_theme()) { &LIGHT_SET } else { &DARK_SET };
+    let wanted = custom().unwrap_or(built_in);
+    if std::ptr::eq(wanted, palette()) {
         return;
     }
-    set_light(light);
+    set_active(wanted);
     let ctx = ui.ctx().clone();
     apply(&ctx);
     ui.set_style(ctx.global_style());
@@ -720,6 +803,24 @@ mod tests {
             }
         }
         set_light(false);
+    }
+
+    #[test]
+    fn a_custom_set_is_kept_once_and_used_until_cleared() {
+        let mut plum = DARK;
+        plum.accent = rgb(0xff7ac8);
+        // The same colours give the same lasting set; others another one.
+        assert!(std::ptr::eq(intern(plum), intern(plum)));
+        assert!(!std::ptr::eq(intern(plum), intern(DARK)));
+        set_custom(Some(plum));
+        assert_eq!(custom().map(|p| p.accent), Some(rgb(0xff7ac8)));
+        set_active(custom().unwrap());
+        assert_eq!(accent(), rgb(0xff7ac8));
+        assert!(!is_light());
+        set_custom(None);
+        assert!(custom().is_none());
+        set_light(false);
+        assert_eq!(accent(), DARK.accent);
     }
 
     #[test]

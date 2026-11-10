@@ -1,6 +1,6 @@
 //! Modal dialogs and toast notifications.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{
     self, Align, Align2, Area, Button, Frame, Id, Key, Layout, Margin, Modal, Order,
@@ -350,9 +350,26 @@ pub fn toasts(ctx: &egui::Context, shared: &mut Shared, tab: Option<&RepoTab>) {
         ctx.request_repaint_after(remaining + Duration::from_millis(20));
     }
 
+    if shared.settings.appearance.desktop_notifications {
+        notify(ctx, &shared.toasts);
+    }
+
+    // Preferences > UI Customization > Notification Location. At the top,
+    // below the tab strip and the toolbar; at the bottom, above the status
+    // bar.
+    use crate::prefs::appearance::Corner;
+    let toolbar = if tab.is_some() && shared.prefs.is_none() { crate::ui::toolbar::height(&shared.settings) } else { 0.0 };
+    let top = 24.0 + 34.0 + toolbar + 12.0;
+    let (anchor, offset) = match shared.settings.appearance.toast_corner {
+        Corner::BottomLeft => (Align2::LEFT_BOTTOM, vec2(14.0, -36.0)),
+        Corner::BottomRight => (Align2::RIGHT_BOTTOM, vec2(-14.0, -36.0)),
+        Corner::TopLeft => (Align2::LEFT_TOP, vec2(14.0, top)),
+        Corner::TopRight => (Align2::RIGHT_TOP, vec2(-14.0, top)),
+    };
+
     let mut dismiss: Option<usize> = None;
     Area::new(Id::new("toasts"))
-        .anchor(Align2::LEFT_BOTTOM, vec2(14.0, -36.0))
+        .anchor(anchor, offset)
         .order(Order::Foreground)
         .show(ctx, |ui| {
             ui.spacing_mut().item_spacing.y = 8.0;
@@ -419,4 +436,31 @@ pub fn toasts(ctx: &egui::Context, shared: &mut Shared, tab: Option<&RepoTab>) {
     if let Some(i) = dismiss {
         shared.toasts.remove(i);
     }
+}
+
+/// Preferences > Notifications: when toasts appeared since the last frame
+/// while the window is in the background, asks the window manager for the
+/// user's attention (the taskbar button flashes until the window is
+/// focused; the dock icon bounces). Operations that end raise a toast in
+/// the frame they end, so this is where they are noticed; nothing polls.
+fn notify(ctx: &egui::Context, toasts: &[crate::state::Toast]) {
+    let id = Id::new("toasts-notified");
+    let Some(newest) = toasts.iter().map(|t| t.born).max() else { return };
+    let seen: Option<Instant> = ctx.data(|d| d.get_temp(id));
+    if seen.is_some_and(|seen| newest <= seen) {
+        return;
+    }
+    ctx.data_mut(|d| d.insert_temp(id, newest));
+    if ctx.input(|i| i.viewport().focused).unwrap_or(true) {
+        return;
+    }
+    let failed = toasts.iter().any(|t| t.kind == ToastKind::Error && seen.is_none_or(|seen| t.born > seen));
+    let kind = if failed { egui::UserAttentionType::Critical } else { egui::UserAttentionType::Informational };
+    // A scripted run's window is never focused: say it instead of flashing
+    // the taskbar of whoever uses the machine.
+    if std::env::var_os("GITKRILL_SHOT").is_some() {
+        println!("attention requested: {kind:?}");
+        return;
+    }
+    ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(kind));
 }
