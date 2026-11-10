@@ -226,7 +226,9 @@ pub fn config_text(ui: &mut Ui, ctx: &egui::Context, file: &mut ConfigFile, key:
     let stored = file.get(key).unwrap_or("").to_owned();
     let mut value = ui.data_mut(|d| d.get_temp::<String>(id)).unwrap_or_else(|| stored.clone());
     let response = text(ui, &mut value, hint);
-    if response.has_focus() {
+    // Not `response.has_focus()`: that is false while the window itself is
+    // in the background, which would drop what was typed.
+    if ui.memory(|m| m.has_focus(response.id)) {
         ui.data_mut(|d| d.insert_temp(id, value));
         return false;
     }
