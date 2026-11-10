@@ -22,6 +22,7 @@ use git2::{BranchType, ObjectType, Repository, RepositoryState};
 
 use super::ops::{GitCmd, Step};
 use super::repo::{lossy, read_head};
+use super::text::{self, Encoding, Eol, FileEncoding};
 use super::{Oid, short};
 
 /// Git looks for a NUL in this many leading bytes to call a file binary.
@@ -97,9 +98,10 @@ impl Chunk {
         self.bytes.ends_with(b"\n")
     }
 
-    /// Line `line` without its line ending, for display.
+    /// Line `line` without its line ending, for display. Chunks are UTF-8
+    /// (see [`load`]); a byte order mark at the start of the file is not shown.
     pub fn line(&self, line: usize) -> Cow<'_, str> {
-        String::from_utf8_lossy(strip_eol(self.raw(line, line + 1)))
+        Encoding::Utf8.decode(strip_eol(self.raw(line, line + 1)))
     }
 
     /// All lines as editor text: joined by `\n`, no trailing newline.
@@ -567,6 +569,15 @@ pub struct ConflictFile {
     /// The repository's git directory, home of the scratch index that
     /// [`save`] uses to write a file without staging it.
     pub git_dir: PathBuf,
+    /// How the file's text is stored, to write it back that way.
+    pub encoding: FileEncoding,
+    /// The sides were turned from `encoding` into UTF-8 to be merged and
+    /// shown; the result is turned back. Files in UTF-8 are worked on as
+    /// they are, byte for byte.
+    pub transcoded: bool,
+    /// The repository's encoding when the file was read (Preferences >
+    /// Encoding), to notice it changing.
+    pub default_encoding: Encoding,
 }
 
 impl ConflictFile {
@@ -588,7 +599,8 @@ impl ConflictFile {
         }
     }
 
-    /// The resolved file for `draft`; `None` when this is not a text conflict.
+    /// The resolved file for `draft`, in UTF-8 when it was transcoded (see
+    /// [`ConflictFile::output`]); `None` when this is not a text conflict.
     pub fn render(&self, draft: &Draft) -> Option<Vec<u8>> {
         match &self.content {
             Content::Text { merge, .. } => {
@@ -596,6 +608,21 @@ impl ConflictFile {
             }
             Content::Whole(_) => None,
         }
+    }
+
+    /// The bytes to write for `draft`: line endings made `eol`, and the text
+    /// back in the file's encoding.
+    pub fn output(&self, draft: &Draft, eol: Eol) -> Option<Vec<u8>> {
+        let rendered = self.render(draft)?;
+        let bytes = text::convert_eol(&rendered, eol);
+        if self.transcoded {
+            return Some(self.encoding.encode(&String::from_utf8_lossy(&bytes)));
+        }
+        let bom = Encoding::Utf8Bom.bom();
+        if self.encoding.encoding == Encoding::Utf8Bom && !bytes.is_empty() && !bytes.starts_with(bom) {
+            return Some([bom, &bytes].concat());
+        }
+        Some(bytes.into_owned())
     }
 }
 
@@ -614,8 +641,10 @@ pub fn stage_ids(repo: &Repository, path: &str) -> Result<[Option<Oid>; 3], Stri
     Ok([1, 2, 3].map(|stage| index.get_path(Path::new(path), stage).map(|entry| entry.id)))
 }
 
-/// Reads the conflict at `path` from the index. Runs on the reader thread.
-pub fn load(repo: &Repository, path: &str) -> Result<ConflictFile, String> {
+/// Reads the conflict at `path` from the index, its text in `default` (the
+/// repository's encoding) unless a byte order mark says otherwise. Runs on
+/// the reader thread.
+pub fn load(repo: &Repository, path: &str, default: Encoding) -> Result<ConflictFile, String> {
     let mut index = repo.index().map_err(err)?;
     index.read(false).map_err(err)?;
     let entries = [1, 2, 3].map(|stage| index.get_path(Path::new(path), stage));
@@ -640,6 +669,24 @@ pub fn load(repo: &Repository, path: &str) -> Result<ConflictFile, String> {
             return Err(format!("Could not read the versions of {path} from the repository."));
         }
         stages[i] = Some(stage);
+    }
+
+    // The file's encoding: a byte order mark on a side, else the
+    // repository's setting. Other than UTF-8, the sides are merged and
+    // shown as UTF-8 and the result is turned back when saved. UTF-16 is
+    // binary to git (it is full of zero bytes); as text it merges fine.
+    let sample = [&blobs[1], &blobs[2], &blobs[0]].into_iter().find(|blob| !blob.is_empty());
+    let encoding = text::detect(sample.map_or(&[][..], |blob| blob.as_slice()), default);
+    let transcoded = !matches!(encoding.encoding, Encoding::Utf8 | Encoding::Utf8Bom);
+    if transcoded {
+        for (blob, stage) in blobs.iter_mut().zip(&mut stages) {
+            if let Some(stage) = stage
+                && !blob.is_empty()
+            {
+                *blob = text::decode_file(blob, encoding.encoding).0.into_bytes();
+                stage.binary = is_binary(blob);
+            }
+        }
     }
     let [base, ours, theirs] = stages;
 
@@ -668,12 +715,21 @@ pub fn load(repo: &Repository, path: &str) -> Result<ConflictFile, String> {
         Some(whole) => Content::Whole(whole),
         None => {
             let merge = merge_text(&blobs[0], &blobs[1], &blobs[2])?;
-            let worktree = repo.workdir().and_then(|dir| std::fs::read(dir.join(path)).ok());
-            let adopted = worktree.as_deref().and_then(|bytes| adopt(&merge, bytes));
+            let mut worktree = repo.workdir().and_then(|dir| std::fs::read(dir.join(path)).ok());
+            if transcoded {
+                worktree = worktree.map(|bytes| text::decode_file(&bytes, encoding.encoding).0.into_bytes());
+            }
+            // Git leaves its own side of a file it took for binary, without
+            // markers: that is not a resolution to start from.
+            let adopted = worktree
+                .as_deref()
+                .filter(|_| !encoding.encoding.is_utf16())
+                .and_then(|bytes| adopt(&merge, bytes));
             let has_markers = worktree.as_deref().is_some_and(|bytes| {
                 split_lines(bytes).iter().any(|line| line.starts_with(&[b'<'; MARKER_SIZE]))
             });
-            let edited_outside = adopted.is_none() && worktree.is_some() && !has_markers;
+            let edited_outside =
+                adopted.is_none() && worktree.is_some() && !has_markers && !encoding.encoding.is_utf16();
             let draft = adopted.unwrap_or_else(|| Draft::unresolved(&merge));
             Content::Text { merge, draft, edited_outside }
         }
@@ -689,6 +745,9 @@ pub fn load(repo: &Repository, path: &str) -> Result<ConflictFile, String> {
         theirs_info,
         content,
         git_dir: repo.path().to_path_buf(),
+        encoding,
+        transcoded,
+        default_encoding: default,
     })
 }
 
@@ -949,7 +1008,11 @@ mod tests {
     }
 
     fn load_file(fx: &Fixture, path: &'static str) -> ConflictFile {
-        fx.job(move |loader| load(loader.repo(), path)).expect("conflict loads")
+        load_in(fx, path, Encoding::Utf8)
+    }
+
+    fn load_in(fx: &Fixture, path: &'static str, encoding: Encoding) -> ConflictFile {
+        fx.job(move |loader| load(loader.repo(), path, encoding)).expect("conflict loads")
     }
 
     fn text(file: &ConflictFile) -> (&TextMerge, &Draft) {
@@ -1264,6 +1327,88 @@ mod tests {
         assert_eq!(on_disk(&fx, FILE), expected);
         assert_eq!(staged(&fx, FILE), expected);
         assert_eq!(unmerged(&fx), "");
+    }
+
+    #[test]
+    fn files_in_another_encoding_are_shown_decoded_and_written_back_in_it() {
+        use Resolution::*;
+        // Windows-1252: e9 is "é", 93/94 are curly quotes, 80 is the euro sign.
+        let fx = merging(
+            "conflict-cp1252",
+            Some(b"caf\xe9\r\nmiddle\r\nend\r\n"),
+            Some(b"caf\xe9\r\nours \x93x\x94\r\nend\r\n"),
+            Some(b"caf\xe9\r\ntheirs \x80\r\nend\r\n"),
+        );
+        let file = load_in(&fx, FILE, Encoding::Windows1252);
+        assert!(file.transcoded);
+        assert_eq!(file.encoding, FileEncoding { encoding: Encoding::Windows1252, bom: false });
+        let (merge, _) = text(&file);
+        let Segment::Stable(first) = &merge.segments[0] else { panic!("a stable start") };
+        assert_eq!(first.line(0), "café");
+        let (ours, theirs) = merge.conflict(0).unwrap();
+        assert_eq!((ours.line(0), theirs.line(0)), ("ours “x”".into(), "theirs €".into()));
+
+        // Typed text goes back in the file's encoding, line endings too.
+        let typed = draft(&[Custom("both € and “quotes”".to_owned())]);
+        let bytes = file.output(&typed, Eol::Keep).unwrap();
+        assert_eq!(show(&bytes), show(b"caf\xe9\r\nboth \x80 and \x93quotes\x94\r\nend\r\n"));
+        fx.run(save(&file, bytes.clone(), true).unwrap());
+        assert_eq!(on_disk(&fx, FILE), bytes);
+        assert_eq!(staged(&fx, FILE), bytes);
+
+        // Read as UTF-8 instead, the bytes are kept as they are.
+        let fx = merging("conflict-cp1252-as-utf8", Some(b"caf\xe9\n"), Some(b"caf\xe9 a\n"), Some(b"caf\xe9 b\n"));
+        let file = load_file(&fx, FILE);
+        assert!(!file.transcoded);
+        assert_eq!(file.output(&draft(&[Theirs]), Eol::Keep).unwrap(), b"caf\xe9 b\n");
+    }
+
+    #[test]
+    fn utf16_files_with_a_byte_order_mark_merge_as_text() {
+        use Resolution::*;
+        let utf16 = |text: &str| FileEncoding { encoding: Encoding::Utf16Le, bom: true }.encode(text);
+        let fx = merging(
+            "conflict-utf16",
+            Some(&utf16("one\r\ntwo\r\nthree\r\n")),
+            Some(&utf16("one\r\nTWO (ours)\r\nthree\r\n")),
+            Some(&utf16("one\r\ntwo, theirs\r\nthree\r\n")),
+        );
+        // Git calls the file binary; read with its mark, it is text, whatever
+        // the repository's encoding says.
+        let file = load_in(&fx, FILE, Encoding::Windows1252);
+        assert!(file.transcoded);
+        assert_eq!(file.encoding, FileEncoding { encoding: Encoding::Utf16Le, bom: true });
+        let (merge, draft_from_disk) = text(&file);
+        assert_eq!(merge.conflicts.len(), 1);
+        assert_eq!(draft_from_disk.open_conflicts(), 1, "git's own side on disk is no resolution");
+        let (ours, theirs) = merge.conflict(0).unwrap();
+        assert_eq!((ours.line(0), theirs.line(0)), ("TWO (ours)".into(), "two, theirs".into()));
+
+        let expected = utf16("one\r\ntwo, theirs\r\nthree\r\n");
+        let bytes = file.output(&draft(&[Theirs]), Eol::Keep).unwrap();
+        assert_eq!(bytes, expected);
+        fx.run(save(&file, bytes, true).unwrap());
+        assert_eq!(staged(&fx, FILE), expected);
+        assert_eq!(on_disk(&fx, FILE), expected);
+        assert_eq!(unmerged(&fx), "");
+    }
+
+    #[test]
+    fn line_endings_are_written_as_asked() {
+        use Resolution::*;
+        let fx = merging("conflict-eol", Some(b"a\nb\nc\n"), Some(b"a\nours\nc\n"), Some(b"a\ntheirs\nc\n"));
+        let file = load_file(&fx, FILE);
+        let choice = draft(&[Custom("one\ntwo".to_owned())]);
+        assert_eq!(file.output(&choice, Eol::Keep).unwrap(), b"a\none\ntwo\nc\n");
+        assert_eq!(file.output(&choice, Eol::Crlf).unwrap(), b"a\r\none\r\ntwo\r\nc\r\n");
+        let bytes = file.output(&draft(&[Ours]), Eol::Crlf).unwrap();
+        fx.run(save(&file, bytes, true).unwrap());
+        assert_eq!(staged(&fx, FILE), b"a\r\nours\r\nc\r\n");
+
+        let fx = merging("conflict-eol-lf", Some(b"a\r\nb\r\n"), Some(b"a\r\nours\r\n"), Some(b"a\r\ntheirs\r\n"));
+        let file = load_file(&fx, FILE);
+        assert_eq!(file.output(&draft(&[Theirs]), Eol::Lf).unwrap(), b"a\ntheirs\n");
+        assert_eq!(file.output(&draft(&[Theirs]), Eol::Keep).unwrap(), b"a\r\ntheirs\r\n");
     }
 
     #[test]

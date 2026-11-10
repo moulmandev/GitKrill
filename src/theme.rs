@@ -505,7 +505,49 @@ pub fn mono(size: f32) -> FontId {
     FontId::monospace(size)
 }
 
+/// The font of code in the diff, blame and conflict views: the monospace
+/// font, or the one picked in Preferences > Editor (see [`set_code_font`]).
+pub fn code(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(CODE_FAMILY.into()))
+}
+
+const CODE_FAMILY: &str = "code-view";
+
+/// The fonts installed at start, so the code font can be swapped later
+/// without reading the others from disk again (font data is shared).
+static BASE_FONTS: std::sync::OnceLock<FontDefinitions> = std::sync::OnceLock::new();
+/// Name of the system monospace font found at start ("Cascadia Mono").
+static DEFAULT_CODE_FONT: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+/// What the code views use when no font is picked: the system monospace
+/// font found at start, or egui's own.
+pub fn default_code_font() -> &'static str {
+    DEFAULT_CODE_FONT.get().copied().unwrap_or("Hack")
+}
+
+/// Puts `font` (a name for it and its data) first in the code views'
+/// family, with the usual monospace fonts after it for glyphs it lacks;
+/// `None` goes back to the usual ones. Any thread may call it; egui takes
+/// the fonts at the start of its next frame. The data must have been
+/// checked to parse (egui panics on a broken font).
+pub fn set_code_font(ctx: &egui::Context, font: Option<(String, FontData)>) {
+    let Some(base) = BASE_FONTS.get() else { return };
+    let mut fonts = base.clone();
+    if let Some((name, data)) = font {
+        let key = format!("{CODE_FAMILY}:{name}");
+        fonts.font_data.insert(key.clone(), Arc::new(data));
+        fonts.families.entry(FontFamily::Name(CODE_FAMILY.into())).or_default().insert(0, key);
+    }
+    ctx.set_fonts(fonts);
+    ctx.request_repaint();
+}
+
 fn system_font(names: &[&str]) -> Option<Vec<u8>> {
+    system_font_index(names).map(|(_, bytes)| bytes)
+}
+
+/// The first of `names` found in the system font folders, and which one it was.
+fn system_font_index(names: &[&str]) -> Option<(usize, Vec<u8>)> {
     let mut dirs: Vec<std::path::PathBuf> = Vec::new();
     if let Some(windir) = std::env::var_os("WINDIR") {
         dirs.push(std::path::Path::new(&windir).join("Fonts"));
@@ -514,8 +556,9 @@ fn system_font(names: &[&str]) -> Option<Vec<u8>> {
     dirs.push("/usr/share/fonts/truetype/dejavu".into());
     names
         .iter()
-        .flat_map(|name| dirs.iter().map(move |dir| dir.join(name)))
-        .find_map(|path| std::fs::read(path).ok())
+        .enumerate()
+        .flat_map(|(index, name)| dirs.iter().map(move |dir| (index, dir.join(name))))
+        .find_map(|(index, path)| std::fs::read(path).ok().map(|bytes| (index, bytes)))
 }
 
 /// Fonts and the style of the palette in use. Once, at startup; theme
@@ -531,16 +574,18 @@ fn install_fonts(ctx: &egui::Context) {
     // Prefer the platform UI font so the app looks native; egui's bundled
     // fonts stay in the list as fallbacks.
     let add = |fonts: &mut FontDefinitions, key: &str, family: FontFamily, files: &[&str]| {
-        if let Some(bytes) = system_font(files) {
+        if let Some((index, bytes)) = system_font_index(files) {
             fonts.font_data.insert(key.to_owned(), Arc::new(FontData::from_owned(bytes)));
             fonts.families.entry(family).or_default().insert(0, key.to_owned());
-            true
+            Some(index)
         } else {
-            false
+            None
         }
     };
     add(&mut fonts, "ui", FontFamily::Proportional, &["segoeui.ttf", "SFNS.ttf", "DejaVuSans.ttf"]);
-    add(&mut fonts, "code", FontFamily::Monospace, &["CascadiaMono.ttf", "consola.ttf", "Menlo.ttc"]);
+    const CODE_FONTS: [(&str, &str); 3] = [("CascadiaMono.ttf", "Cascadia Mono"), ("consola.ttf", "Consolas"), ("Menlo.ttc", "Menlo")];
+    let code = add(&mut fonts, "code", FontFamily::Monospace, &CODE_FONTS.map(|(file, _)| file));
+    let _ = DEFAULT_CODE_FONT.set(code.map_or("Hack", |index| CODE_FONTS[index].1));
 
     egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
 
@@ -557,6 +602,11 @@ fn install_fonts(ctx: &egui::Context) {
     if let Some(mono) = fonts.families.get_mut(&FontFamily::Monospace) {
         mono.push("phosphor".to_owned());
     }
+    // The code views have a family of their own, the monospace one until
+    // Preferences > Editor picks a font (`set_code_font`).
+    let mono = fonts.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
+    fonts.families.insert(FontFamily::Name(CODE_FAMILY.into()), mono);
+    let _ = BASE_FONTS.set(fonts.clone());
 
     ctx.set_fonts(fonts);
 }

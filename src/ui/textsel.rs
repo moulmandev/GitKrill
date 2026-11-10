@@ -430,9 +430,37 @@ impl Selection {
         if self.range().is_none_or(|(start, end)| line < start.line || line > end.line) {
             return;
         }
-        let Some((cols, more)) = self.columns(line, char_count(galley.text())) else { return };
-        let from = left + x_at(galley, cols.start);
-        let to = left + x_at(galley, cols.end) + if more { newline } else { 0.0 };
+        let len = char_count(galley.text());
+        self.paint_part(painter, line, galley, left, row, newline, 0..len, len);
+    }
+
+    /// [`Selection::paint`] for one row of a wrapped line: `galley` holds
+    /// columns `part` of the line, which is `len` columns long.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_part(
+        &self,
+        painter: &Painter,
+        line: usize,
+        galley: &Galley,
+        left: f32,
+        row: Rect,
+        newline: f32,
+        part: Range<usize>,
+        len: usize,
+    ) {
+        if self.range().is_none_or(|(start, end)| line < start.line || line > end.line) {
+            return;
+        }
+        let Some((cols, more)) = self.columns(line, len) else { return };
+        let (start, end) = (cols.start.max(part.start), cols.end.min(part.end));
+        let last = part.end >= len;
+        if start >= end && !(more && last && cols.end >= part.start) {
+            return;
+        }
+        let from = left + x_at(galley, start.saturating_sub(part.start));
+        let to = left
+            + x_at(galley, end.max(start) - part.start)
+            + if more && last { newline } else { 0.0 };
         let fill = if self.active {
             theme::text_selection()
         } else {

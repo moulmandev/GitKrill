@@ -368,9 +368,17 @@ impl HunkView<'_> {
 }
 
 /// The text of a diff line as a layout job with one section per colour.
+#[cfg(test)]
 pub fn layout(text: &str, spans: &[Span], font: &FontId) -> LayoutJob {
-    let plain = || LayoutJob::simple_singleline(text.to_owned(), font.clone(), theme::text());
-    if spans.is_empty() {
+    layout_part(text, 0..text.len(), spans, font)
+}
+
+/// Bytes `part` of a diff line (one row of a wrapped line) as a layout job
+/// with one section per colour. `spans` are those of the whole line.
+pub fn layout_part(text: &str, part: Range<usize>, spans: &[Span], font: &FontId) -> LayoutJob {
+    let piece = text.get(part.clone()).unwrap_or("");
+    let plain = || LayoutJob::simple_singleline(piece.to_owned(), font.clone(), theme::text());
+    if spans.is_empty() || piece.is_empty() {
         return plain();
     }
     let mut job = LayoutJob { break_on_newline: false, ..Default::default() };
@@ -382,11 +390,18 @@ pub fn layout(text: &str, spans: &[Span], font: &FontId) -> LayoutJob {
         if end <= start || end > text.len() || !text.is_char_boundary(end) {
             return plain();
         }
-        job.append(&text[start..end], 0.0, TextFormat::simple(font.clone(), span.class.color()));
+        let (from, to) = (start.max(part.start), end.min(part.end));
+        if from < to {
+            job.append(&text[from..to], 0.0, TextFormat::simple(font.clone(), span.class.color()));
+        }
         start = end;
+        if start >= part.end {
+            return job;
+        }
     }
-    if start < text.len() {
-        job.append(&text[start..], 0.0, TextFormat::simple(font.clone(), theme::text()));
+    let from = start.max(part.start);
+    if from < part.end {
+        job.append(&text[from..part.end], 0.0, TextFormat::simple(font.clone(), theme::text()));
     }
     job
 }
@@ -419,8 +434,8 @@ struct Queue {
 
 #[derive(Default)]
 struct State {
-    /// Newest first.
-    recent: VecDeque<(Weak<FileDiff>, Arc<DiffStyle>)>,
+    /// Newest first, with whether syntax colours were asked for.
+    recent: VecDeque<(Weak<FileDiff>, bool, Arc<DiffStyle>)>,
     /// Hunk styles that are still referenced, by content hash.
     hunks: HashMap<u64, Weak<HunkStyle>>,
     /// The worker's queue, once the worker has been started.
@@ -431,18 +446,26 @@ struct State {
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
 
-/// The styling for `diff`, a file called `path`. Cheap enough to call every
-/// frame: after the first call for a diff this is a pointer comparison.
-pub fn style_for(ctx: &egui::Context, diff: &Arc<FileDiff>, path: &str) -> Arc<DiffStyle> {
+/// The styling for `diff`, a file called `path`: syntax colours when
+/// `syntax` (Preferences > Editor), and the changed words either way.
+/// Cheap enough to call every frame: after the first call for a diff this
+/// is a pointer comparison.
+pub fn style_for(ctx: &egui::Context, diff: &Arc<FileDiff>, path: &str, syntax: bool) -> Arc<DiffStyle> {
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
     // Comparing addresses is sound because the entry's weak reference keeps
     // the allocation from being reused for another diff.
-    if let Some((_, style)) = state.recent.iter().find(|(known, _)| std::ptr::eq(known.as_ptr(), Arc::as_ptr(diff))) {
+    if let Some((_, _, style)) = state
+        .recent
+        .iter()
+        .find(|(known, colours, _)| std::ptr::eq(known.as_ptr(), Arc::as_ptr(diff)) && *colours == syntax)
+    {
         return style.clone();
     }
 
     let file_name: Arc<str> = path.rsplit(['/', '\\']).next().unwrap_or(path).to_lowercase().into();
-    let (mut lines_left, mut bytes_left) = (MAX_LINES, MAX_BYTES);
+    // Without syntax colours nothing is parsed: every hunk gets the word
+    // emphasis only.
+    let (mut lines_left, mut bytes_left) = if syntax { (MAX_LINES, MAX_BYTES) } else { (0, 0) };
     let request = state.requests + 1;
     let mut jobs = Vec::new();
     let mut hunks = Vec::with_capacity(diff.hunks.len());
@@ -487,7 +510,7 @@ pub fn style_for(ctx: &egui::Context, diff: &Arc<FileDiff>, path: &str) -> Arc<D
     }
 
     let style = Arc::new(DiffStyle { hunks });
-    state.recent.push_front((Arc::downgrade(diff), style.clone()));
+    state.recent.push_front((Arc::downgrade(diff), syntax, style.clone()));
     state.recent.truncate(RECENT_DIFFS);
     if state.hunks.len() > 4096 {
         state.hunks.retain(|_, style| style.strong_count() > 0);
@@ -1462,9 +1485,9 @@ mod tests {
         let ctx = egui::Context::default();
         let lines = [(' ', "fn shared_by_equal_hunks() {"), ('-', "    let a = 1;"), ('+', "    let a = 2;"), (' ', "}")];
         let first = file_diff(&lines);
-        let style = style_for(&ctx, &first, "src/some/file.rs");
+        let style = style_for(&ctx, &first, "src/some/file.rs", true);
         // Asking again is a lookup, not new work.
-        assert!(Arc::ptr_eq(&style, &style_for(&ctx, &first, "src/some/file.rs")));
+        assert!(Arc::ptr_eq(&style, &style_for(&ctx, &first, "src/some/file.rs", true)));
 
         wait_for("colours", || !style.hunk(0).unwrap().spans(3).is_empty());
         let view = style.hunk(0).unwrap();
@@ -1480,12 +1503,43 @@ mod tests {
         // finished hunk even though the first diff object is gone.
         drop(first);
         let again = file_diff(&lines);
-        let reloaded = style_for(&ctx, &again, "src/some/file.rs");
+        let reloaded = style_for(&ctx, &again, "src/some/file.rs", true);
         assert!(!Arc::ptr_eq(&style, &reloaded));
         assert!(Arc::ptr_eq(&style.hunks[0], &reloaded.hunks[0]));
         // Under another name it is another language, so it is done afresh.
-        let other = style_for(&ctx, &file_diff(&lines), "src/some/file.py");
+        let other = style_for(&ctx, &file_diff(&lines), "src/some/file.py", true);
         assert!(!Arc::ptr_eq(&style.hunks[0], &other.hunks[0]));
+
+        // With syntax colours off the changed words are still marked, and
+        // nothing is coloured.
+        let plain = style_for(&ctx, &again, "src/some/file.rs", false);
+        assert!(!Arc::ptr_eq(&plain, &reloaded));
+        wait_for("emphasis", || plain.hunk(0).unwrap().emphasis(1).count() == 1);
+        assert!((0..4).all(|line| plain.hunk(0).unwrap().spans(line).is_empty()));
+    }
+
+    #[test]
+    fn rows_of_a_wrapped_line_keep_their_colours() {
+        let font = FontId::monospace(12.0);
+        let text = "let s = \"héllo\";";
+        let spans = [
+            Span { end: 3, class: Class::Keyword },
+            Span { end: 8, class: Class::Plain },
+            Span { end: 16, class: Class::String },
+            Span { end: 17, class: Class::Punctuation },
+        ];
+        // "let s = " / "\"héllo\";": the second row starts inside no span.
+        let first = layout_part(text, 0..8, &spans, &font);
+        assert_eq!(first.text, "let s = ");
+        assert_eq!(first.sections[0].format.color, Class::Keyword.color());
+        let second = layout_part(text, 8..text.len(), &spans, &font);
+        assert_eq!(second.text, "\"héllo\";");
+        assert_eq!(second.sections[0].format.color, Class::String.color());
+        assert_eq!(second.sections.last().unwrap().format.color, Class::Punctuation.color());
+        // A row cut through a span keeps the span's colour on both sides.
+        let middle = layout_part(text, 10..14, &spans, &font);
+        assert_eq!((middle.text.as_str(), middle.sections.len()), ("éll", 1));
+        assert_eq!(middle.sections[0].format.color, Class::String.color());
     }
 
     #[test]
@@ -1500,11 +1554,11 @@ mod tests {
         assert_eq!(hunks.len(), 2);
         let diff = Arc::new(FileDiff { hunks, ..Default::default() });
         let requested = Instant::now();
-        let style = style_for(&ctx, &diff, "big.rs");
+        let style = style_for(&ctx, &diff, "big.rs", true);
 
         // A diff opened while that is being worked on does not wait for it.
         let small = file_diff(&[('+', "let opened_meanwhile = true;")]);
-        let small_style = style_for(&ctx, &small, "small.rs");
+        let small_style = style_for(&ctx, &small, "small.rs", true);
         let prompt = requested.elapsed() < Duration::from_millis(250);
         wait_for("the later diff", || !small_style.hunk(0).unwrap().spans(0).is_empty());
         // (Meaningless if this thread was stalled long enough between the

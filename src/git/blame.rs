@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 use git2::{Commit, Delta, DiffFindOptions, Repository, Tree};
 
 use super::repo::lossy;
-use super::text::{shown, source_text};
+use super::text::{self, Format, shown_with, source_text_in};
 use super::{ChangeKind, Oid, cli, short};
 
 fn err(e: git2::Error) -> String {
@@ -318,6 +318,8 @@ pub struct Blame {
     pub max_chars: usize,
     /// The commit whose version was blamed; `None` for the working tree.
     pub rev: Option<Oid>,
+    /// The encoding and tab width the lines were prepared with.
+    pub format: Format,
 }
 
 impl Blame {
@@ -508,7 +510,7 @@ pub fn blame(
         }
     }
 
-    let mut blame = parse_porcelain(&out).map_err(BlameError::Git)?;
+    let mut blame = parse_porcelain(&out, &text::format_for(workdir)).map_err(BlameError::Git)?;
     blame.rev = rev;
     Ok(blame)
 }
@@ -528,9 +530,9 @@ fn check_text(start: &[u8], size: u64) -> Result<(), BlameError> {
 /// Every line of the file comes as a header `<sha> <orig line> <final line>
 /// [<count>]`, then (the first time a commit appears) `key value` lines
 /// describing the commit, then the line itself behind a tab.
-fn parse_porcelain(out: &[u8]) -> Result<Blame, String> {
+fn parse_porcelain(out: &[u8], format: &Format) -> Result<Blame, String> {
     let bad = || "Could not understand the output of git blame".to_owned();
-    let mut blame = Blame::default();
+    let mut blame = Blame { format: *format, ..Blame::default() };
     let mut index: HashMap<Oid, usize> = HashMap::new();
 
     let mut rows = out.split(|byte| *byte == b'\n');
@@ -595,8 +597,8 @@ fn parse_porcelain(out: &[u8]) -> Result<Blame, String> {
             Some(block) if block.commit == commit => block.len += 1,
             _ => blame.blocks.push(BlameBlock { start: line, len: 1, commit }),
         }
-        let source = source_text(content);
-        let text = shown(&source);
+        let source = source_text_in(content, format.encoding);
+        let text = shown_with(&source, format.tab_width);
         if text != source {
             blame.originals.insert(line, source.into_owned());
         }
@@ -1028,7 +1030,7 @@ mod tests {
              {b} 7 3 1\nauthor Bob\nauthor-mail <bob@example.com>\nauthor-time 1700000500\n\
              summary Second\nprevious {a} old name.txt\nfilename new.txt\n\t\n{a} 3 4 1\n\tlast\n"
         );
-        let blame = parse_porcelain(out.as_bytes()).unwrap();
+        let blame = parse_porcelain(out.as_bytes(), &Format::default()).unwrap();
         assert_eq!(blame.lines, ["fn main() {", "    indented", "", "last"]);
         // The tab is kept for copying; lines shown as they are need nothing.
         let originals: Vec<(usize, &str)> = blame.originals.iter().map(|(line, text)| (*line, text.as_str())).collect();
@@ -1052,8 +1054,25 @@ mod tests {
         assert_eq!(second.previous, Some((Oid::from_str(a).unwrap(), "old name.txt".to_owned())));
         assert_eq!(second.path, "new.txt");
 
-        assert!(parse_porcelain(b"").unwrap().lines.is_empty());
-        assert!(parse_porcelain(b"not a blame\n").is_err());
-        assert!(parse_porcelain(format!("{a} 1 1 1\nauthor A\n").as_bytes()).is_err());
+        assert!(parse_porcelain(b"", &Format::default()).unwrap().lines.is_empty());
+        assert!(parse_porcelain(b"not a blame\n", &Format::default()).is_err());
+        assert!(parse_porcelain(format!("{a} 1 1 1\nauthor A\n").as_bytes(), &Format::default()).is_err());
+    }
+
+    #[test]
+    fn blamed_lines_are_decoded_and_tabbed_as_set() {
+        let a = "1111111111111111111111111111111111111111";
+        let mut out = format!("{a} 1 1 2\nauthor A\nsummary S\nfilename f.txt\n\t").into_bytes();
+        out.extend_from_slice(b"caf\xe9\tna\xefve\n");
+        out.extend_from_slice(format!("{a} 2 2\n\t").as_bytes());
+        out.extend_from_slice(b"\x93quoted\x94\n");
+        let format = Format { encoding: text::Encoding::Windows1252, tab_width: 8, generation: 7 };
+        let blame = parse_porcelain(&out, &format).unwrap();
+        assert_eq!(blame.lines, ["café    naïve", "“quoted”"]);
+        assert_eq!(blame.originals.get(&0).map(String::as_str), Some("café\tnaïve"));
+        assert_eq!(blame.format, format);
+        // In UTF-8 the same bytes are not text.
+        let utf8 = parse_porcelain(&out, &Format::default()).unwrap();
+        assert!(utf8.lines[0].contains('\u{fffd}'));
     }
 }

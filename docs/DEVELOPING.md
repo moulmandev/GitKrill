@@ -44,6 +44,8 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Change what the commit button does | `src/ui/commit_button.rs`: the split button (`show`), what runs once a commit succeeded (`follow_up`), the commit template in the message fields (`prefill`). |
 | Ask a hosting account something (who is signed in, its SSH keys) | `hosting::account::AccountSession::start(account, ctx)`, polled from the UI; `account::local_keys`, `parse_public_key` and `fingerprint` read `.pub` files. A host in `settings.hosting_disconnected` is never signed in to. |
 | Know who commits | `prefs::identity`: `settings.identity.current()` is the profile in use; `identity::generation()` changes whenever the identity git commands get may have changed (ask git again then, as `ui::prefs::profiles::commit_author` does). |
+| Show the text of a file (not git's own data) | Decode it in the background with `git::text::format_for(workdir)` (the repository's encoding and the tab width: `display_text_in`, `decode_file`), keep the `Format` with the result, and load again when `text::generation()` has moved on (`ui/diff.rs` does). |
+| Paint code | `prefs::editor::look()` (one atomic load): `font()`, `small()`, `line_height()`, `numbers`, `wrap`, `highlight`. `theme::code(size)` is the code font; `ui::diff::{first_rows, wrap_rows, segments}` wrap lines with rows kept from frame to frame. |
 | Do network or other non-repository background work | Spawn your own thread, send results over a channel, call `ctx.request_repaint()` when something arrives, and poll the channel from your UI code. Never block in UI code. |
 
 Fetch commands start from `ops::fetch(&[...])`, which adds `--prune`

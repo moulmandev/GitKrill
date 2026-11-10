@@ -5,11 +5,13 @@ use git2::{DiffFindOptions, DiffFormat, DiffOptions};
 
 use super::repo::{Loader, delta_kind, lossy};
 use super::picture;
-use super::text::{display_text, source_text};
+use super::text::{self, Encoding, display_text_in, source_text_in};
 use super::{DiffLine, DiffSource, DiffTarget, FileDiff, Hunk};
 
 /// Beyond this many lines the rest of the diff is not shown.
 const MAX_LINES: usize = 50_000;
+/// Binary files larger than this are not looked at as UTF-16 text.
+const MAX_TRANSCODED_BYTES: usize = 16 * 1024 * 1024;
 
 impl Loader {
     pub fn diff(&self, target: &DiffTarget) -> Result<FileDiff, String> {
@@ -51,7 +53,9 @@ impl Loader {
             let _ = diff.find_similar(Some(&mut find));
         }
 
-        let mut out = FileDiff::default();
+        // How lines become text: the repository's encoding, the tab width.
+        let format = text::format_for(repo.workdir().unwrap_or(repo.path()));
+        let mut out = FileDiff { format, ..FileDiff::default() };
         // Blob ids of both sides of the file shown, for the image preview.
         let mut blobs = None;
         let mut wanted = false;
@@ -108,7 +112,7 @@ impl Loader {
                     }
                     shown += 1;
 
-                    let text = display_text(content);
+                    let text = display_text_in(content, &format);
                     out.max_chars = out.max_chars.max(text.chars().count());
                     hunk.lines.push(DiffLine {
                         origin,
@@ -148,8 +152,91 @@ impl Loader {
             if images.old.is_some() || images.new.is_some() {
                 out.images = Some(std::sync::Arc::new(images));
             }
+        } else if out.binary && let Some((old, new)) = blobs {
+            let _ = self.utf16_diff(target, old, new, &mut out);
         }
         Ok(out)
+    }
+
+    /// UTF-16 is binary to git: it is full of zero bytes. When a version of
+    /// the file starts with a UTF-16 byte order mark (or the repository is
+    /// set to UTF-16), both are turned into UTF-8 and diffed as text. Such a
+    /// diff is for reading: it has no patch header, so nothing in it can be
+    /// staged by hunk or line.
+    fn utf16_diff(&self, target: &DiffTarget, old: git2::Oid, new: git2::Oid, out: &mut FileDiff) -> Option<()> {
+        let repo = &self.repo;
+        // Every binary file comes through here: big ones are not read at all.
+        let blob = |id: git2::Oid| {
+            if id.is_zero() {
+                return Some(Vec::new());
+            }
+            let (size, _) = repo.odb().ok()?.read_header(id).ok()?;
+            (size <= MAX_TRANSCODED_BYTES).then(|| repo.find_blob(id).ok().map(|blob| blob.content().to_vec()))?
+        };
+        let new_bytes = match (target.source, out.kind) {
+            (DiffSource::Unstaged, kind) if kind != Some(super::ChangeKind::Deleted) => {
+                let file = repo.workdir()?.join(&target.path);
+                let small = std::fs::metadata(&file).is_ok_and(|meta| meta.len() <= MAX_TRANSCODED_BYTES as u64);
+                small.then(|| std::fs::read(&file).ok()).flatten()
+            }
+            _ => blob(new),
+        };
+        let (old_bytes, new_bytes) = (blob(old)?, new_bytes?);
+        let default = out.format.encoding;
+        if ![&old_bytes, &new_bytes].iter().any(|bytes| !bytes.is_empty() && text::detect(bytes, default).encoding.is_utf16()) {
+            return None;
+        }
+        let (old_text, _) = text::decode_file(&old_bytes, default);
+        let (new_text, _) = text::decode_file(&new_bytes, default);
+        // Zero bytes left after decoding: binary after all.
+        if old_text.contains('\0') || new_text.contains('\0') {
+            return None;
+        }
+
+        let mut opts = DiffOptions::new();
+        opts.context_lines(3);
+        let path = std::path::Path::new(&target.path);
+        let patch =
+            git2::Patch::from_buffers(old_text.as_bytes(), Some(path), new_text.as_bytes(), Some(path), Some(&mut opts))
+                .ok()?;
+        // The lines are UTF-8 now, whatever the file is in.
+        let format = text::Format { encoding: Encoding::Utf8, ..out.format };
+        let mut hunks = Vec::new();
+        let (mut additions, mut deletions, mut max_chars, mut shown) = (0, 0, 0, 0usize);
+        for h in 0..patch.num_hunks() {
+            let (hunk, count) = patch.hunk(h).ok()?;
+            let mut made = Hunk { header: lossy(hunk.header()).trim_end().to_owned(), lines: Vec::new(), raw: hunk.header().to_vec() };
+            for l in 0..count {
+                let line = patch.line_in_hunk(h, l).ok()?;
+                let origin = line.origin();
+                match origin {
+                    ' ' | '+' | '-' => {
+                        made.raw.push(origin as u8);
+                        made.raw.extend_from_slice(line.content());
+                        match origin {
+                            '+' => additions += 1,
+                            '-' => deletions += 1,
+                            _ => {}
+                        }
+                        if shown < MAX_LINES {
+                            shown += 1;
+                            let text = display_text_in(line.content(), &format);
+                            max_chars = max_chars.max(text.chars().count());
+                            made.lines.push(DiffLine { origin, old_no: line.old_lineno(), new_no: line.new_lineno(), text });
+                        }
+                    }
+                    _ => made.raw.extend_from_slice(line.content()),
+                }
+            }
+            hunks.push(made);
+        }
+        out.hunks = hunks;
+        out.binary = false;
+        out.truncated = shown >= MAX_LINES && additions + deletions > MAX_LINES;
+        (out.additions, out.deletions, out.max_chars) = (additions, deletions, max_chars);
+        out.format = format;
+        out.file_header.clear();
+        Some(())
     }
 }
 
@@ -229,11 +316,12 @@ fn split_hunk(raw: &[u8]) -> Option<(&[u8], Vec<RawLine<'_>>)> {
 
 impl Hunk {
     /// Each line's text as it is in the file (see `text::source_text`), in
-    /// the order of `lines`: what copying gives back. `None` if the patch
+    /// the order of `lines`: what copying gives back. `encoding` is the one
+    /// the diff was shown in (`FileDiff::format`). `None` if the patch
     /// cannot be read back into lines.
-    pub fn sources(&self) -> Option<Vec<std::borrow::Cow<'_, str>>> {
+    pub fn sources(&self, encoding: Encoding) -> Option<Vec<std::borrow::Cow<'_, str>>> {
         let (_, lines) = split_hunk(&self.raw)?;
-        Some(lines.iter().map(|line| source_text(line.body)).collect())
+        Some(lines.iter().map(|line| source_text_in(line.body, encoding)).collect())
     }
 }
 
@@ -449,6 +537,7 @@ mod tests {
 
     use super::LineApply::{Forward, Reverse};
     use crate::git::DiffSource::{Commit, Staged, Unstaged};
+    use crate::git::text::{Encoding, FileEncoding};
     use crate::git::{ChangeKind, DiffTarget, FileDiff, ops};
     use crate::tests::{Fixture, TIMEOUT, git};
     use crate::worker::Response;
@@ -816,6 +905,37 @@ mod tests {
         git(&fx.dir, &["add", "-A"]);
         unstage(&fx, name, &[('+', "a")]);
         assert_eq!(index(&fx, name), "b\n");
+    }
+
+    #[test]
+    fn utf16_files_with_a_byte_order_mark_get_a_text_diff() {
+        let fx = Fixture::new("diff-utf16");
+        let utf16 = |text: &str| FileEncoding { encoding: Encoding::Utf16Le, bom: true }.encode(text);
+        std::fs::write(fx.dir.join("notes.txt"), utf16("caf\u{e9}\r\nsecond\r\nthird\r\n")).unwrap();
+        fx.commit_all("notes");
+        std::fs::write(fx.dir.join("notes.txt"), utf16("caf\u{e9}\r\nsecond, changed\r\nthird\r\n")).unwrap();
+
+        let target = DiffTarget { source: Unstaged, path: "notes.txt".to_owned(), old_path: None };
+        let diff = fx.job(move |loader| loader.diff(&target)).unwrap();
+        assert!(!diff.binary);
+        assert_eq!(changes(&diff), owned(&[('-', "second"), ('+', "second, changed")]));
+        assert_eq!(diff.hunks[0].lines[0].text, "caf\u{e9}");
+        assert_eq!((diff.additions, diff.deletions), (1, 1));
+        // For reading only: there is no patch to stage parts of.
+        assert!(diff.file_header.is_empty() && diff.hunk_patch(0).is_none());
+        assert_eq!(diff.hunks[0].sources(diff.format.encoding).unwrap()[1], "second");
+
+        // Committed, the same.
+        fx.commit_all("change");
+        let head = fx.job(|loader| loader.repo().head().unwrap().target().unwrap());
+        let target = DiffTarget { source: Commit(head), path: "notes.txt".to_owned(), old_path: None };
+        let diff = fx.job(move |loader| loader.diff(&target)).unwrap();
+        assert_eq!(changes(&diff), owned(&[('-', "second"), ('+', "second, changed")]));
+
+        // Real binary data is still binary.
+        std::fs::write(fx.dir.join("data.bin"), b"\x00\x01\x02 not text").unwrap();
+        let target = DiffTarget { source: Unstaged, path: "data.bin".to_owned(), old_path: None };
+        assert!(fx.job(move |loader| loader.diff(&target)).unwrap().binary);
     }
 
     #[test]

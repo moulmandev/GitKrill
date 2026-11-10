@@ -108,6 +108,9 @@ be installed.
 - Unstaged / staged lists as paths or a folder tree
 - Stage, unstage and discard files, folders, hunks or individual lines
 - Syntax-highlighted diffs with word-level emphasis of what changed
+- Diffs, blame and the conflict resolver in the font, size and tab width you
+  pick (**Preferences > Editor**: any installed font, monospace ones listed
+  first), with or without line numbers, syntax colours and word wrap
 - Image previews for PNG, JPEG, GIF, BMP, WebP and ICO: before and after
   side by side, a swipe between them, or an onion skin, with sizes and
   dimensions; tiny icons are enlarged with sharp pixels
@@ -133,6 +136,11 @@ be installed.
 - Binary and delete/modify conflicts: keep one side or delete
 - Or hand a conflicted file to an external merge tool (`git mergetool`):
   the file counts as resolved once the tool has saved it
+- Files in another encoding (**Preferences > Encoding**, per repository:
+  Windows-1252, ISO-8859-1, Shift_JIS, GBK, Big5, EUC-KR, Cyrillic and more)
+  and UTF-16 files with a byte order mark are shown, diffed and resolved as
+  text; a resolved file is written back in its own encoding, with the line
+  endings set in Preferences > Editor
 
 **History**
 - Checkout (branch, remote branch, commit, tag), create / rename / delete branch
@@ -339,6 +347,10 @@ build.rs         the Windows executable's icon and version details
 - File history and blame always start from HEAD
 - No ancestor pane or syntax colours in the conflict resolver, and text in
   its two side panes cannot be selected (the result can, in its editor)
+- Long lines do not wrap in the conflict resolver, and its tabs keep a fixed
+  width instead of the tab size set in Preferences > Editor
+- UTF-16 files cannot be blamed, and their diffs are for reading only (no
+  staging of hunks or lines)
 - Syntax grammars are syntect's bundled set: TypeScript is coloured as
   JavaScript, and Kotlin, Swift, Dart and PowerShell stay plain
 - SSH and GPG keys with a passphrase need an agent that already holds them

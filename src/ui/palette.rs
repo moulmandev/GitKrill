@@ -378,6 +378,27 @@ fn on_tab(run: impl FnOnce(&mut RepoTab, &mut Shared) + 'static) -> impl FnOnce(
     }
 }
 
+/// Preferences > Editor switches that are handy while reading a diff.
+fn editor_actions(list: &mut Vec<Entry>, settings: &Settings) {
+    let editor = &settings.editor;
+    let label = if editor.word_wrap { "Turn word wrap off" } else { "Turn word wrap on" };
+    list.push(
+        Entry::new(Kind::Action, "word-wrap", icons::TEXT_INDENT, label, |env: &mut Env<'_>| {
+            let editor = &mut env.shared.settings.editor;
+            editor.word_wrap = !editor.word_wrap;
+        })
+        .keywords("wrap long lines diff blame editor"),
+    );
+    let label = if editor.line_numbers { "Hide line numbers" } else { "Show line numbers" };
+    list.push(
+        Entry::new(Kind::Action, "line-numbers", icons::LIST_NUMBERS, label, |env: &mut Env<'_>| {
+            let editor = &mut env.shared.settings.editor;
+            editor.line_numbers = !editor.line_numbers;
+        })
+        .keywords("gutter diff blame editor"),
+    );
+}
+
 /// Everything the palette offers right now, in the order shown for an empty
 /// query. Entries that cannot run at the moment are left out.
 pub fn entries(tabs: &[RepoTab], active: usize, settings: &Settings) -> Vec<Entry> {
@@ -393,6 +414,7 @@ pub fn entries(tabs: &[RepoTab], active: usize, settings: &Settings) -> Vec<Entr
     // More actions: push further entries here. `Entry::on_tab` is for
     // anything that needs the repository in front; call the function the
     // rest of the UI uses for it, and leave the entry out when it cannot run.
+    editor_actions(&mut list, settings);
     if let Some(shown) = tab.and_then(|tab| tab.hosting.connected()) {
         let service = shown.repo.service;
         list.push(
