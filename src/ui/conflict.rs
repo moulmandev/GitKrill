@@ -227,7 +227,8 @@ impl Resolver {
 
     fn load(&mut self, tab: &mut RepoTab) {
         let path = self.path.clone();
-        tab.spawn_job(self.job_key(), move |loader| conflict::load(loader.repo(), &path));
+        let encoding = text::encoding_for(&tab.path);
+        tab.spawn_job(self.job_key(), move |loader| conflict::load(loader.repo(), &path, encoding));
         self.phase = Phase::Loading;
         self.file = None;
         self.editing = None;

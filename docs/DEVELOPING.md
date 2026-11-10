@@ -37,6 +37,8 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Show a preference | Its section's page in `src/ui/prefs/<section>.rs` (see "Preferences" below). |
 | Read or change git's configuration | `crate::prefs::gitconfig`: `page.global` / `page.repo` on a preferences page (`get`, `get_bool`, `set`, `set_bool`; read in the background, written through `git config`); `gitconfig::read` / `write` / `effective` from background code. |
 | Give every git command an environment variable | `git::cli::set_session_env` (the SSH key and author of the profile in use). |
+| Show the text of a file (not git's own data) | Decode it in the background with `git::text::format_for(workdir)` (the repository's encoding and the tab width: `display_text_in`, `decode_file`), keep the `Format` with the result, and load again when `text::generation()` has moved on (`ui/diff.rs` does). |
+| Paint code | `prefs::editor::look()` (one atomic load): `font()`, `small()`, `line_height()`, `numbers`, `wrap`, `highlight`. `theme::code(size)` is the code font; `ui::diff::{first_rows, wrap_rows, segments}` wrap lines with rows kept from frame to frame. |
 | Do network or other non-repository background work | Spawn your own thread, send results over a channel, call `ctx.request_repaint()` when something arrives, and poll the channel from your UI code. Never block in UI code. |
 
 `tab.jump_to(oid)` selects a commit and scrolls the graph to it.
