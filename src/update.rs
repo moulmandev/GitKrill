@@ -890,6 +890,24 @@ trying it.";
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Against the real GitHub: the latest release reads, and a download
+    /// through GitHub's redirect checks out. `cargo test real_github -- --ignored`
+    #[test]
+    #[ignore]
+    fn real_github_release_reads_and_downloads() {
+        let source = Source::github();
+        let release = check(&mut Wire::new(), &source).unwrap();
+        assert!(release.version >= Version(0, 2, 0), "{release:?}");
+        for name in [INSTALLER, PORTABLE_WINDOWS, PORTABLE_LINUX, SUMS] {
+            assert!(release.assets.iter().any(|asset| asset.name == name), "{name} missing");
+        }
+        let dir = std::env::temp_dir().join(format!("gitkrill-real-update-{}", std::process::id()));
+        let saved = download(&mut Wire::new(), &source, &release, SUMS, &dir, &mut |_, _| {}).unwrap();
+        let sums = std::fs::read_to_string(&saved).unwrap();
+        assert!(sum_for(&sums, INSTALLER).is_some(), "{sums}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn each_kind_of_copy_updates_from_its_own_file() {
         assert_eq!(Kind::Installed.asset(), Some(INSTALLER));
