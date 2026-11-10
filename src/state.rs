@@ -795,11 +795,13 @@ fn conflict_lines(message: &str) -> String {
         .join("\n")
 }
 
-/// `Nov 10, 2026 15:04` in local time.
+/// `Nov 10, 2026 15:04` in local time, or in the date format chosen under
+/// Preferences > UI Customization (with the time of day).
 pub fn format_time(secs: i64) -> String {
     use chrono::{Local, TimeZone};
     match Local.timestamp_opt(secs, 0).single() {
-        Some(time) => time.format("%b %-d, %Y %H:%M").to_string(),
+        Some(time) => crate::prefs::appearance::custom_date(&time, true)
+            .unwrap_or_else(|| time.format("%b %-d, %Y %H:%M").to_string()),
         None => String::new(),
     }
 }

@@ -143,7 +143,15 @@ be installed.
   its name in the command palette. New repositories are found on each start
   (or with the rescan button); dependency and build folders (`node_modules`,
   `target`, `.venv`, ...) are not searched
-- Dark and light themes, or follow the system setting (**View > Theme**)
+- Dark and light themes, or follow the system setting (**View > Theme**);
+  custom themes are JSON files in the `themes` folder next to the settings,
+  started from a template that **Preferences > UI Customization** writes
+- Preferences > UI Customization: where messages appear, a date format
+  (`DD.MM.YYYY`, `YYYY-MM-DD HH:mm`...) used everywhere a date is shown, an
+  icon-only toolbar, initials instead of avatars, and a
+  workspace › repository › branch breadcrumb in the toolbar
+- Preferences > Notifications: the taskbar button flashes (the Dock icon
+  bounces) when an operation ends while GitKrill is in the background
 - Clone and init
 - Open a terminal in the repository
 - Command palette (`Ctrl+P`): type a few letters of any action, branch, tag,
@@ -273,6 +281,9 @@ build.rs         the Windows executable's icon and version details
   JavaScript, and Kotlin, Swift, Dart and PowerShell stay plain
 - SSH keys with a passphrase need an agent; there is no passphrase prompt
 - Submodule management, worktrees, Git LFS controls; SVG changes show as text
+- Desktop notifications draw attention to the window but do not pop up a
+  system notification with the message; dates follow one pattern, not the
+  system's locale
 
 ## License
 
