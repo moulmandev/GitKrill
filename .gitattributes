@@ -1,0 +1,4 @@
+# Sources are LF everywhere, so shell scripts keep working after a checkout
+# on Windows.
+* text=auto eol=lf
+*.png binary

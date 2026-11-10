@@ -1,0 +1,147 @@
+# Builds, tests and packages GitKrill for Windows, Linux and macOS.
+#
+# - Every push and pull request: test and build on all three, and attach the
+#   packaged apps to the workflow run (Actions tab > the run > Artifacts).
+# - Pushing a tag such as v0.2.0: the same, then publish a GitHub release with
+#   the three downloads attached.
+
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-latest
+            package: gitkrill-windows-x64.zip
+          # The oldest Ubuntu image on offer, so the binary also runs on
+          # distributions with an older glibc.
+          - name: Linux
+            os: ubuntu-22.04
+            package: gitkrill-linux-x64.tar.gz
+          - name: macOS
+            os: macos-latest
+            package: gitkrill-macos-universal.zip
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          fi
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The tests create real repositories and commits.
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build (Windows, Linux)
+        if: runner.os != 'macOS'
+        run: cargo build --release --locked
+
+      # One binary that runs natively on both Apple silicon and Intel Macs.
+      - name: Build (macOS universal)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create -output target/release/gitkrill \
+            target/aarch64-apple-darwin/release/gitkrill \
+            target/x86_64-apple-darwin/release/gitkrill
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/GitKrill | Out-Null
+          Copy-Item target/release/gitkrill.exe, README.md dist/GitKrill/
+          Compress-Archive -Path dist/GitKrill -DestinationPath ${{ matrix.package }}
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p dist/gitkrill
+          cp target/release/gitkrill README.md dist/gitkrill/
+          tar -C dist -czf ${{ matrix.package }} gitkrill
+
+      # A minimal .app bundle so it can be launched from Finder. It is signed
+      # ad hoc only: without an Apple Developer ID, macOS asks the user to
+      # confirm the first launch (right-click > Open).
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          app=dist/GitKrill.app
+          mkdir -p "$app/Contents/MacOS"
+          cp target/release/gitkrill "$app/Contents/MacOS/gitkrill"
+          cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>GitKrill</string>
+            <key>CFBundleDisplayName</key><string>GitKrill</string>
+            <key>CFBundleIdentifier</key><string>dev.gitkrill.app</string>
+            <key>CFBundleExecutable</key><string>gitkrill</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$version</string>
+            <key>CFBundleVersion</key><string>$version</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          EOF
+          codesign --force --deep --sign - "$app"
+          ditto -c -k --keepParent "$app" ${{ matrix.package }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.package }}
+          path: ${{ matrix.package }}
+          if-no-files-found: error
+
+  release:
+    name: Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: packages
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: packages/*
+          generate_release_notes: true
