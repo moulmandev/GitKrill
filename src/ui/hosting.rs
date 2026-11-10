@@ -2,7 +2,7 @@
 //! CI runs, the offer to connect a self-hosted server, and the dialog that
 //! asks what runs on it.
 
-use eframe::egui::{Align2, Button, Color32, Rect, Response, RichText, Sense, Ui, Vec2, pos2, vec2};
+use eframe::egui::{Align2, Button, Color32, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
 
 use crate::git::{BranchInfo, Oid, RemoteInfo, RepoSnapshot};
 use crate::git::ops::GitCmd;
@@ -10,6 +10,7 @@ use crate::hosting::{self, Checks, Feed, Issue, Offer, PullRequest, Run, RunStat
 use crate::state::{Dialog, RepoTab, Shared};
 use crate::theme::{self, icons};
 use crate::ui::dialogs;
+use crate::ui::graph::drag::{self, Branch};
 use crate::ui::sidebar::{leaf, row, section, section_header};
 use crate::ui::widgets::{elided, elided_pair, menu_item, spinner};
 
@@ -24,6 +25,8 @@ enum Act {
     Choose(String, ServerKind),
     /// Forget it: the server is no longer contacted, and offered again.
     Disconnect(String),
+    /// Open the "Create pull request" dialog, from this branch if given.
+    NewPull(Option<Branch>),
 }
 
 /// Called at the end of the sidebar, inside its scroll area.
@@ -53,6 +56,7 @@ pub fn sections(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Repo
         Some(Act::Disconnect(host)) => {
             shared.settings.hosting_servers.remove(&host);
         }
+        Some(Act::NewPull(branch)) => crate::ui::new_pull::open(tab, shared, branch),
         None => {}
     }
 }
@@ -80,12 +84,18 @@ fn lists(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, shown: &Shown, act
         .collect();
     let count = (pulls.len(), view.pulls.items.len());
     let url = repo.pulls_url();
-    if header(ui, tab, shown, (service.pulls_title(), pull_icon(service), &url), count, act) {
+    let top = ui.cursor().top();
+    if header(ui, tab, shown, (service.pulls_title(), pull_icon(service), &url), count, true, act) {
         notice(ui, shown, &view.pulls, act);
         for pr in pulls {
             pull_row(ui, snap, shown, pr, act);
         }
         more(ui, shown, &view.pulls, &url);
+    }
+    // A branch dropped anywhere on the list opens the dialog for it.
+    let list = Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top());
+    if let Some(branch) = drop_target(ui, snap, shown, list) {
+        *act = Some(Act::NewPull(Some(branch)));
     }
 
     // ---- issues ----
@@ -97,7 +107,7 @@ fn lists(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, shown: &Shown, act
         .collect();
     let count = (issues.len(), view.issues.items.len());
     let url = repo.issues_url();
-    if header(ui, tab, shown, ("ISSUES", icons::RADIO_BUTTON, &url), count, act) {
+    if header(ui, tab, shown, ("ISSUES", icons::RADIO_BUTTON, &url), count, false, act) {
         notice(ui, shown, &view.issues, act);
         for issue in issues {
             issue_row(ui, shown, issue, act);
@@ -114,7 +124,7 @@ fn lists(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, shown: &Shown, act
         .collect();
     let count = (runs.len(), view.runs.items.len());
     let url = repo.runs_url();
-    if header(ui, tab, shown, (service.ci_title(), icons::PLAY_CIRCLE, &url), count, act) {
+    if header(ui, tab, shown, (service.ci_title(), icons::PLAY_CIRCLE, &url), count, false, act) {
         notice(ui, shown, &view.runs, act);
         for run in runs {
             run_row(ui, shown, run, now, act);
@@ -127,14 +137,49 @@ fn pull_icon(service: Service) -> &'static str {
     if service.is_gitlab() { icons::GIT_MERGE } else { icons::GIT_PULL_REQUEST }
 }
 
+/// Makes `rect` (the pull request section) a place to drop a branch: it is
+/// outlined while a branch that can be proposed is dragged, filled while the
+/// pointer is on it, and the branch is returned on the frame it is dropped.
+fn drop_target(ui: &Ui, snap: &RepoSnapshot, shown: &Shown, rect: Rect) -> Option<Branch> {
+    let session = drag::session(ui.ctx())?;
+    if !crate::ui::new_pull::accepts(snap, &shown.remote, session.branch()) {
+        return None;
+    }
+    let clipped = rect.intersect(ui.clip_rect());
+    if !ui.is_rect_visible(clipped) {
+        return None;
+    }
+    if ui.rect_contains_pointer(clipped) {
+        drag::highlight_row(ui.painter(), clipped);
+        if session.over_place(ui.ctx(), &format!("Create {}", shown.repo.service.pull_word())) {
+            return Some(session.branch().clone());
+        }
+    } else {
+        let stroke = Stroke::new(1.0, theme::with_alpha(theme::accent(), 150));
+        ui.painter().rect_stroke(clipped.shrink(0.5), 2.0, stroke, StrokeKind::Inside);
+    }
+    None
+}
+
 /// Opens a page in the default browser.
 ///
 /// Not `ctx.open_url`: eframe is built without its `links` feature here,
 /// which turns that call into a silent no-op. Every address passed in is
-/// assembled by [`hosting::RepoId`] from validated parts and numbers, never
-/// taken from a server's answer.
-fn browse(url: &str) {
+/// assembled by [`hosting::RepoId`] from validated parts, numbers and
+/// percent-escaped branch names, never taken from a server's answer.
+///
+/// A scripted screenshot run (`GITKRILL_SHOT`) prints the address instead,
+/// so trying the links never opens the real site on someone's desktop.
+pub fn open_link(url: &str) {
+    if std::env::var_os("GITKRILL_SHOT").is_some() {
+        eprintln!("would open {url}");
+        return;
+    }
     crate::platform::open(std::path::Path::new(url));
+}
+
+fn browse(url: &str) {
+    open_link(url);
 }
 
 /// The sidebar's own section header with a refresh button on top of it.
@@ -144,12 +189,16 @@ fn browse(url: &str) {
 /// the header, and as a spinner while a refresh is in flight. Right-clicking
 /// the header offers the list's page and, for a self-hosted server, a way to
 /// disconnect it. Returns whether the section is open.
+///
+/// With `add`, a "+" next to it opens the "Create pull request" dialog.
+#[allow(clippy::too_many_arguments)]
 fn header(
     ui: &mut Ui,
     tab: &mut RepoTab,
     shown: &Shown,
     (title, icon, url): (&str, &str, &str),
     (visible, total): (usize, usize),
+    add: bool,
     act: &mut Option<Act>,
 ) -> bool {
     let (left, top, width) = (ui.cursor().left(), ui.cursor().top(), ui.available_width());
@@ -186,6 +235,24 @@ fn header(
     }
     if response.clicked() {
         *act = Some(Act::Refresh);
+    }
+    // "+" just left of the refresh button, over the end of the title.
+    if add && over_header {
+        let plus = Rect::from_min_size(pos2(button.left() - 24.0, button.top()), Vec2::new(22.0, button.height()));
+        let add_response = ui.interact(plus, ui.id().with(("hosting-add", title)), Sense::click());
+        // The header behind is hovered unless one of the buttons is.
+        let behind = if add_response.hovered() || response.hovered() { theme::bg_panel() } else { theme::bg_hover() };
+        let painter = ui.painter();
+        let cover = Rect::from_min_max(pos2(plus.left() - 4.0, bar.top() + 1.0), pos2(button.left(), bar.bottom()));
+        painter.rect_filled(cover, 0.0, behind);
+        let fill = if add_response.hovered() { theme::bg_raised() } else { behind };
+        painter.rect_filled(plus, 4.0, fill);
+        let color = if add_response.hovered() { theme::text_bright() } else { theme::text_dim() };
+        painter.text(plus.center(), Align2::CENTER_CENTER, icons::PLUS, theme::font(14.0), color);
+        if add_response.clicked() {
+            *act = Some(Act::NewPull(None));
+        }
+        add_response.on_hover_text(format!("Create {}", shown.repo.service.pull_word()));
     }
     response.on_hover_ui(|ui| {
         let mut text = format!("Refresh from {}  ({})", shown.repo.site(), shown.repo.slug());

@@ -122,6 +122,16 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   the run's `cfg/settings.json` first, so the app never fetches from the
   real host; `"hosting_servers": {"git.example.com": "gitlab"}` there
   connects a made-up server without clicking through the offer.
+- Opening a pull request is answered from `create.json` (and `create.head`
+  for another status), the request body is written to `create.sent.json`,
+  and `pulls.after.json` replaces `pulls.json` once one was opened. An empty
+  file named `signed-in` stands in for a token; without it the fixture is
+  signed out. Browser links clicked during a `GITKRILL_SHOT` run are
+  printed, not opened.
+- For a demo repository whose remote must look like GitHub, set the fetch URL
+  to github.com, a separate push URL to a local bare repository
+  (`git remote set-url --push origin <bare>`), and `"auto_fetch_minutes": 0`
+  and `"fetch_avatars": false` in the run's `cfg/settings.json`.
 - Screenshot runs keep their avatar cache under the config folder too, so
   they never touch the real one.
 - To see the light theme, put `{"theme": "Light"}` in `cfg/settings.json`

@@ -52,22 +52,28 @@ struct RawPull {
     updated_at: Option<String>,
 }
 
+fn pull_request(pull: RawPull) -> PullRequest {
+    PullRequest {
+        number: pull.number,
+        title: pull.title,
+        author: login(pull.user),
+        draft: pull.draft,
+        head_ref: pull.head.name,
+        head_sha: pull.head.sha,
+        head_repo: pull.head.repo.and_then(|repo| repo.full_name),
+        base_ref: pull.base.name,
+        updated: timestamp(pull.updated_at.as_deref()),
+    }
+}
+
 pub fn parse_pulls(json: &str) -> Result<Vec<PullRequest>, String> {
     let raw: Vec<RawPull> = serde_json::from_str(json).map_err(|e| e.to_string())?;
-    Ok(raw
-        .into_iter()
-        .map(|pull| PullRequest {
-            number: pull.number,
-            title: pull.title,
-            author: login(pull.user),
-            draft: pull.draft,
-            head_ref: pull.head.name,
-            head_sha: pull.head.sha,
-            head_repo: pull.head.repo.and_then(|repo| repo.full_name),
-            base_ref: pull.base.name,
-            updated: timestamp(pull.updated_at.as_deref()),
-        })
-        .collect())
+    Ok(raw.into_iter().map(pull_request).collect())
+}
+
+/// One pull request, as the API answers a creation.
+pub fn parse_pull(json: &str) -> Result<PullRequest, String> {
+    serde_json::from_str::<RawPull>(json).map(pull_request).map_err(|e| e.to_string())
 }
 
 #[derive(Deserialize)]
@@ -181,6 +187,79 @@ fn api_message(body: &str) -> String {
         message: String,
     }
     serde_json::from_str::<RawError>(body).map(|error| error.message).unwrap_or_default()
+}
+
+// ---- opening a pull request ----
+
+/// The JSON sent to open a pull request.
+pub fn new_pull_json(new: &NewPull) -> String {
+    serde_json::json!({
+        "title": new.title,
+        "head": new.head,
+        "base": new.base,
+        "body": new.body,
+        "draft": new.draft,
+    })
+    .to_string()
+}
+
+/// What a 422 ("Validation Failed") answer to a creation means, in words.
+/// GitHub puts the reasons in `errors`, each with a `message` or a
+/// `field` and `code`.
+pub fn validation_problem(body: &str, new: &NewPull) -> String {
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct RawReason {
+        message: String,
+        field: String,
+        code: String,
+    }
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct RawFailure {
+        message: String,
+        errors: Vec<RawReason>,
+    }
+    let failure: RawFailure = serde_json::from_str(body).unwrap_or_default();
+    let (head, base) = (&new.head, &new.base);
+    let reasons: Vec<&RawReason> = failure.errors.iter().collect();
+    let says = |needle: &str| {
+        let needle = needle.to_ascii_lowercase();
+        failure.message.to_ascii_lowercase().contains(&needle)
+            || reasons.iter().any(|reason| reason.message.to_ascii_lowercase().contains(&needle))
+    };
+    let field = |name: &str| reasons.iter().any(|reason| reason.field == name);
+
+    if says("already exists") {
+        format!("A pull request from {head} into {base} is already open")
+    } else if says("no commits between") {
+        format!("No commits between {base} and {head}: there is nothing to merge")
+    } else if says("draft") {
+        "Draft pull requests are not available in this repository: untick Draft".to_owned()
+    } else if field("head") {
+        format!("GitHub does not have the branch {head}: push it first")
+    } else if field("base") {
+        format!("GitHub does not have the branch {base} to merge into")
+    } else if field("title") {
+        "The title is missing".to_owned()
+    } else {
+        // Whatever it said, as it said it.
+        let details: Vec<String> = reasons
+            .iter()
+            .map(|reason| match (reason.message.is_empty(), reason.field.is_empty()) {
+                (false, _) => reason.message.clone(),
+                (true, false) => format!("{} is {}", reason.field, reason.code.replace('_', " ")),
+                (true, true) => reason.code.replace('_', " "),
+            })
+            .filter(|text| !text.is_empty())
+            .collect();
+        match (failure.message.is_empty(), details.is_empty()) {
+            (false, false) => format!("{} ({})", failure.message, details.join("; ")),
+            (true, false) => details.join("; "),
+            (false, true) => failure.message,
+            (true, true) => "Validation failed".to_owned(),
+        }
+    }
 }
 
 // ---- the client ----
@@ -354,6 +433,68 @@ impl Client {
             fine => fine,
         }
     }
+
+    /// POST /repos/{owner}/{repo}/pulls. Always with a token: opening a
+    /// pull request anonymously is impossible, so nothing is sent without
+    /// one. Never repeated after a request that may have reached GitHub,
+    /// except after a 401, which means nothing was done.
+    fn open_pull(&mut self, new: &NewPull, now: u64) -> Result<PullRequest, Problem> {
+        let body = new_pull_json(new);
+        let mut url = format!("{}/repos/{}/{}/pulls", self.api, self.repo.owner, self.repo.name);
+        let mut hops = 0;
+        // Not signed in so far: the user may have signed in since.
+        self.look_again();
+        loop {
+            if !self.looked {
+                let found = find_token(self.secrets.as_ref(), &self.repo, &self.rejected);
+                self.sign_in(found);
+            }
+            let Some((token, _)) = &self.token else {
+                return Err(if self.rejected.is_empty() { Problem::NotSignedIn } else { Problem::SignInRejected });
+            };
+            if let Some(until) = self.limiter.blocked(now) {
+                return Err(Problem::RateLimited { until });
+            }
+            let request = HttpRequest { url: &url, etag: None, token: Some(token) };
+            let response = self.transport.post(&request, &body).map_err(Problem::Unreachable)?;
+            let message = api_message(&response.body);
+            let rate = Rate::of(&response);
+            if let Some(until) = self.limiter.record(response.status, &rate, &message, now) {
+                return Err(Problem::RateLimited { until });
+            }
+
+            return match response.status {
+                200 | 201 => parse_pull(&response.body)
+                    .map_err(|error| Problem::Failed(format!("Unreadable answer from GitHub ({error})"))),
+                // Only these two keep the method and the body; anything else
+                // would turn the request into a GET.
+                307 | 308 => match response.header("location") {
+                    Some(location) if within(&self.api, location) && hops < 3 => {
+                        url = location.to_owned();
+                        hops += 1;
+                        continue;
+                    }
+                    _ => Err(Problem::Failed("GitHub sent an unexpected redirect".to_owned())),
+                },
+                300..=399 => Err(Problem::Failed("GitHub sent an unexpected redirect".to_owned())),
+                401 => {
+                    if let Some((token, _)) = self.token.take() {
+                        self.rejected.push(token);
+                    }
+                    let found = find_token(self.secrets.as_ref(), &self.repo, &self.rejected);
+                    self.sign_in(found);
+                    continue;
+                }
+                404 => Err(Problem::NoAccess),
+                403 => Err(Problem::Refused(match message.is_empty() {
+                    true => format!("No permission to open pull requests in {}", self.repo.slug()),
+                    false => format!("No permission to open pull requests in {} ({message})", self.repo.slug()),
+                })),
+                422 => Err(Problem::Refused(validation_problem(&response.body, new))),
+                status => Err(Problem::Failed(format!("GitHub answered {status}"))),
+            };
+        }
+    }
 }
 
 impl Backend for Client {
@@ -392,5 +533,13 @@ impl Backend for Client {
 
     fn blocked_until(&self, now: u64) -> Option<u64> {
         self.limiter.blocked(now)
+    }
+
+    fn create_pull(&mut self, new: &NewPull, now: u64) -> Result<PullRequest, Problem> {
+        self.open_pull(new, now).map_err(|problem| {
+            let mut tokens: Vec<&Token> = self.rejected.iter().collect();
+            tokens.extend(self.token.as_ref().map(|(token, _)| token));
+            problem.scrubbed(&tokens)
+        })
     }
 }

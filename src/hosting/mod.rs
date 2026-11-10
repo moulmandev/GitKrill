@@ -25,7 +25,8 @@
 //! `issues.json` and `runs.json` for GitHub; `merge_requests.json`,
 //! `issues.json` and `pipelines.json` for GitLab) instead of the network
 //! (see `Canned`) and no token is looked for, so screenshots of every state
-//! can be taken offline.
+//! can be taken offline. Opening a pull request is answered from
+//! `create.json`; an empty file named `signed-in` stands in for a sign-in.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -75,6 +76,11 @@ impl Service {
     /// "pull request", or "merge request" on GitLab.
     pub fn pull_word(self) -> &'static str {
         if self.is_gitlab() { "merge request" } else { "pull request" }
+    }
+
+    /// [`Service::pull_word`] at the start of a sentence.
+    pub fn pull_word_title(self) -> &'static str {
+        if self.is_gitlab() { "Merge request" } else { "Pull request" }
     }
 
     /// Sidebar title of the pull / merge request section.
@@ -234,6 +240,39 @@ impl RepoId {
             false => self.page(&format!("actions/runs/{id}")),
         }
     }
+
+    /// The service's own page for opening a pull request from `head` into
+    /// `base`, prefilled. Works without any sign-in in GitKrill.
+    ///
+    /// Branch names can hold almost anything; every byte outside letters,
+    /// digits, `.`, `_`, `-` and `/` is percent-encoded, so the link stays
+    /// within the same safe characters as the others plus `%`, `?` and `=`.
+    pub fn compare_url(&self, base: &str, head: &str) -> String {
+        match self.service {
+            Service::GitHub | Service::GitHubEnterprise => {
+                self.page(&format!("compare/{}...{}?expand=1", url_escape(base), url_escape(head)))
+            }
+            // `merge_request[source_branch]`, with its brackets encoded.
+            Service::GitLab => self.page(&format!(
+                "merge_requests/new?merge_request%5Bsource_branch%5D={}&merge_request%5Btarget_branch%5D={}",
+                url_escape(head),
+                url_escape(base)
+            )),
+        }
+    }
+}
+
+/// Percent-encodes everything but `A-Z a-z 0-9 . _ - /`.
+pub fn url_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"._-/".contains(&byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// Where `service`'s REST API lives for a repository on `host`.
@@ -1013,6 +1052,24 @@ pub fn password_from(answer: &str) -> Option<String> {
     answer.lines().find_map(|line| line.strip_prefix("password=")).map(str::to_owned)
 }
 
+
+/// The offline fixture when its folder holds a file named `signed-in`: a
+/// made-up token "from the CLI", so signed-in states (opening a pull
+/// request) can be shown. It only ever reaches the canned transport.
+struct FixtureSignIn;
+
+impl Secrets for FixtureSignIn {
+    fn env(&self, _name: &str) -> Option<String> {
+        None
+    }
+    fn cli(&self, _service: Service, _host: &str) -> Option<String> {
+        Some("fixture-token-not-a-real-one".to_owned())
+    }
+    fn credential_helper(&self, _host: &str) -> Option<String> {
+        None
+    }
+}
+
 /// Runs a helper program to completion and returns its standard output, or
 /// `None` if it is missing, fails or takes longer than `timeout`. It gets no
 /// console window, and its error output is discarded unread.
@@ -1095,7 +1152,6 @@ pub trait Transport: Send {
 
     /// A POST with a JSON body (`request.etag` is not used). Never retried
     /// and never redirected, so nothing can be created twice.
-    #[cfg_attr(not(test), expect(dead_code, reason = "reached through Backend::create_pull, which nothing calls until the pull request dialog does"))]
     fn post(&mut self, request: &HttpRequest<'_>, json: &str) -> Result<HttpResponse, String> {
         let _ = (request, json);
         Err("sending is not supported here".to_owned())
@@ -1206,8 +1262,37 @@ fn explain(error: ureq::Error) -> String {
 /// and `pipelines` on GitLab. An optional `<endpoint>.head` gives a status
 /// code on its first line and `name: value` headers after it, which is how
 /// to stage a rate limit or an outage.
+///
+/// Opening a pull request (a POST) is answered from `create.json` and
+/// `create.head` the same way, with 201 as the default status; the body that
+/// was sent is left in `create.sent.json` to check what the dialog asked for.
+/// Once one has been opened, `pulls.after.json` (if present) takes the place
+/// of `pulls.json`, so the list can be seen to pick it up.
 struct Canned {
     dir: PathBuf,
+    created: bool,
+}
+
+impl Canned {
+    /// The canned answer called `name`; `status` when no `.head` file says
+    /// otherwise.
+    fn answer(&self, name: &str, status: u16) -> HttpResponse {
+        let mut response = HttpResponse { status, ..Default::default() };
+        if let Ok(head) = std::fs::read_to_string(self.dir.join(format!("{name}.head"))) {
+            let mut lines = head.lines();
+            response.status = lines.next().and_then(|line| line.trim().parse().ok()).unwrap_or(status);
+            response.headers = lines
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.trim().to_lowercase(), value.trim().to_owned()))
+                .collect();
+        }
+        match std::fs::read_to_string(self.dir.join(format!("{name}.json"))) {
+            Ok(body) => response.body = body,
+            Err(_) if response.status == status => response.status = 404,
+            Err(_) => {}
+        }
+        response
+    }
 }
 
 impl Transport for Canned {
@@ -1216,21 +1301,19 @@ impl Transport for Canned {
         let endpoints = ["pulls", "issues", "runs", "merge_requests", "pipelines"];
         let list = endpoints.into_iter().find(|list| path.rsplit('/').next() == Some(*list));
         let list = list.ok_or("no fixture for this address")?;
+        if list == "pulls" && self.created && self.dir.join("pulls.after.json").exists() {
+            return Ok(self.answer("pulls.after", 200));
+        }
+        Ok(self.answer(list, 200))
+    }
 
-        let mut response = HttpResponse { status: 200, ..Default::default() };
-        if let Ok(head) = std::fs::read_to_string(self.dir.join(format!("{list}.head"))) {
-            let mut lines = head.lines();
-            response.status = lines.next().and_then(|line| line.trim().parse().ok()).unwrap_or(200);
-            response.headers = lines
-                .filter_map(|line| line.split_once(':'))
-                .map(|(name, value)| (name.trim().to_lowercase(), value.trim().to_owned()))
-                .collect();
+    fn post(&mut self, request: &HttpRequest<'_>, body: &str) -> Result<HttpResponse, String> {
+        if !request.url.ends_with("/pulls") && !request.url.ends_with("/merge_requests") {
+            return Err("no fixture for this address".to_owned());
         }
-        match std::fs::read_to_string(self.dir.join(format!("{list}.json"))) {
-            Ok(body) => response.body = body,
-            Err(_) if response.status == 200 => response.status = 404,
-            Err(_) => {}
-        }
+        let _ = std::fs::write(self.dir.join("create.sent.json"), body);
+        let response = self.answer("create", 201);
+        self.created |= response.status == 201;
         Ok(response)
     }
 }
@@ -1377,7 +1460,12 @@ pub struct NewPull {
 fn connect(repo: &RepoId, workdir: &Path) -> Box<dyn Backend> {
     let (transport, secrets): (Box<dyn Transport>, Box<dyn Secrets>) =
         match std::env::var_os("GITKRILL_HOSTING_FIXTURE") {
-            Some(dir) => (Box::new(Canned { dir: dir.into() }), Box::new(NoSecrets)),
+            Some(dir) => {
+                let dir = PathBuf::from(dir);
+                let secrets: Box<dyn Secrets> =
+                    if dir.join("signed-in").exists() { Box::new(FixtureSignIn) } else { Box::new(NoSecrets) };
+                (Box::new(Canned { dir, created: false }), secrets)
+            }
             None => {
                 let headers = match repo.service {
                     Service::GitHub | Service::GitHubEnterprise => github::HEADERS,
@@ -1404,6 +1492,8 @@ enum Order {
         /// Asked for by the user rather than by the timer.
         manual: bool,
     },
+    /// Open a pull request; answered with [`Event::Created`] under `id`.
+    CreatePull { id: u64, new: NewPull },
 }
 
 enum Event {
@@ -1413,13 +1503,14 @@ enum Event {
     Runs(Outcome<Run>),
     /// The round is over; refresh again by itself after `next`.
     Done { next: Duration },
+    Created { id: u64, result: Result<PullRequest, Problem> },
 }
 
 fn troubled<T>(outcome: &Outcome<T>) -> bool {
     matches!(outcome, Outcome::Failed(problem) if !matches!(problem, Problem::RateLimited { .. }))
 }
 
-/// Serves refresh orders until the tab goes away (`orders` closes) or the
+/// Serves orders until the tab goes away (`orders` closes) or the
 /// integration is switched off (`stop`). `wake` asks the UI for a frame.
 fn worker(
     mut backend: Box<dyn Backend>,
@@ -1429,10 +1520,38 @@ fn worker(
     wake: impl Fn(),
 ) {
     let mut failures = 0u32;
-    while let Ok(Order::Refresh { mut manual }) = orders.recv() {
-        // One round answers every order that queued up meanwhile.
-        while let Ok(Order::Refresh { manual: also }) = orders.try_recv() {
-            manual |= also;
+    // Orders taken off the channel while gathering refreshes, kept in order.
+    let mut later: std::collections::VecDeque<Order> = std::collections::VecDeque::new();
+    loop {
+        let order = match later.pop_front() {
+            Some(order) => order,
+            None => match orders.recv() {
+                Ok(order) => order,
+                Err(_) => return,
+            },
+        };
+        let mut manual = match order {
+            Order::Refresh { manual } => manual,
+            Order::CreatePull { id, new } => {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let result = backend.create_pull(&new, epoch_now());
+                if events.send(Event::Auth(backend.auth())).is_err()
+                    || events.send(Event::Created { id, result }).is_err()
+                {
+                    return;
+                }
+                wake();
+                continue;
+            }
+        };
+        // One round answers every refresh that queued up meanwhile.
+        while let Ok(order) = orders.try_recv() {
+            match order {
+                Order::Refresh { manual: also } => manual |= also,
+                other => later.push_back(other),
+            }
         }
         if manual {
             backend.look_again();
@@ -1500,6 +1619,14 @@ struct Session {
     view: Arc<View>,
     /// When the next automatic refresh is due.
     next_auto: Option<Instant>,
+    /// Pull requests asked for and not answered yet, by id.
+    creating: Vec<u64>,
+    /// Answers to those, until collected with [`HostingState::take_created`].
+    created: Vec<(u64, Result<PullRequest, Problem>)>,
+    last_id: u64,
+    /// A pull request was opened during a refresh round: refresh once more
+    /// when it ends, so the list has it for certain.
+    refresh_after: bool,
 }
 
 impl Drop for Session {
@@ -1531,9 +1658,24 @@ impl Session {
             stop,
             view: Arc::default(),
             next_auto: None,
+            creating: Vec::new(),
+            created: Vec::new(),
+            last_id: 0,
+            refresh_after: false,
         };
         session.request(false);
         session
+    }
+
+    fn create(&mut self, new: NewPull) -> u64 {
+        self.last_id += 1;
+        let id = self.last_id;
+        if self.orders.send(Order::CreatePull { id, new }).is_ok() {
+            self.creating.push(id);
+        } else {
+            self.created.push((id, Err(stopped_problem())));
+        }
+        id
     }
 
     fn request(&mut self, manual: bool) {
@@ -1552,7 +1694,7 @@ impl Session {
     /// cause. Say so instead of spinning forever.
     fn stopped(&mut self) {
         let view = Arc::make_mut(&mut self.view);
-        let problem = Problem::Failed("The background worker stopped".to_owned());
+        let problem = stopped_problem();
         view.busy = false;
         view.pulls.problem = Some(problem.clone());
         view.issues.problem = Some(problem.clone());
@@ -1574,6 +1716,17 @@ impl Session {
                             view.updated = Some(epoch_now());
                             self.next_auto = Some(Instant::now() + next);
                         }
+                        Event::Created { id, result } => {
+                            self.creating.retain(|pending| *pending != id);
+                            if let Ok(pull) = &result {
+                                // Listed at once; the refresh below confirms it.
+                                if !view.pulls.items.iter().any(|known| known.number == pull.number) {
+                                    view.pulls.items.insert(0, pull.clone());
+                                }
+                                self.refresh_after = true;
+                            }
+                            self.created.push((id, result));
+                        }
                     }
                 }
                 Err(TryRecvError::Empty) => break,
@@ -1581,11 +1734,22 @@ impl Session {
                     if self.view.busy {
                         self.stopped();
                     }
+                    for id in std::mem::take(&mut self.creating) {
+                        self.created.push((id, Err(stopped_problem())));
+                    }
                     break;
                 }
             }
         }
+        if self.refresh_after && !self.view.busy {
+            self.refresh_after = false;
+            self.request(false);
+        }
     }
+}
+
+fn stopped_problem() -> Problem {
+    Problem::Failed("The background worker stopped".to_owned())
 }
 
 /// Per-repository hosting state, owned by the tab.
@@ -1667,6 +1831,68 @@ impl HostingState {
             session.request(true);
         }
     }
+
+    /// The remote and hosted repository the integration is running for, if
+    /// it is: what "Create pull request" works with.
+    pub fn connected(&self) -> Option<Shown> {
+        let session = self.session.as_ref()?;
+        Some(Shown { remote: session.remote.clone(), repo: session.repo.clone(), view: session.view.clone() })
+    }
+
+    /// Takes in what the background thread has produced, without the rest
+    /// of [`HostingState::sync`]: for views that wait on an answer while the
+    /// sidebar may be hidden.
+    pub fn poll(&mut self) {
+        if let Some(session) = &mut self.session {
+            session.poll();
+        }
+    }
+
+    /// Asks the service to open a pull request, on the background thread.
+    /// Returns the id to collect the answer with, or `None` when the
+    /// integration is not running.
+    pub fn create_pull(&mut self, new: NewPull) -> Option<u64> {
+        Some(self.session.as_mut()?.create(new))
+    }
+
+    /// The answer to [`HostingState::create_pull`] once it has arrived.
+    pub fn take_created(&mut self, id: u64) -> Option<Result<PullRequest, Problem>> {
+        let session = self.session.as_mut()?;
+        let index = session.created.iter().position(|(done, _)| *done == id)?;
+        Some(session.created.remove(index).1)
+    }
+
+    /// Whether the answer to [`HostingState::create_pull`] is still on its
+    /// way. False also when the integration stopped meanwhile: then the
+    /// answer will never come.
+    pub fn is_creating(&self, id: u64) -> bool {
+        self.session.as_ref().is_some_and(|session| session.creating.contains(&id))
+    }
+}
+
+/// What to tell the user when opening a pull request failed: one or two
+/// sentences, with the way out when there is one.
+pub fn create_problem(problem: &Problem, service: Service) -> String {
+    let host = service.name();
+    let word = service.pull_word();
+    // The same ways to sign in as the sidebar's tooltip gives.
+    let sign_in = sign_in_advice(service).trim_end_matches(", then refresh.");
+    match problem {
+        Problem::NotSignedIn => format!(
+            "Opening a {word} from here needs a {host} sign-in. {sign_in}. Open on {host} works without one."
+        ),
+        Problem::SignInRejected => format!(
+            "{host} refused the saved sign-in (expired or revoked?). {sign_in}. Open on {host} works without one."
+        ),
+        Problem::NoAccess => format!(
+            "{host} answered \"not found\": the signed-in account cannot see this {}, or              its token is not allowed to open {word}s.",
+            service.repo_word()
+        ),
+        Problem::RateLimited { until } => {
+            format!("{host} asked us to slow down. Try again after {}.", clock(*until))
+        }
+        other => other.line(service),
+    }
 }
 
 // ---- checking out a pull request ------------------------------------------
@@ -1706,7 +1932,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicU32;
 
-    use super::github::{API, Client, parse_issues, parse_pulls, parse_runs, run_state};
+    use super::github::{API, Client, new_pull_json, parse_issues, parse_pull, parse_pulls, parse_runs, run_state};
     use super::*;
 
     pub(super) const NOW: u64 = 1_800_000_000;
@@ -2788,13 +3014,386 @@ mod tests {
         std::fs::write(dir.join("issues.head"), "403\nRetry-After: 120\n").unwrap();
         std::fs::write(dir.join("issues.json"), r#"{"message": "slow down"}"#).unwrap();
 
-        let mut client = Client::new(repo(), Box::new(Canned { dir: dir.clone() }), Box::new(NoSecrets));
+        let mut client = Client::new(repo(), Box::new(Canned { dir: dir.clone(), created: false }), Box::new(NoSecrets));
         assert!(matches!(client.pulls(NOW), Outcome::Fresh { ref items, .. } if items.len() == 2));
         assert_eq!(failure(client.issues(NOW)), Problem::RateLimited { until: NOW + 120 });
         // No runs.json: the list does not exist.
         assert_eq!(failure(client.runs(NOW + 120)), Problem::NotSignedIn);
         assert_eq!(client.auth(), Auth::Anonymous);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- opening a pull request ----
+
+    /// The API's answer to a creation, trimmed down.
+    const CREATED: &str = r#"{"number": 42, "title": "Add dark mode", "draft": true, "state": "open",
+       "html_url": "https://github.com/octo/app/pull/42", "user": {"login": "ada"},
+       "head": {"ref": "feature/dark", "sha": "5555555555555555555555555555555555555555",
+                "repo": {"full_name": "octo/app"}},
+       "base": {"ref": "main", "sha": "0000000000000000000000000000000000000000",
+                "repo": {"full_name": "octo/app"}},
+       "updated_at": "1970-01-02T00:00:00Z"}"#;
+
+    fn new_pull() -> NewPull {
+        NewPull {
+            head: "feature/dark".to_owned(),
+            base: "main".to_owned(),
+            title: "Add dark mode".to_owned(),
+            body: "- Dark palette\n- \"Quoted\" & <escaped>".to_owned(),
+            draft: true,
+        }
+    }
+
+    fn validation(errors: &str) -> String {
+        format!(r#"{{"message": "Validation Failed", "errors": [{errors}], "documentation_url": "https://docs.github.com"}}"#)
+    }
+
+    #[test]
+    fn a_pull_request_is_opened_with_one_post_to_the_api() {
+        let (mut client, sent) = scripted(vec![reply(201, &[], CREATED)], with_token());
+        let pull = client.create_pull(&new_pull(), NOW).unwrap();
+        assert_eq!((pull.number, pull.title.as_str(), pull.draft), (42, "Add dark mode", true));
+        assert_eq!((pull.head_ref.as_str(), pull.base_ref.as_str()), ("feature/dark", "main"));
+        assert!(pull.is_from(&repo()));
+        assert_eq!(client.auth(), Auth::SignedIn(TokenSource::Env("GITHUB_TOKEN")));
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].url, "https://api.github.com/repos/octo/app/pulls");
+        assert!(within(API, &sent[0].url));
+        assert_eq!(sent[0].token.as_deref(), Some(SECRET));
+        assert_eq!(sent[0].etag, None);
+        // The body is JSON with exactly these fields, quotes and all intact.
+        let body: serde_json::Value = serde_json::from_str(sent[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "title": "Add dark mode",
+                "head": "feature/dark",
+                "base": "main",
+                "body": "- Dark palette\n- \"Quoted\" & <escaped>",
+                "draft": true,
+            })
+        );
+        assert!(!sent[0].body.as_deref().unwrap().contains(SECRET));
+        assert_eq!(parse_pull(CREATED).unwrap(), pull);
+        assert!(new_pull_json(&NewPull { draft: false, ..new_pull() }).contains("\"draft\":false"));
+    }
+
+    #[test]
+    fn opening_a_pull_request_needs_a_token_and_says_how_to_get_one() {
+        // Nothing anywhere: nothing is sent at all.
+        let (mut client, sent) = scripted(vec![reply(201, &[], CREATED)], Fake::default());
+        let problem = client.create_pull(&new_pull(), NOW).unwrap_err();
+        assert_eq!(problem, Problem::NotSignedIn);
+        assert!(sent.lock().unwrap().is_empty());
+        let text = create_problem(&problem, Service::GitHub);
+        assert!(text.contains("GITHUB_TOKEN") && text.contains("gh auth login"), "{text}");
+        assert!(text.contains("Open on GitHub"), "{text}");
+
+        // A sign-in made since the app started is found when asked again.
+        let late = Arc::new(AtomicBool::new(false));
+        struct Late(Arc<AtomicBool>);
+        impl Secrets for Late {
+            fn env(&self, name: &str) -> Option<String> {
+                (self.0.load(Ordering::Relaxed) && name == "GITHUB_TOKEN").then(|| SECRET.to_owned())
+            }
+            fn cli(&self, _service: Service, _host: &str) -> Option<String> {
+                None
+            }
+            fn credential_helper(&self, _host: &str) -> Option<String> {
+                None
+            }
+        }
+        let sent = Log::default();
+        let transport = Script { replies: vec![reply(201, &[], CREATED)].into(), sent: sent.clone() };
+        let mut client = Client::new(repo(), Box::new(transport), Box::new(Late(late.clone())));
+        assert_eq!(client.create_pull(&new_pull(), NOW).unwrap_err(), Problem::NotSignedIn);
+        late.store(true, Ordering::Relaxed);
+        assert_eq!(client.create_pull(&new_pull(), NOW).unwrap().number, 42);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_refused_token_gives_way_to_the_next_and_then_to_a_clear_refusal() {
+        let bad = r#"{"message": "Bad credentials"}"#;
+        // GITHUB_TOKEN is stale; the CLI's token works. A 401 did nothing,
+        // so asking again with the other token is safe.
+        let secrets = Fake { env: vec![("GITHUB_TOKEN", SECRET)], cli: Some(OTHER), ..Default::default() };
+        let (mut client, sent) = scripted(vec![reply(401, &[], bad), reply(201, &[], CREATED)], secrets);
+        assert_eq!(client.create_pull(&new_pull(), NOW).unwrap().number, 42);
+        let tokens: Vec<Option<String>> = sent.lock().unwrap().iter().map(|sent| sent.token.clone()).collect();
+        assert_eq!(tokens, [Some(SECRET.to_owned()), Some(OTHER.to_owned())]);
+
+        // The only token refused: no anonymous attempt follows.
+        let (mut client, sent) = scripted(vec![reply(401, &[], bad), reply(201, &[], CREATED)], with_token());
+        let problem = client.create_pull(&new_pull(), NOW).unwrap_err();
+        assert_eq!(problem, Problem::SignInRejected);
+        assert_eq!(sent.lock().unwrap().len(), 1);
+        assert!(create_problem(&problem, Service::GitHub).contains("refused the saved sign-in"));
+    }
+
+    #[test]
+    fn creation_errors_are_put_in_plain_words() {
+        let line = |replies: Vec<Result<HttpResponse, String>>| {
+            let (mut client, _) = scripted(replies, with_token());
+            let problem = client.create_pull(&new_pull(), NOW).unwrap_err();
+            (problem.clone(), create_problem(&problem, Service::GitHub))
+        };
+        let refused = |status: u16, body: &str| line(vec![reply(status, &[], body)]).1;
+
+        let exists = validation(
+            r#"{"resource": "PullRequest", "code": "custom", "message": "A pull request already exists for octo:feature/dark."}"#,
+        );
+        assert_eq!(refused(422, &exists), "GitHub refused: A pull request from feature/dark into main is already open");
+        let empty = validation(
+            r#"{"resource": "PullRequest", "code": "custom", "message": "No commits between main and feature/dark"}"#,
+        );
+        assert_eq!(
+            refused(422, &empty),
+            "GitHub refused: No commits between main and feature/dark: there is nothing to merge"
+        );
+        let head = validation(r#"{"resource": "PullRequest", "field": "head", "code": "invalid"}"#);
+        assert_eq!(refused(422, &head), "GitHub refused: GitHub does not have the branch feature/dark: push it first");
+        let base = validation(r#"{"resource": "PullRequest", "field": "base", "code": "invalid"}"#);
+        assert_eq!(refused(422, &base), "GitHub refused: GitHub does not have the branch main to merge into");
+        let title = validation(r#"{"resource": "PullRequest", "field": "title", "code": "missing_field"}"#);
+        assert_eq!(refused(422, &title), "GitHub refused: The title is missing");
+        let draft = r#"{"message": "Draft pull requests are not supported in this repository."}"#;
+        assert_eq!(
+            refused(422, draft),
+            "GitHub refused: Draft pull requests are not available in this repository: untick Draft"
+        );
+        // Something new: GitHub's own words.
+        let other = validation(r#"{"resource": "PullRequest", "field": "maintainer_can_modify", "code": "invalid"}"#);
+        assert_eq!(refused(422, &other), "GitHub refused: Validation Failed (maintainer_can_modify is invalid)");
+        assert_eq!(refused(422, "not json"), "GitHub refused: Validation failed");
+
+        // Permission.
+        let forbidden = r#"{"message": "Resource not accessible by personal access token"}"#;
+        assert_eq!(
+            refused(403, forbidden),
+            "GitHub refused: No permission to open pull requests in octo/app (Resource not accessible by personal access token)"
+        );
+        assert_eq!(refused(403, ""), "GitHub refused: No permission to open pull requests in octo/app");
+        let (problem, text) = line(vec![reply(404, &[], r#"{"message": "Not Found"}"#)]);
+        assert_eq!(problem, Problem::NoAccess);
+        assert!(text.contains("not allowed to open pull requests"), "{text}");
+
+        // Slow down, and when to try again.
+        let secondary = r#"{"message": "You have exceeded a secondary rate limit"}"#;
+        let (problem, text) = line(vec![reply(403, &[("retry-after", "120")], secondary)]);
+        assert_eq!(problem, Problem::RateLimited { until: NOW + 120 });
+        assert_eq!(text, format!("GitHub asked us to slow down. Try again after {}.", clock(NOW + 120)));
+
+        // The service or the network failing.
+        assert_eq!(refused(502, "<html>"), "GitHub answered 502");
+        let (problem, _) = line(vec![reply(201, &[], "{ not json")]);
+        assert!(matches!(problem, Problem::Failed(text) if text.starts_with("Unreadable answer")));
+        let (problem, text) = line(vec![Err("timed out".to_owned())]);
+        assert_eq!(problem, Problem::Unreachable("timed out".to_owned()));
+        assert_eq!(text, "GitHub unreachable: timed out");
+    }
+
+    #[test]
+    fn a_creation_is_never_sent_twice_or_anywhere_but_the_api() {
+        // No answer: the pull request may exist now, so no second attempt.
+        let (mut client, sent) = scripted(vec![Err("connection reset".to_owned()), reply(201, &[], CREATED)], with_token());
+        assert!(client.create_pull(&new_pull(), NOW).is_err());
+        assert_eq!(sent.lock().unwrap().len(), 1);
+
+        // A renamed repository: 307 and 308 keep the POST, within the API.
+        let moved = "https://api.github.com/repositories/42/pulls";
+        let (mut client, sent) =
+            scripted(vec![reply(307, &[("location", moved)], ""), reply(201, &[], CREATED)], with_token());
+        assert_eq!(client.create_pull(&new_pull(), NOW).unwrap().number, 42);
+        {
+            let sent = sent.lock().unwrap();
+            assert_eq!(sent[1].url, moved);
+            assert_eq!(sent[1].body, sent[0].body);
+        }
+
+        // Elsewhere, or a redirect that would turn it into a GET: not followed.
+        for (status, target) in [
+            (307, "https://evil.example/collect"),
+            (308, "http://api.github.com/repositories/42/pulls"),
+            (301, moved),
+            (302, moved),
+            (303, moved),
+        ] {
+            let (mut client, sent) =
+                scripted(vec![reply(status, &[("location", target)], ""), reply(201, &[], CREATED)], with_token());
+            let problem = client.create_pull(&new_pull(), NOW).unwrap_err();
+            assert_eq!(problem, Problem::Failed("GitHub sent an unexpected redirect".to_owned()), "{status} {target}");
+            assert_eq!(sent.lock().unwrap().len(), 1, "{status} {target}");
+        }
+
+        // Nor is an endless chain.
+        let replies = (0..10).map(|_| reply(307, &[("location", moved)], "")).collect();
+        let (mut client, sent) = scripted(replies, with_token());
+        assert!(client.create_pull(&new_pull(), NOW).is_err());
+        assert_eq!(sent.lock().unwrap().len(), 4);
+
+        // A rate limit already known holds the request back entirely.
+        let reset = (NOW + 600).to_string();
+        let spent = [("x-ratelimit-remaining", "0"), ("x-ratelimit-reset", reset.as_str())];
+        let (mut client, sent) = scripted(vec![reply(200, &spent, PULLS), reply(201, &[], CREATED)], with_token());
+        assert!(matches!(client.pulls(NOW), Outcome::Fresh { .. }));
+        assert_eq!(client.create_pull(&new_pull(), NOW + 1).unwrap_err(), Problem::RateLimited { until: NOW + 600 });
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_token_never_reaches_a_creation_error() {
+        let echo = format!(r#"{{"message": "Bad token {SECRET} for Bearer {SECRET}"}}"#);
+        let failing = format!(
+            r#"{{"message": "Validation Failed", "errors": [{{"field": "x", "code": "c", "message": "saw {SECRET}"}}]}}"#
+        );
+        let cases: Vec<Vec<Result<HttpResponse, String>>> = vec![
+            vec![Err(format!("tls: failed sending Authorization: Bearer {SECRET}"))],
+            vec![reply(403, &[], &echo)],
+            vec![reply(422, &[], &echo)],
+            vec![reply(422, &[], &failing)],
+            vec![reply(500, &[], &echo)],
+            vec![reply(201, &[], &echo)],
+            vec![reply(201, &[], SECRET)],
+            vec![reply(307, &[("location", format!("https://evil.example/{SECRET}").as_str())], "")],
+            vec![reply(401, &[], &echo), reply(422, &[], &failing)],
+        ];
+        for (index, replies) in cases.into_iter().enumerate() {
+            let secrets = Fake { env: vec![("GITHUB_TOKEN", SECRET)], cli: Some(OTHER), ..Default::default() };
+            let (mut client, _) = scripted(replies, secrets);
+            let problem = client.create_pull(&new_pull(), NOW).unwrap_err();
+            for text in [
+                create_problem(&problem, Service::GitHub),
+                problem.line(Service::GitHub),
+                problem.detail(Service::GitHub),
+                format!("{problem:?}"),
+            ] {
+                assert!(!text.contains(SECRET) && !text.contains("FAKEfake"), "case {index}: {text}");
+                assert!(!text.contains(OTHER), "case {index}: {text}");
+            }
+        }
+        // Scrubbed, not dropped: the rest of the message is still there.
+        let (mut client, _) = scripted(vec![reply(422, &[], &failing)], with_token());
+        assert_eq!(
+            client.create_pull(&new_pull(), NOW).unwrap_err(),
+            Problem::Refused("Validation Failed (saw ***)".to_owned())
+        );
+    }
+
+    #[test]
+    fn the_compare_page_link_escapes_branch_names() {
+        let repo = repo();
+        assert_eq!(
+            repo.compare_url("main", "feature/dark-mode_2.0"),
+            "https://github.com/octo/app/compare/main...feature/dark-mode_2.0?expand=1"
+        );
+        // Everything a shell or a URL could read as syntax is encoded.
+        let link = repo.compare_url("release&calc", "ada/x%y#z+w?q=1 \"é\"|^!");
+        assert_eq!(
+            link,
+            "https://github.com/octo/app/compare/release%26calc...ada/x%25y%23z%2Bw%3Fq%3D1%20%22%C3%A9%22%7C%5E%21?expand=1"
+        );
+        for link in [link, repo.compare_url("a", "b")] {
+            assert!(link.starts_with("https://github.com/octo/app/compare/"), "{link}");
+            assert!(link.bytes().all(|b| b.is_ascii_alphanumeric() || b"/:._-%?=".contains(&b)), "{link}");
+            assert_eq!(link.matches('?').count(), 1, "{link}");
+            // Each % starts an escape.
+            for (at, _) in link.match_indices('%') {
+                assert!(link[at + 1..].len() >= 2 && link[at + 1..at + 3].bytes().all(|b| b.is_ascii_hexdigit()));
+            }
+        }
+    }
+
+    #[test]
+    fn the_offline_fixture_answers_a_creation_too() {
+        let dir = std::env::temp_dir().join("gitkrill-tests").join(format!("hosting-canned-create-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("create.json"), CREATED).unwrap();
+
+        std::fs::write(dir.join("pulls.json"), PULLS).unwrap();
+        std::fs::write(dir.join("pulls.after.json"), format!("[{CREATED}]")).unwrap();
+
+        let canned = Canned { dir: dir.clone(), created: false };
+        let mut client = Client::new(repo(), Box::new(canned), Box::new(FixtureSignIn));
+        let numbers = |outcome: Outcome<PullRequest>| match outcome {
+            Outcome::Fresh { items, .. } => items.iter().map(|pull| pull.number).collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(numbers(client.pulls(NOW)), [12, 9]);
+        assert_eq!(client.create_pull(&new_pull(), NOW).unwrap().number, 42);
+        // The list the fixture serves from then on has it.
+        assert_eq!(numbers(client.pulls(NOW)), [42]);
+        let sent: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("create.sent.json")).unwrap()).unwrap();
+        assert_eq!(sent["title"], "Add dark mode");
+        assert_eq!(client.auth(), Auth::SignedIn(TokenSource::Cli));
+
+        // A staged refusal.
+        std::fs::write(dir.join("create.head"), "422\n").unwrap();
+        let exists = validation(r#"{"message": "A pull request already exists for octo:feature/dark."}"#);
+        std::fs::write(dir.join("create.json"), exists).unwrap();
+        let problem = client.create_pull(&new_pull(), NOW).unwrap_err();
+        assert!(create_problem(&problem, Service::GitHub).contains("already open"));
+
+        // Without the sign-in file the fixture has no token, as before.
+        let mut anonymous = Client::new(repo(), Box::new(Canned { dir: dir.clone(), created: false }), Box::new(NoSecrets));
+        assert_eq!(anonymous.create_pull(&new_pull(), NOW).unwrap_err(), Problem::NotSignedIn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_creation_goes_through_the_worker_and_the_list_follows() {
+        let stub = Stub::default();
+        let mut state = HostingState::default();
+        {
+            let stub = stub.clone();
+            state.sync_with(&hosted(), &NO_SERVERS, true, true, move |_| Box::new(stub), || {});
+        }
+        settle(&mut state, &hosted());
+        assert_eq!(stub.rounds.load(Ordering::SeqCst), 1);
+        assert!(state.connected().is_some_and(|shown| shown.remote == "origin"));
+
+        let id = state.create_pull(new_pull()).expect("connected");
+        assert!(state.is_creating(id));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let answer = loop {
+            state.poll();
+            if let Some(answer) = state.take_created(id) {
+                break answer;
+            }
+            assert!(Instant::now() < deadline, "no answer");
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(answer.unwrap().number, 42);
+        assert!(!state.is_creating(id));
+        assert_eq!(stub.created.lock().unwrap().as_slice(), [new_pull()]);
+        // Collected once only.
+        assert!(state.take_created(id).is_none());
+
+        // The list shows it straight away and is refreshed to be sure.
+        let shown = state.connected().unwrap();
+        assert_eq!(shown.view.pulls.items.first().map(|pull| pull.number), Some(42));
+        let shown = settle(&mut state, &hosted());
+        assert_eq!(stub.rounds.load(Ordering::SeqCst), 2);
+        assert!(!shown.view.busy);
+
+        // A failure comes back as it is, with no refresh.
+        stub.fail.store(true, Ordering::SeqCst);
+        let id = state.create_pull(new_pull()).unwrap();
+        let answer = loop {
+            state.poll();
+            if let Some(answer) = state.take_created(id) {
+                break answer;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(answer.unwrap_err(), Problem::Unreachable("no connection".to_owned()));
+
+        // Nothing running: nothing to ask.
+        assert!(HostingState::default().create_pull(new_pull()).is_none());
     }
 
     // ---- the background thread and the per-tab state ----
@@ -2805,6 +3404,7 @@ mod tests {
         rounds: Arc<AtomicU32>,
         looked_again: Arc<AtomicU32>,
         fail: Arc<AtomicBool>,
+        created: Arc<Mutex<Vec<NewPull>>>,
     }
 
     impl Backend for Stub {
@@ -2832,6 +3432,13 @@ mod tests {
         }
         fn blocked_until(&self, _now: u64) -> Option<u64> {
             None
+        }
+        fn create_pull(&mut self, new: &NewPull, _now: u64) -> Result<PullRequest, Problem> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(Problem::Unreachable("no connection".to_owned()));
+            }
+            self.created.lock().unwrap().push(new.clone());
+            Ok(parse_pull(CREATED).unwrap())
         }
     }
 
@@ -3693,7 +4300,7 @@ mod tests {
         std::fs::write(dir.join("merge_requests.json"), r#"[{"iid": 4, "title": "Speed up", "source_branch": "fast"}]"#).unwrap();
         std::fs::write(dir.join("pipelines.json"), r#"[{"id": 9, "status": "running"}]"#).unwrap();
 
-        let mut client = gitlab::Client::new(own_gitlab(), Box::new(Canned { dir: dir.clone() }), Box::new(NoSecrets));
+        let mut client = gitlab::Client::new(own_gitlab(), Box::new(Canned { dir: dir.clone(), created: false }), Box::new(NoSecrets));
         assert!(matches!(client.pulls(NOW), Outcome::Fresh { ref items, .. } if items[0].number == 4));
         assert!(matches!(client.runs(NOW), Outcome::Fresh { ref items, .. } if items[0].state == RunState::Running));
         // No issues.json: the project looks private.

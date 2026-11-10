@@ -80,7 +80,6 @@ pub fn parse_merge_requests(json: &str, repo: &RepoId) -> Result<Vec<PullRequest
 }
 
 /// One merge request, as the API answers its creation.
-#[cfg_attr(not(test), expect(dead_code, reason = "reached through Backend::create_pull, which nothing calls until the pull request dialog does"))]
 pub fn parse_merge_request(json: &str, repo: &RepoId) -> Result<PullRequest, String> {
     let raw: RawMergeRequest = serde_json::from_str(json).map_err(|e| e.to_string())?;
     Ok(raw.model(repo))
@@ -225,7 +224,6 @@ const FORBIDDEN: &str = "403 Forbidden";
 
 /// The body of a new merge request. GitLab has no draft flag on creation:
 /// a title starting with "Draft:" is what makes one.
-#[cfg_attr(not(test), expect(dead_code, reason = "reached through Backend::create_pull, which nothing calls until the pull request dialog does"))]
 pub fn new_merge_request(new: &NewPull) -> String {
     let title = new.title.trim();
     let lower = title.to_lowercase();
@@ -424,7 +422,6 @@ impl Client {
         }
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "reached through Backend::create_pull, which nothing calls until the pull request dialog does"))]
     fn create(&mut self, new: &NewPull, now: u64) -> Result<PullRequest, Problem> {
         let url = format!("{}/projects/{}/merge_requests", self.api, self.project);
         let body = new_merge_request(new);

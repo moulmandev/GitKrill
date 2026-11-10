@@ -99,6 +99,10 @@ Wayland; nothing else has to be installed.
 - A remote on a server other than github.com or gitlab.com is offered as
   "Connect <server>…": say whether it runs GitLab or GitHub Enterprise and
   its lists appear; right-click the remote to disconnect it again
+- Open a pull or merge request: drop a branch on the list, right-click it,
+  or use the list's + button. Title and description are filled in from
+  the commits, the branch is pushed first when the remote lacks it, and
+  "Open on GitHub" (or GitLab) works without signing in
 
 **Shell**
 - Multiple repositories in tabs, restored on start; drop a folder to open it
@@ -119,7 +123,7 @@ Three features talk to the network on their own. Each has a switch in the
 | Feature | What is sent | Where |
 | --- | --- | --- |
 | Author pictures | SHA-256 of each author's email address, or the GitHub user id from a `noreply` address | gravatar.com, avatars.githubusercontent.com |
-| Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, with a token when one is found for that host (below) | api.github.com, gitlab.com, and only the servers you connected |
+| Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, and the requests you open, with a token when one is found for that host (below) | api.github.com, gitlab.com, and only the servers you connected |
 | Automatic fetch | `git fetch --all --prune`, as you would run it | your remotes |
 
 A server other than github.com and gitlab.com is never sent anything until
@@ -192,6 +196,7 @@ src/
   ui/
     graph.rs     commit graph (graph/drag.rs: dragging branches)
     sidebar.rs   refs sidebar        hosting.rs  hosting sections
+    new_pull.rs  creating a pull or merge request
     panel.rs     staging / details   files.rs    changed-file lists
     diff.rs      diff view           highlight.rs  syntax colours
     conflict.rs  conflict resolver   rebase.rs   interactive rebase
@@ -211,8 +216,8 @@ tools/           demo repository and screenshot scripts
 
 - Undo does not cover a rebase that stopped on conflicts and was continued, or
   drag actions that switch branches first (`git reflog` still has them)
-- Pull request review state and merge request approvals; creating pull
-  requests
+- Pull request review state and merge request approvals
+- Pull and merge requests from a fork of the repository
 - Bitbucket, Gitea, Azure DevOps and other hosts; GitLab installed under a
   path (`example.com/gitlab`)
 - Interactive rebase refuses ranges that contain merge commits

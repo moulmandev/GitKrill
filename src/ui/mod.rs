@@ -9,6 +9,7 @@ pub mod highlight;
 pub mod history;
 pub mod hosting;
 pub mod palette;
+pub mod new_pull;
 pub mod panel;
 pub mod rebase;
 pub mod sidebar;

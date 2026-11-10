@@ -401,6 +401,11 @@ pub fn local_branch_menu(
         && menu_item(ui, icons::ARROW_LINE_UP, &format!("Push {} to {remote}", branch.name)) {
             tab.run(ops::push_branch(remote, &branch.name));
         }
+    if let Some(word) = tab.hosting.connected().map(|shown| shown.repo.service.pull_word())
+        && menu_item(ui, icons::GIT_PULL_REQUEST, &format!("Create {word}…"))
+    {
+        crate::ui::new_pull::open(tab, shared, Some(Branch::local(&branch.name)));
+    }
     if menu_item(ui, icons::GIT_BRANCH, "Create branch here") {
         shared.show(Dialog::CreateBranch {
             at: Some(branch.name.clone()),
@@ -478,6 +483,13 @@ pub fn remote_branch_menu(
             && menu_item(ui, icons::CLOUD, &format!("Set as upstream of {current}")) {
                 tab.run(ops::set_upstream(current, &branch.full));
             }
+    }
+    // Only for the hosted remote: a fork's branch would need its owner too.
+    if let Some(shown) = tab.hosting.connected().filter(|shown| shown.remote == branch.remote) {
+        ui.separator();
+        if menu_item(ui, icons::GIT_PULL_REQUEST, &format!("Create {}…", shown.repo.service.pull_word())) {
+            crate::ui::new_pull::open(tab, shared, Some(Branch::remote(branch)));
+        }
     }
     ui.separator();
     if menu_item(ui, icons::TRASH, &format!("Delete {}", branch.full)) {

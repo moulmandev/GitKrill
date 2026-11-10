@@ -391,6 +391,16 @@ pub fn entries(tabs: &[RepoTab], active: usize, settings: &Settings) -> Vec<Entr
     // More actions: push further entries here. `Entry::on_tab` is for
     // anything that needs the repository in front; call the function the
     // rest of the UI uses for it, and leave the entry out when it cannot run.
+    if let Some(shown) = tab.and_then(|tab| tab.hosting.connected()) {
+        let service = shown.repo.service;
+        list.push(
+            Entry::on_tab("create-pr", icons::GIT_PULL_REQUEST, format!("Create {}", service.pull_word()), |tab, shared| {
+                crate::ui::new_pull::open(tab, shared, None)
+            })
+            .detail(format!("on {}", shown.repo.site()))
+            .keywords("pull request merge request mr pr open propose"),
+        );
+    }
 
     if let Some(snap) = snap {
         branches_and_tags(&mut list, snap);
@@ -545,7 +555,7 @@ fn app_actions(list: &mut Vec<Entry>, has_tab: bool, settings: &Settings) {
         icons::GIT_PULL_REQUEST,
         settings.hosting_integration,
         ("Hide pull requests, issues and CI", "Show pull requests, issues and CI"),
-        "github hosting actions",
+        "github gitlab hosting actions pipelines merge requests",
         |s| s.hosting_integration = !s.hosting_integration,
     ));
 
