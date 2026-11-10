@@ -121,7 +121,7 @@ fn header(
 
     // Where the header painted its count: right-aligned, 12 points in.
     let count = if visible == total { total.to_string() } else { format!("{visible}/{total}") };
-    let count_width = ui.painter().layout_no_wrap(count, theme::bold(11.5), theme::ACCENT).size().x;
+    let count_width = ui.painter().layout_no_wrap(count, theme::bold(11.5), theme::accent()).size().x;
     let slot = Vec2::new(count_width.max(14.0) + 10.0, 22.0);
     let button = Rect::from_min_size(pos2(bar.right() - 7.0 - slot.x, bar.center().y - slot.y / 2.0), slot);
     let response = ui.interact(button, ui.id().with(("hosting-refresh", title)), Sense::click());
@@ -132,18 +132,18 @@ fn header(
         let painter = ui.painter();
         // Cover the count with whatever the header has behind it.
         let fill = if response.hovered() {
-            theme::BG_RAISED
+            theme::bg_raised()
         } else if over_header {
-            theme::BG_HOVER
+            theme::bg_hover()
         } else {
-            theme::BG_PANEL
+            theme::bg_panel()
         };
         painter.rect_filled(button, 4.0, fill);
         if busy {
-            spinner(painter, button.center(), 5.0, theme::ACCENT);
+            spinner(painter, button.center(), 5.0, theme::accent());
             ui.ctx().request_repaint();
         } else {
-            let color = if response.hovered() { theme::TEXT_BRIGHT } else { theme::TEXT_DIM };
+            let color = if response.hovered() { theme::text_bright() } else { theme::text_dim() };
             painter.text(button.center(), Align2::CENTER_CENTER, icons::ARROWS_CLOCKWISE, theme::font(13.0), color);
         }
     }
@@ -177,18 +177,18 @@ fn notice<T>(ui: &mut Ui, shown: &Shown, feed: &Feed<T>, act: &mut Option<Act>) 
         };
         let response = row(ui, 0, false, |painter, rect, x| {
             let y = rect.center().y;
-            painter.text(pos2(x, y), Align2::LEFT_CENTER, icon, theme::font(14.0), theme::TEXT_DIM);
+            painter.text(pos2(x, y), Align2::LEFT_CENTER, icon, theme::font(14.0), theme::text_dim());
             // The whole sentence when it fits; otherwise its short form, so
             // the part that matters (the time) is not what gets cut off.
             let room = rect.right() - 10.0 - (x + 20.0);
             let font = theme::font(12.0);
-            let full = painter.layout_no_wrap(problem.line(service), font.clone(), theme::TEXT_DIM);
+            let full = painter.layout_no_wrap(problem.line(service), font.clone(), theme::text_dim());
             let galley = if full.size().x <= room {
                 full
             } else {
-                elided(painter, &problem.brief(service), font, theme::TEXT_DIM, room)
+                elided(painter, &problem.brief(service), font, theme::text_dim(), room)
             };
-            painter.galley(pos2(x + 20.0, (y - galley.size().y / 2.0).round()), galley, theme::TEXT_DIM);
+            painter.galley(pos2(x + 20.0, (y - galley.size().y / 2.0).round()), galley, theme::text_dim());
         });
         if response.clicked() {
             *act = Some(Act::Refresh);
@@ -199,7 +199,7 @@ fn notice<T>(ui: &mut Ui, shown: &Shown, feed: &Feed<T>, act: &mut Option<Act>) 
             ui.label(problem.detail(service));
         });
     } else if !feed.loaded && shown.view.busy {
-        leaf(ui, 0, false, icons::CIRCLE_NOTCH, "Loading…", theme::TEXT_FAINT, "");
+        leaf(ui, 0, false, icons::CIRCLE_NOTCH, "Loading…", theme::text_faint(), "");
     }
 }
 
@@ -209,7 +209,7 @@ fn more<T>(ui: &mut Ui, shown: &Shown, feed: &Feed<T>, url: &str) {
         return;
     }
     let text = format!("More on {}…", shown.repo.service.name());
-    let response = leaf(ui, 0, false, icons::ARROW_SQUARE_OUT, &text, theme::TEXT_DIM, "");
+    let response = leaf(ui, 0, false, icons::ARROW_SQUARE_OUT, &text, theme::text_dim(), "");
     if opened(&response) {
         browse(url);
     }
@@ -258,7 +258,7 @@ fn item_row(
         let font = if highlighted { theme::bold(13.0) } else { theme::font(13.0) };
         let galley = elided_pair(
             painter,
-            (prefix, theme::font(13.0), theme::TEXT_DIM),
+            (prefix, theme::font(13.0), theme::text_dim()),
             (title, font, title_color),
             right - (x + 20.0),
         );
@@ -278,9 +278,9 @@ fn local_branch<'a>(snap: &'a RepoSnapshot, shown: &Shown, pr: &PullRequest) -> 
 
 fn checks_mark(checks: Checks) -> (&'static str, Color32, &'static str) {
     match checks {
-        Checks::Passing => (icons::CHECK, theme::GREEN, "Checks passed"),
-        Checks::Failing => (icons::X, theme::RED, "Checks failed"),
-        Checks::Pending => (icons::CIRCLE_NOTCH, theme::YELLOW, "Checks running"),
+        Checks::Passing => (icons::CHECK, theme::green(), "Checks passed"),
+        Checks::Failing => (icons::X, theme::red(), "Checks failed"),
+        Checks::Pending => (icons::CIRCLE_NOTCH, theme::yellow(), "Checks running"),
     }
 }
 
@@ -290,16 +290,16 @@ fn pull_row(ui: &mut Ui, snap: &RepoSnapshot, shown: &Shown, pr: &PullRequest, a
     let checks = hosting::checks_for(&pr.head_sha, &shown.view.runs.items).map(checks_mark);
 
     let (icon_color, title_color) = match (pr.draft, current) {
-        (true, _) => (theme::TEXT_FAINT, theme::TEXT_DIM),
-        (false, true) => (theme::GREEN, theme::TEXT_BRIGHT),
-        (false, false) => (theme::GREEN, theme::TEXT),
+        (true, _) => (theme::text_faint(), theme::text_dim()),
+        (false, true) => (theme::green(), theme::text_bright()),
+        (false, false) => (theme::green(), theme::text()),
     };
     let mut marks = Vec::new();
     if let Some((mark, color, _)) = checks {
         marks.push((mark, 13.0, color));
     }
     if pr.draft {
-        marks.push(("Draft", 11.0, theme::TEXT_DIM));
+        marks.push(("Draft", 11.0, theme::text_dim()));
     }
     let number = format!("#{}", pr.number);
     let response = item_row(
@@ -375,8 +375,8 @@ fn issue_row(ui: &mut Ui, shown: &Shown, issue: &Issue, act: &mut Option<Act>) {
     let response = item_row(
         ui,
         false,
-        (icons::RADIO_BUTTON, theme::GREEN),
-        (&number, &issue.title, theme::TEXT),
+        (icons::RADIO_BUTTON, theme::green()),
+        (&number, &issue.title, theme::text()),
         &[],
     );
 
@@ -407,13 +407,13 @@ fn issue_row(ui: &mut Ui, shown: &Shown, issue: &Issue, act: &mut Option<Act>) {
 
 fn run_mark(state: RunState) -> (&'static str, Color32) {
     match state {
-        RunState::Success => (icons::CHECK_CIRCLE, theme::GREEN),
-        RunState::Failure => (icons::X_CIRCLE, theme::RED),
-        RunState::Running => (icons::CIRCLE_NOTCH, theme::YELLOW),
-        RunState::Queued => (icons::CLOCK, theme::YELLOW),
-        RunState::NeedsAction => (icons::WARNING_CIRCLE, theme::ORANGE),
-        RunState::Cancelled => (icons::PROHIBIT, theme::TEXT_DIM),
-        RunState::Skipped => (icons::MINUS_CIRCLE, theme::TEXT_DIM),
+        RunState::Success => (icons::CHECK_CIRCLE, theme::green()),
+        RunState::Failure => (icons::X_CIRCLE, theme::red()),
+        RunState::Running => (icons::CIRCLE_NOTCH, theme::yellow()),
+        RunState::Queued => (icons::CLOCK, theme::yellow()),
+        RunState::NeedsAction => (icons::WARNING_CIRCLE, theme::orange()),
+        RunState::Cancelled => (icons::PROHIBIT, theme::text_dim()),
+        RunState::Skipped => (icons::MINUS_CIRCLE, theme::text_dim()),
     }
 }
 
@@ -425,16 +425,16 @@ fn run_row(ui: &mut Ui, shown: &Shown, run: &Run, now: i64, act: &mut Option<Act
         painter.text(pos2(x, y), Align2::LEFT_CENTER, icon, theme::font(14.0), color);
         let mut right = rect.right() - 10.0;
         if !when.is_empty() {
-            let used = painter.text(pos2(right, y), Align2::RIGHT_CENTER, &when, theme::font(11.0), theme::TEXT_DIM);
+            let used = painter.text(pos2(right, y), Align2::RIGHT_CENTER, &when, theme::font(11.0), theme::text_dim());
             right = used.left() - 6.0;
         }
         let galley = elided_pair(
             painter,
-            (&run.workflow, theme::font(13.0), theme::TEXT),
-            (&run.branch, theme::font(12.0), theme::TEXT_DIM),
+            (&run.workflow, theme::font(13.0), theme::text()),
+            (&run.branch, theme::font(12.0), theme::text_dim()),
             right - (x + 20.0),
         );
-        painter.galley(pos2(x + 20.0, (y - galley.size().y / 2.0).round()), galley, theme::TEXT);
+        painter.galley(pos2(x + 20.0, (y - galley.size().y / 2.0).round()), galley, theme::text());
     });
 
     let url = shown.repo.run_url(run.id);

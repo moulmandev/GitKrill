@@ -23,8 +23,8 @@ pub fn show(ctx: &egui::Context, shared: &mut Shared, tab: Option<&mut RepoTab>)
     let fresh = std::mem::take(&mut shared.dialog_fresh);
 
     let frame = Frame::new()
-        .fill(theme::BG_TOOLBAR)
-        .stroke(Stroke::new(1.0, theme::BORDER_LIGHT))
+        .fill(theme::bg_toolbar())
+        .stroke(Stroke::new(1.0, theme::border_light()))
         .corner_radius(8.0)
         .inner_margin(Margin::same(20));
     let modal = Modal::new(Id::new("gitkrill-dialog")).frame(frame).show(ctx, |ui| {
@@ -41,7 +41,7 @@ pub fn show(ctx: &egui::Context, shared: &mut Shared, tab: Option<&mut RepoTab>)
 }
 
 fn title(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).font(theme::bold(16.0)).color(theme::TEXT_BRIGHT));
+    ui.label(RichText::new(text).font(theme::bold(16.0)).color(theme::text_bright()));
     ui.add_space(2.0);
 }
 
@@ -58,9 +58,9 @@ fn buttons(ui: &mut Ui, confirm: &str, enabled: bool, danger: bool) -> Option<bo
     let mut result = None;
     ui.add_space(6.0);
     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-        let fill = if danger { theme::mix(theme::BG_APP, theme::RED, 0.7) } else { theme::mix(theme::BG_APP, theme::ACCENT, 0.8) };
+        let fill = if danger { theme::mix(theme::bg_app(), theme::red(), 0.7) } else { theme::mix(theme::bg_app(), theme::accent(), 0.8) };
         let primary = Button::new(RichText::new(confirm).color(Color32::WHITE))
-            .fill(if enabled { fill } else { theme::BG_RAISED })
+            .fill(if enabled { fill } else { theme::bg_raised() })
             .min_size(vec2(84.0, 28.0));
         if ui.add_enabled(enabled, primary).clicked() {
             result = Some(true);
@@ -104,7 +104,7 @@ fn body(
     match dialog {
         Dialog::CreateBranch { at, at_label, name, checkout } => {
             title(ui, "Create branch");
-            ui.label(RichText::new(format!("Starting at {at_label}")).color(theme::TEXT_DIM));
+            ui.label(RichText::new(format!("Starting at {at_label}")).color(theme::text_dim()));
             field(ui, name, "Branch name", fresh);
             sanitize_ref(name);
             ui.checkbox(checkout, "Check out the new branch");
@@ -113,7 +113,7 @@ fn body(
                 .and_then(|t| t.snap.as_ref())
                 .is_some_and(|s| s.branches.iter().any(|b| b.name == name.trim()));
             if exists {
-                ui.colored_label(theme::ORANGE, "A branch with this name already exists.");
+                ui.colored_label(theme::orange(), "A branch with this name already exists.");
             }
             match buttons(ui, "Create", valid_ref(name) && !exists, false) {
                 Some(true) => {
@@ -129,7 +129,7 @@ fn body(
 
         Dialog::RenameBranch { old, name } => {
             title(ui, "Rename branch");
-            ui.label(RichText::new(format!("Renaming {old}")).color(theme::TEXT_DIM));
+            ui.label(RichText::new(format!("Renaming {old}")).color(theme::text_dim()));
             field(ui, name, "New name", fresh);
             sanitize_ref(name);
             match buttons(ui, "Rename", valid_ref(name) && name.trim() != old, false) {
@@ -146,7 +146,7 @@ fn body(
 
         Dialog::CreateTag { at, at_label, name, message } => {
             title(ui, "Create tag");
-            ui.label(RichText::new(format!("Tagging {at_label}")).color(theme::TEXT_DIM));
+            ui.label(RichText::new(format!("Tagging {at_label}")).color(theme::text_dim()));
             field(ui, name, "Tag name", fresh);
             sanitize_ref(name);
             field(ui, message, "Message (optional, makes the tag annotated)", false);
@@ -166,7 +166,7 @@ fn body(
             title(ui, "Stash changes");
             ui.label(
                 RichText::new("All changes, including untracked files, are saved and removed from the working tree.")
-                    .color(theme::TEXT_DIM),
+                    .color(theme::text_dim()),
             );
             field(ui, message, "Message (optional)", fresh);
             match buttons(ui, "Stash", true, false) {
@@ -183,7 +183,7 @@ fn body(
 
         Dialog::Confirm { title: heading, body, button, danger, cmd } => {
             title(ui, heading);
-            ui.label(RichText::new(body.as_str()).color(theme::TEXT));
+            ui.label(RichText::new(body.as_str()).color(theme::text()));
             match buttons(ui, button, true, *danger) {
                 Some(true) => {
                     if let Some(tab) = tab {
@@ -207,7 +207,7 @@ fn body(
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let Some(tab) = tab else { return };
                 let pull = Button::new(RichText::new("Pull (rebase)").color(Color32::WHITE))
-                    .fill(theme::mix(theme::BG_APP, theme::ACCENT, 0.8))
+                    .fill(theme::mix(theme::bg_app(), theme::accent(), 0.8))
                     .min_size(vec2(96.0, 28.0));
                 if ui.add(pull).clicked() {
                     tab.run(ops::pull(PullMode::Rebase));
@@ -218,7 +218,7 @@ fn body(
                     outcome = Outcome::Close;
                 }
                 let force = Button::new(RichText::new("Force push").color(Color32::WHITE))
-                    .fill(theme::mix(theme::BG_APP, theme::RED, 0.7))
+                    .fill(theme::mix(theme::bg_app(), theme::red(), 0.7))
                     .min_size(vec2(90.0, 28.0));
                 if ui.add(force).clicked() {
                     if let Some(cmd) = push_cmd(tab, true) {
@@ -266,7 +266,7 @@ fn body(
                      in-process through libgit2; everything that changes the repository runs \
                      through your installed git, so hooks, signing and credentials behave as usual.",
                 )
-                .color(theme::TEXT_DIM),
+                .color(theme::text_dim()),
             );
             ui.add_space(6.0);
             let mut outcome = Outcome::Keep;
@@ -322,38 +322,38 @@ pub fn toasts(ctx: &egui::Context, shared: &mut Shared, tab: Option<&RepoTab>) {
             ui.spacing_mut().item_spacing.y = 8.0;
             for label in &running {
                 Frame::new()
-                    .fill(theme::BG_RAISED)
-                    .stroke(Stroke::new(1.0, theme::mix(theme::BG_RAISED, theme::ACCENT, 0.55)))
+                    .fill(theme::bg_raised())
+                    .stroke(Stroke::new(1.0, theme::mix(theme::bg_raised(), theme::accent(), 0.55)))
                     .corner_radius(6.0)
                     .inner_margin(Margin::symmetric(12, 9))
                     .show(ui, |ui| {
                         ui.set_width(380.0);
                         ui.horizontal(|ui| {
                             let (rect, _) = ui.allocate_exact_size(vec2(16.0, 16.0), egui::Sense::hover());
-                            crate::ui::widgets::spinner(ui.painter(), rect.center(), 6.5, theme::ACCENT);
+                            crate::ui::widgets::spinner(ui.painter(), rect.center(), 6.5, theme::accent());
                             ui.label(
                                 RichText::new(format!("{label} in progress…"))
                                     .font(theme::bold(13.0))
-                                    .color(theme::TEXT_BRIGHT),
+                                    .color(theme::text_bright()),
                             );
                         });
                     });
             }
             for (i, toast) in shared.toasts.iter().enumerate() {
                 let (accent, icon) = match toast.kind {
-                    ToastKind::Success => (theme::GREEN, icons::CHECK_CIRCLE),
-                    ToastKind::Error => (theme::RED, icons::WARNING_CIRCLE),
+                    ToastKind::Success => (theme::green(), icons::CHECK_CIRCLE),
+                    ToastKind::Error => (theme::red(), icons::WARNING_CIRCLE),
                 };
                 Frame::new()
-                    .fill(theme::BG_RAISED)
-                    .stroke(Stroke::new(1.0, theme::mix(theme::BG_RAISED, accent, 0.55)))
+                    .fill(theme::bg_raised())
+                    .stroke(Stroke::new(1.0, theme::mix(theme::bg_raised(), accent, 0.55)))
                     .corner_radius(6.0)
                     .inner_margin(Margin::symmetric(12, 9))
                     .show(ui, |ui| {
                         ui.set_width(380.0);
                         ui.horizontal(|ui| {
                             ui.label(RichText::new(icon).size(16.0).color(accent));
-                            ui.label(RichText::new(&toast.title).font(theme::bold(13.0)).color(theme::TEXT_BRIGHT));
+                            ui.label(RichText::new(&toast.title).font(theme::bold(13.0)).color(theme::text_bright()));
                             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                                 if icon_button(ui, icons::X, 11.0, "").clicked() {
                                     dismiss = Some(i);
@@ -368,7 +368,7 @@ pub fn toasts(ctx: &egui::Context, shared: &mut Shared, tab: Option<&RepoTab>) {
                         if !toast.body.is_empty() {
                             // Git errors can be long; keep the toast a sane size.
                             let shown: String = toast.body.lines().take(8).collect::<Vec<_>>().join("\n");
-                            ui.label(RichText::new(shown).size(12.0).color(theme::TEXT_DIM));
+                            ui.label(RichText::new(shown).size(12.0).color(theme::text_dim()));
                         }
                     });
             }

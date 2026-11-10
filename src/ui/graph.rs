@@ -267,7 +267,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                     Align2::CENTER_CENTER,
                     "Loading older commits…",
                     theme::font(12.0),
-                    theme::TEXT_FAINT,
+                    theme::text_faint(),
                 );
                 if last >= rows {
                     tab.load_more();
@@ -312,11 +312,11 @@ fn scroll_near_edges(ui: &Ui) {
 
 fn header(ui: &mut Ui, rect: Rect, cols: &Columns, settings: &mut Settings, refs_w: f32, graph_w: f32) {
     let painter = ui.painter().clone();
-    painter.rect_filled(rect, 0.0, theme::BG_HEADER);
-    painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+    painter.rect_filled(rect, 0.0, theme::bg_header());
+    painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::border()));
 
     let label = |x: f32, text: &str| {
-        painter.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, text, theme::font(10.5), theme::TEXT_DIM);
+        painter.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, text, theme::font(10.5), theme::text_dim());
     };
     label(cols.refs.min + 10.0, "BRANCH  /  TAG");
     label(cols.graph.min + 8.0, "GRAPH");
@@ -352,7 +352,7 @@ fn header(ui: &mut Ui, rect: Rect, cols: &Columns, settings: &mut Settings, refs
         painter.vline(
             x,
             rect.y_range(),
-            Stroke::new(1.0, if active { theme::ACCENT } else { theme::BORDER_LIGHT }),
+            Stroke::new(1.0, if active { theme::accent() } else { theme::border_light() }),
         );
     }
 
@@ -363,11 +363,11 @@ fn header(ui: &mut Ui, rect: Rect, cols: &Columns, settings: &mut Settings, refs
         Align2::CENTER_CENTER,
         icons::GEAR,
         theme::font(14.0),
-        if response.hovered() { theme::TEXT_BRIGHT } else { theme::TEXT_DIM },
+        if response.hovered() { theme::text_bright() } else { theme::text_dim() },
     );
     Popup::menu(&response).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
         ui.set_min_width(170.0);
-        ui.label(egui::RichText::new("Columns").color(theme::TEXT_DIM).size(11.0));
+        ui.label(egui::RichText::new("Columns").color(theme::text_dim()).size(11.0));
         ui.checkbox(&mut settings.show_author, "Author");
         ui.checkbox(&mut settings.show_date, "Date");
         ui.checkbox(&mut settings.show_sha, "SHA");
@@ -477,12 +477,12 @@ fn paint_row(
 
     match commit.kind {
         RowKind::Wip => {
-            gp.circle_filled(node, NODE_R, theme::BG_APP);
+            gp.circle_filled(node, NODE_R, theme::bg_app());
             gp.extend(dashed_circle(node, NODE_R - 1.0, Stroke::new(1.5, color)));
         }
         RowKind::Stash => {
             let tile = Rect::from_center_size(node, vec2(NODE_R * 2.0 - 2.0, NODE_R * 2.0 - 2.0));
-            gp.rect(tile, 4.0, theme::BG_APP, Stroke::new(1.5, color), StrokeKind::Inside);
+            gp.rect(tile, 4.0, theme::bg_app(), Stroke::new(1.5, color), StrokeKind::Inside);
             gp.text(node, Align2::CENTER_CENTER, icons::ARCHIVE, theme::font(12.0), color);
         }
         RowKind::Commit if commit.parents.len() > 1 => {
@@ -508,7 +508,7 @@ fn paint_row(
 
     match commit.kind {
         RowKind::Wip => {
-            let galley = mp.layout_no_wrap("// WIP".to_owned(), theme::font(13.0), theme::TEXT_DIM);
+            let galley = mp.layout_no_wrap("// WIP".to_owned(), theme::font(13.0), theme::text_dim());
             let field = Rect::from_min_size(
                 pos2(text_x - 4.0, cy - 10.0),
                 vec2((galley.size().x + 60.0).min(max_w), 20.0),
@@ -516,19 +516,19 @@ fn paint_row(
             mp.rect_filled(field, 3.0, theme::with_alpha(Color32::BLACK, 70));
             widgets::galley_left(&mp, rect, text_x + 4.0, galley);
             let x = field.right() + 12.0;
-            let w = widgets::text_left(&mp, rect, x, icons::PENCIL_SIMPLE, theme::font(14.0), theme::YELLOW);
-            widgets::text_left(&mp, rect, x + w + 5.0, &file_count.to_string(), theme::font(13.0), theme::TEXT);
+            let w = widgets::text_left(&mp, rect, x, icons::PENCIL_SIMPLE, theme::font(14.0), theme::yellow());
+            widgets::text_left(&mp, rect, x + w + 5.0, &file_count.to_string(), theme::font(13.0), theme::text());
         }
         RowKind::Stash => {
-            let galley = elided(&mp, &commit.summary, theme::font(13.0), theme::TEXT_DIM, max_w);
+            let galley = elided(&mp, &commit.summary, theme::font(13.0), theme::text_dim(), max_w);
             widgets::galley_left(&mp, rect, text_x, galley);
         }
         RowKind::Commit => {
-            let summary_color = if selected { theme::TEXT_BRIGHT } else { theme::TEXT };
+            let summary_color = if selected { theme::text_bright() } else { theme::text() };
             let galley = elided_pair(
                 &mp,
                 (&commit.summary, theme::font(13.0), summary_color),
-                (&commit.body_preview, theme::font(13.0), theme::TEXT_FAINT),
+                (&commit.body_preview, theme::font(13.0), theme::text_faint()),
                 max_w,
             );
             widgets::galley_left(&mp, rect, text_x, galley);
@@ -539,7 +539,7 @@ fn paint_row(
     if commit.kind != RowKind::Wip {
         let cell = |range: Option<Rangef>, text: &str, font: egui::FontId| {
             let Some(range) = range else { return };
-            let galley = elided(&painter, text, font, theme::TEXT_DIM, range.span() - 14.0);
+            let galley = elided(&painter, text, font, theme::text_dim(), range.span() - 14.0);
             widgets::galley_left(&painter, rect, range.min + 8.0, galley);
         };
         cell(cols.author, &commit.author, theme::font(12.5));
@@ -677,9 +677,9 @@ pub fn layout_pills(painter: &Painter, rect: Rect, cols: &Columns, labels: &[Ref
 fn pill_text_colors(label: &RefLabel) -> (Color32, Color32) {
     match label.kind {
         _ if label.is_head => (Color32::WHITE, Color32::WHITE),
-        RefKind::Local | RefKind::Head => (theme::TEXT_BRIGHT, theme::TEXT),
-        RefKind::Remote => (theme::TEXT, theme::TEXT_DIM),
-        RefKind::Tag => (theme::TEXT, theme::YELLOW),
+        RefKind::Local | RefKind::Head => (theme::text_bright(), theme::text()),
+        RefKind::Remote => (theme::text(), theme::text_dim()),
+        RefKind::Tag => (theme::text(), theme::yellow()),
     }
 }
 
@@ -716,14 +716,14 @@ fn paint_pills(
                 p.rect_filled(pill.rect, 3.0, theme::mix(Color32::BLACK, color, 0.82));
             }
             PillStyle::Local => {
-                p.rect_filled(pill.rect, 3.0, theme::mix(theme::BG_APP, color, 0.34));
+                p.rect_filled(pill.rect, 3.0, theme::mix(theme::bg_app(), color, 0.34));
             }
             PillStyle::Outline => {
                 p.rect(
                     pill.rect,
                     3.0,
-                    theme::mix(theme::BG_APP, color, 0.08),
-                    Stroke::new(1.0, theme::mix(theme::BG_APP, color, 0.75)),
+                    theme::mix(theme::bg_app(), color, 0.08),
+                    Stroke::new(1.0, theme::mix(theme::bg_app(), color, 0.75)),
                     StrokeKind::Inside,
                 );
             }
@@ -744,7 +744,7 @@ fn paint_pills(
             Align2::LEFT_CENTER,
             format!("+{}", pills.hidden),
             theme::font(11.0),
-            theme::TEXT_DIM,
+            theme::text_dim(),
         );
         end = used.right() + 4.0;
     }
@@ -1003,7 +1003,7 @@ fn search_bar(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot) {
     let mut jump: i32 = 0;
     let mut close = false;
     egui::Frame::new()
-        .fill(theme::BG_PANEL)
+        .fill(theme::bg_panel())
         .inner_margin(egui::Margin::symmetric(8, 5))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1028,7 +1028,7 @@ fn search_bar(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot) {
                     } else {
                         format!("{position} / {}", tab.search_hits.len())
                     };
-                    ui.label(egui::RichText::new(count).color(theme::TEXT_DIM).size(12.0));
+                    ui.label(egui::RichText::new(count).color(theme::text_dim()).size(12.0));
 
                     let response = ui.add(
                         TextEdit::singleline(&mut tab.search)

@@ -113,10 +113,10 @@ pub fn file_list(
                         widgets::row_background(&painter, rect, false, response.hovered());
                         let x = rect.left() + 10.0 + *depth as f32 * INDENT;
                         let caret = if *collapsed { icons::CARET_RIGHT } else { icons::CARET_DOWN };
-                        painter.text(pos2(x, y), Align2::LEFT_CENTER, caret, theme::font(10.0), theme::TEXT_DIM);
+                        painter.text(pos2(x, y), Align2::LEFT_CENTER, caret, theme::font(10.0), theme::text_dim());
                         let icon = if *collapsed { icons::FOLDER } else { icons::FOLDER_OPEN };
-                        painter.text(pos2(x + 14.0, y), Align2::LEFT_CENTER, icon, theme::font(14.0), theme::TEXT_DIM);
-                        let galley = elided(&painter, name, theme::font(13.0), theme::TEXT_DIM, rect.right() - x - 44.0);
+                        painter.text(pos2(x + 14.0, y), Align2::LEFT_CENTER, icon, theme::font(14.0), theme::text_dim());
+                        let galley = elided(&painter, name, theme::font(13.0), theme::text_dim(), rect.right() - x - 44.0);
                         widgets::galley_left(&painter, rect, x + 34.0, galley);
 
                         if response.clicked() {
@@ -155,8 +155,8 @@ pub fn file_list(
 
                         // The action button appears on hover, so reserve its room then.
                         let action = match source {
-                            DiffSource::Unstaged => Some(("Stage File", theme::GREEN)),
-                            DiffSource::Staged => Some(("Unstage File", theme::RED)),
+                            DiffSource::Unstaged => Some(("Stage File", theme::green())),
+                            DiffSource::Staged => Some(("Unstage File", theme::red())),
                             DiffSource::Commit(_) => None,
                         };
                         let hovering = ui.rect_contains_pointer(rect);
@@ -287,7 +287,7 @@ fn paint_path(
     name: &str,
     selected: bool,
 ) {
-    let name_color = if selected { theme::TEXT_BRIGHT } else { theme::TEXT };
+    let name_color = if selected { theme::text_bright() } else { theme::text() };
     let width = (right - left).max(0.0);
     let clip = Rect::from_min_max(pos2(left, rect.top()), pos2(right, rect.bottom()));
     let p = painter.with_clip_rect(clip.intersect(painter.clip_rect()));
@@ -299,14 +299,14 @@ fn paint_path(
         return;
     }
 
-    let dir_galley = p.layout_no_wrap(dir.to_owned(), theme::font(13.0), theme::TEXT_DIM);
+    let dir_galley = p.layout_no_wrap(dir.to_owned(), theme::font(13.0), theme::text_dim());
     let total = dir_galley.size().x + name_galley.size().x;
     if total <= width {
         let w = widgets::galley_left(&p, rect, left, dir_galley);
         widgets::galley_left(&p, rect, left + w, name_galley);
     } else {
         // Right-align and mark the cut with an ellipsis.
-        let ellipsis = p.layout_no_wrap("…".to_owned(), theme::font(13.0), theme::TEXT_DIM);
+        let ellipsis = p.layout_no_wrap("…".to_owned(), theme::font(13.0), theme::text_dim());
         let start = right - total;
         let cut = Rect::from_min_max(
             pos2(left + ellipsis.size().x + 1.0, rect.top()),

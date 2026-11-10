@@ -158,10 +158,10 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, view: &mut Hist
     };
     if let Some(oid) = view.jump {
         // Still here, so the graph has not loaded that commit yet.
-        let strip = strip(ui, theme::mix(theme::BG_HEADER, theme::ACCENT, 0.12));
-        widgets::spinner(ui.painter(), pos2(strip.left() + 18.0, strip.center().y), 6.0, theme::ACCENT);
+        let strip = strip(ui, theme::mix(theme::bg_header(), theme::accent(), 0.12));
+        widgets::spinner(ui.painter(), pos2(strip.left() + 18.0, strip.center().y), 6.0, theme::accent());
         let text = format!("Loading older commits into the graph to reach {}…", short(oid));
-        widgets::text_left(ui.painter(), strip, strip.left() + 34.0, &text, theme::font(12.0), theme::TEXT);
+        widgets::text_left(ui.painter(), strip, strip.left() + 34.0, &text, theme::font(12.0), theme::text());
         ui.ctx().request_repaint();
     }
 
@@ -227,7 +227,7 @@ fn title_bar(ui: &mut Ui, view: &mut HistoryView) -> bool {
                 );
                 if !view.back.is_empty() {
                     let label = format!("{}  Back", icons::ARROW_LEFT);
-                    back = tint_button(ui, &label, theme::ACCENT)
+                    back = tint_button(ui, &label, theme::accent())
                         .on_hover_text("Return to the version of the file shown before")
                         .clicked();
                 }
@@ -236,7 +236,7 @@ fn title_bar(ui: &mut Ui, view: &mut HistoryView) -> bool {
         )
         .inner;
     let cover = Rect::from_min_max(pos2(used.left() - 12.0, area.top()), area.max);
-    ui.painter().set(patch, Shape::rect_filled(cover, 0.0, theme::BG_HEADER));
+    ui.painter().set(patch, Shape::rect_filled(cover, 0.0, theme::bg_header()));
 
     view.mode = if blame { Mode::Blame } else { Mode::History };
     if back {
@@ -289,16 +289,16 @@ fn to_pixel(ui: &Ui, x: f32) -> f32 {
 fn strip(ui: &mut Ui, fill: Color32) -> Rect {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), STRIP_H), Sense::hover());
     ui.painter().rect_filled(rect, 0.0, fill);
-    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::border()));
     rect
 }
 
 /// A one-line notice with a leading icon, cut off if it does not fit.
 fn notice(ui: &mut Ui, icon: &str, color: Color32, text: &str) -> Rect {
-    let rect = strip(ui, theme::mix(theme::BG_PANEL, color, 0.10));
+    let rect = strip(ui, theme::mix(theme::bg_panel(), color, 0.10));
     let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     painter.text(pos2(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER, icon, theme::font(14.0), color);
-    let galley = elided(&painter, text, theme::font(12.0), theme::TEXT, rect.width() - 44.0);
+    let galley = elided(&painter, text, theme::font(12.0), theme::text(), rect.width() - 44.0);
     galley_left(&painter, rect, rect.left() + 34.0, galley);
     rect
 }
@@ -316,13 +316,13 @@ fn action_button(ui: &mut Ui, compact: bool, icon: &str, label: &str, hint: &str
 /// A spinner with a caption, filling the remaining space.
 fn busy(ui: &mut Ui, text: &str) {
     let rect = ui.available_rect_before_wrap();
-    widgets::spinner(ui.painter(), rect.center() - vec2(0.0, 14.0), 10.0, theme::ACCENT);
+    widgets::spinner(ui.painter(), rect.center() - vec2(0.0, 14.0), 10.0, theme::accent());
     ui.painter().text(
         rect.center() + vec2(0.0, 14.0),
         Align2::CENTER_CENTER,
         text,
         theme::font(13.0),
-        theme::TEXT_DIM,
+        theme::text_dim(),
     );
     ui.allocate_rect(rect, Sense::hover());
     ui.ctx().request_repaint();
@@ -565,7 +565,7 @@ fn history_mode(
         Rect::from_min_max(avail.min, pos2(detail.left() - 1.0, avail.bottom()))
     };
 
-    ui.painter().rect_filled(list, 0.0, theme::BG_PANEL);
+    ui.painter().rect_filled(list, 0.0, theme::bg_panel());
     ui.scope_builder(UiBuilder::new().max_rect(list), |ui| {
         ui.set_clip_rect(list.intersect(ui.clip_rect()));
         history_list(ui, tab, snap, view, action);
@@ -576,7 +576,7 @@ fn history_mode(
     });
 
     if stacked {
-        ui.painter().hline(avail.x_range(), list.bottom(), Stroke::new(1.0, theme::BORDER));
+        ui.painter().hline(avail.x_range(), list.bottom(), Stroke::new(1.0, theme::border()));
         return;
     }
     // The edge between the two can be dragged.
@@ -591,7 +591,7 @@ fn history_mode(
     ui.painter().vline(
         list.right(),
         avail.y_range(),
-        Stroke::new(1.0, if active { theme::ACCENT } else { theme::BORDER }),
+        Stroke::new(1.0, if active { theme::accent() } else { theme::border() }),
     );
 }
 
@@ -610,12 +610,12 @@ fn history_list(
             Some(old) => format!("Renamed from {old}, not committed yet."),
             None => "This file has uncommitted changes, which are not listed.".to_owned(),
         };
-        let rect = notice(ui, icons::PENCIL_SIMPLE, theme::YELLOW, &text);
+        let rect = notice(ui, icons::PENCIL_SIMPLE, theme::yellow(), &text);
         if file.kind != ChangeKind::Conflicted {
             let size = widgets::tint_button_size(ui, "View");
             let button = Rect::from_min_size(pos2(rect.right() - size.x - 8.0, rect.center().y - size.y / 2.0), size);
-            ui.painter().rect_filled(button.expand2(vec2(8.0, 2.0)), 0.0, theme::mix(theme::BG_PANEL, theme::YELLOW, 0.10));
-            if widgets::tint_button_at(ui, button, "View", theme::YELLOW)
+            ui.painter().rect_filled(button.expand2(vec2(8.0, 2.0)), 0.0, theme::mix(theme::bg_panel(), theme::yellow(), 0.10));
+            if widgets::tint_button_at(ui, button, "View", theme::yellow())
                 .on_hover_text("Close this view and open the uncommitted changes")
                 .clicked()
             {
@@ -631,7 +631,7 @@ fn history_list(
         notice(
             ui,
             icons::INFO,
-            theme::BLUE,
+            theme::blue(),
             &format!("The file does not exist {place}. This is its history up to the deletion."),
         );
     }
@@ -700,19 +700,19 @@ fn history_list(
             let footer = row_rect(rows);
             if last >= rows && ui.is_rect_visible(footer) {
                 if let Some(e) = &history.error {
-                    let galley = elided(&painter, e, theme::font(12.0), theme::RED, footer.width() - 24.0);
+                    let galley = elided(&painter, e, theme::font(12.0), theme::red(), footer.width() - 24.0);
                     galley_left(&painter, footer, footer.left() + 12.0, galley);
                 } else if history.done {
                     let text = if rows == 1 { "1 commit".to_owned() } else { format!("{rows} commits") };
-                    painter.text(footer.center(), Align2::CENTER_CENTER, text, theme::font(12.0), theme::TEXT_FAINT);
+                    painter.text(footer.center(), Align2::CENTER_CENTER, text, theme::font(12.0), theme::text_faint());
                 } else {
-                    widgets::spinner(&painter, pos2(footer.center().x - 86.0, footer.center().y), 6.0, theme::TEXT_DIM);
+                    widgets::spinner(&painter, pos2(footer.center().x - 86.0, footer.center().y), 6.0, theme::text_dim());
                     painter.text(
                         footer.center() + vec2(8.0, 0.0),
                         Align2::CENTER_CENTER,
                         "Looking further back…",
                         theme::font(12.0),
-                        theme::TEXT_DIM,
+                        theme::text_dim(),
                     );
                     want_more = true;
                     ui.ctx().request_repaint();
@@ -736,7 +736,7 @@ fn paint_commit_row(
     hovered: bool,
 ) {
     widgets::row_background(painter, rect, selected, hovered);
-    painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::with_alpha(theme::BORDER, 110)));
+    painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::with_alpha(theme::border(), 110)));
     let painter = painter.with_clip_rect(rect.intersect(painter.clip_rect()));
 
     let upper = Rect::from_min_max(rect.min + vec2(0.0, 5.0), pos2(rect.right(), rect.center().y + 1.0));
@@ -746,7 +746,7 @@ fn paint_commit_row(
 
     widgets::avatar(&painter, pos2(rect.left() + 24.0, rect.center().y), 13.0, &commit.author, &commit.email, None);
     // The selection fill needs brighter text than the panel does.
-    let (dim, faint) = if selected { (theme::TEXT, theme::TEXT) } else { (theme::TEXT_DIM, theme::TEXT_FAINT) };
+    let (dim, faint) = if selected { (theme::text(), theme::text()) } else { (theme::text_dim(), theme::text_faint()) };
 
     // First line: summary, then what happened to the file and the SHA.
     let sha = painter.layout_no_wrap(short(commit.oid), theme::mono(11.5), dim);
@@ -757,14 +757,14 @@ fn paint_commit_row(
         painter.text(pos2(summary_right, upper.center().y), Align2::RIGHT_CENTER, icon, theme::font(13.0), color);
         summary_right -= 22.0;
     }
-    let color = if selected { theme::TEXT_BRIGHT } else { theme::TEXT };
+    let color = if selected { theme::text_bright() } else { theme::text() };
     let summary = elided(&painter, &commit.summary, theme::font(13.0), color, summary_right - left);
     galley_left(&painter, upper, left, summary);
 
     // Second line: who and when, then the file's name at the time when it
     // was not today's.
     let was = match &commit.old_path {
-        Some(old) => Some((format!("{old}  {}  {}", icons::ARROW_RIGHT, commit.path), theme::BLUE)),
+        Some(old) => Some((format!("{old}  {}  {}", icons::ARROW_RIGHT, commit.path), theme::blue())),
         None if commit.path != current_path => Some((commit.path.clone(), dim)),
         None => None,
     };
@@ -801,8 +801,8 @@ fn history_detail(
     let top = ui.available_rect_before_wrap().top();
     let height = to_pixel(ui, top + HEADER_H) - top;
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, theme::BG_HEADER);
-    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+    ui.painter().rect_filled(rect, 0.0, theme::bg_header());
+    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::border()));
 
     let compact = rect.width() < COMPACT_DIFF_BELOW;
     let mut buttons_left = rect.right();
@@ -818,7 +818,7 @@ fn history_detail(
                 icons::GIT_COMMIT,
                 "Show in graph",
                 "Close this view and select the commit in the graph (double-click)",
-                theme::ACCENT,
+                theme::accent(),
             ) {
                 *action = Some(Action::ShowInGraph(commit.oid));
             }
@@ -829,7 +829,7 @@ fn history_detail(
                     icons::USER_LIST,
                     "Blame at this commit",
                     "Blame the file as this commit left it",
-                    theme::BLUE,
+                    theme::blue(),
                 )
             {
                 *action = Some(Action::BlameAt(commit.oid, commit.path.clone()));
@@ -844,7 +844,7 @@ fn history_detail(
     let width = text_clip.right() - left;
     let upper = Rect::from_min_max(rect.min + vec2(0.0, 7.0), pos2(rect.right(), rect.center().y + 1.0));
     let lower = Rect::from_min_max(pos2(rect.left(), rect.center().y), rect.max - vec2(0.0, 7.0));
-    let summary = elided(&painter, &commit.summary, theme::bold(13.5), theme::TEXT_BRIGHT, width);
+    let summary = elided(&painter, &commit.summary, theme::bold(13.5), theme::text_bright(), width);
     galley_left(&painter, upper, left, summary);
 
     let what = format!("{}   {}", commit.author, format_time(commit.time));
@@ -856,8 +856,8 @@ fn history_detail(
     }
     let line = widgets::elided_pair(
         &painter,
-        (&what, theme::font(12.0), theme::TEXT_DIM),
-        (&change, theme::mono(11.5), theme::TEXT_FAINT),
+        (&what, theme::font(12.0), theme::text_dim()),
+        (&change, theme::mono(11.5), theme::text_faint()),
         width,
     );
     galley_left(&painter, lower, left, line);
@@ -1051,7 +1051,7 @@ fn blame_mode(
         notice(
             ui,
             icons::INFO,
-            theme::BLUE,
+            theme::blue(),
             "The file is deleted in the working tree. This is the version at HEAD.",
         );
     }
@@ -1065,20 +1065,20 @@ fn blame_mode(
 
 /// From cool for the oldest lines to warm for the newest.
 fn heat_color(heat: f32) -> Color32 {
-    theme::mix(theme::BLUE, theme::ORANGE, heat.clamp(0.0, 1.0))
+    theme::mix(theme::blue(), theme::orange(), heat.clamp(0.0, 1.0))
 }
 
 /// The colour that stands for a commit's age in the blame.
 fn age_color(commit: &BlameCommit, heat: f32) -> Color32 {
-    if commit.is_uncommitted() { theme::GREEN } else { heat_color(heat) }
+    if commit.is_uncommitted() { theme::green() } else { heat_color(heat) }
 }
 
 /// The band above the blamed file: the selected commit and what can be done
 /// with it, or how to read the view when nothing is selected.
 fn blame_strip(ui: &mut Ui, blame: &Blame, selected: Option<usize>, action: &mut Option<Action>) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, theme::BG_PANEL);
-    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+    ui.painter().rect_filled(rect, 0.0, theme::bg_panel());
+    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::border()));
     let left = rect.left() + 14.0;
 
     let Some(commit) = selected.map(|index| &blame.commits[index]) else {
@@ -1086,7 +1086,7 @@ fn blame_strip(ui: &mut Ui, blame: &Blame, selected: Option<usize>, action: &mut
         // A legend for the colours, and beside it how to use the view.
         let mut x = rect.right() - 14.0;
         x -= painter
-            .text(pos2(x, rect.center().y), Align2::RIGHT_CENTER, "newer", theme::font(11.5), theme::TEXT_DIM)
+            .text(pos2(x, rect.center().y), Align2::RIGHT_CENTER, "newer", theme::font(11.5), theme::text_dim())
             .width()
             + 8.0;
         const STEPS: usize = 8;
@@ -1096,14 +1096,14 @@ fn blame_strip(ui: &mut Ui, blame: &Blame, selected: Option<usize>, action: &mut
             x -= 14.0;
         }
         x -= painter
-            .text(pos2(x - 8.0, rect.center().y), Align2::RIGHT_CENTER, "older", theme::font(11.5), theme::TEXT_DIM)
+            .text(pos2(x - 8.0, rect.center().y), Align2::RIGHT_CENTER, "older", theme::font(11.5), theme::text_dim())
             .width()
             + 24.0;
         let hint = elided(
             &painter,
             "Click a block to select its commit. Hover for the full summary.",
             theme::font(12.0),
-            theme::TEXT_DIM,
+            theme::text_dim(),
             x - left,
         );
         galley_left(&painter, rect, left, hint);
@@ -1131,7 +1131,7 @@ fn blame_strip(ui: &mut Ui, blame: &Blame, selected: Option<usize>, action: &mut
                             "Blame the file as it was just before this commit, to see where these lines came from",
                         )
                     };
-                    if action_button(ui, compact, icons::ARROW_BEND_UP_LEFT, label, hint, theme::BLUE) {
+                    if action_button(ui, compact, icons::ARROW_BEND_UP_LEFT, label, hint, theme::blue()) {
                         *action = Some(Action::BlameAt(*parent, path.clone()));
                     }
                 }
@@ -1140,7 +1140,7 @@ fn blame_strip(ui: &mut Ui, blame: &Blame, selected: Option<usize>, action: &mut
                     ui.label(
                         egui::RichText::new("The file starts with this commit")
                             .size(11.5)
-                            .color(theme::TEXT_FAINT),
+                            .color(theme::text_faint()),
                     );
                 }
             }
@@ -1151,7 +1151,7 @@ fn blame_strip(ui: &mut Ui, blame: &Blame, selected: Option<usize>, action: &mut
                     icons::GIT_COMMIT,
                     "Show in graph",
                     "Close this view and select the commit in the graph",
-                    theme::ACCENT,
+                    theme::accent(),
                 )
             {
                 *action = Some(Action::ShowInGraph(commit.oid));
@@ -1164,15 +1164,15 @@ fn blame_strip(ui: &mut Ui, blame: &Blame, selected: Option<usize>, action: &mut
     let painter = ui.painter().with_clip_rect(clip.intersect(ui.clip_rect()));
     let mut x = left;
     if commit.is_uncommitted() {
-        widgets::text_left(&painter, rect, x, "Uncommitted changes", theme::bold(13.0), theme::TEXT_BRIGHT);
+        widgets::text_left(&painter, rect, x, "Uncommitted changes", theme::bold(13.0), theme::text_bright());
         return;
     }
-    x += widgets::text_left(&painter, rect, x, &short(commit.oid), theme::mono(12.0), theme::ACCENT) + 10.0;
+    x += widgets::text_left(&painter, rect, x, &short(commit.oid), theme::mono(12.0), theme::accent()) + 10.0;
     let who = format!("{}   {}", commit.author, format_time(commit.time));
     let line = widgets::elided_pair(
         &painter,
-        (&commit.summary, theme::bold(13.0), theme::TEXT_BRIGHT),
-        (&who, theme::font(12.0), theme::TEXT_DIM),
+        (&commit.summary, theme::bold(13.0), theme::text_bright()),
+        (&who, theme::font(12.0), theme::text_dim()),
         clip.right() - x,
     );
     galley_left(&painter, rect, x, line);
@@ -1211,7 +1211,7 @@ fn blame_body(ui: &mut Ui, blame: &Blame, heat: &[f32], selected: Option<usize>,
         painter.rect_filled(
             Rect::from_min_max(pos2(left, view_top), pos2(left + gutter, view_bottom)),
             0.0,
-            theme::BG_PANEL,
+            theme::bg_panel(),
         );
 
         let first = (viewport.min.y / LINE_H).floor().max(0.0) as usize;
@@ -1232,22 +1232,22 @@ fn blame_body(ui: &mut Ui, blame: &Blame, heat: &[f32], selected: Option<usize>,
             let response = ui.interact(seen, ui.id().with(("blame-block", index)), Sense::click());
             let is_selected = selected == Some(block.commit);
             let strength = if commit.is_uncommitted() { 0.16 } else { 0.05 + 0.13 * warmth };
-            let mut fill = theme::mix(theme::BG_PANEL, color, strength);
+            let mut fill = theme::mix(theme::bg_panel(), color, strength);
             if is_selected {
-                fill = theme::BG_SELECTED;
+                fill = theme::bg_selected();
                 painter.rect_filled(
                     Rect::from_min_max(pos2(left + gutter, seen.top()), seen.max),
                     0.0,
-                    theme::mix(theme::BG_APP, theme::ACCENT, 0.09),
+                    theme::mix(theme::bg_app(), theme::accent(), 0.09),
                 );
             } else if response.hovered() {
-                fill = theme::mix(fill, theme::TEXT, 0.08);
+                fill = theme::mix(fill, theme::text(), 0.08);
             }
             painter.rect_filled(annot, 0.0, fill);
             painter.rect_filled(Rect::from_min_max(annot.min, pos2(left + 4.0, annot.bottom())), 0.0, color);
             if block.start > 0 && top >= view_top {
-                painter.hline(left..=left + gutter, top, Stroke::new(1.0, theme::BORDER));
-                painter.hline(left + gutter..=right, top, Stroke::new(1.0, theme::with_alpha(theme::BORDER_LIGHT, 70)));
+                painter.hline(left..=left + gutter, top, Stroke::new(1.0, theme::border()));
+                painter.hline(left + gutter..=right, top, Stroke::new(1.0, theme::with_alpha(theme::border_light(), 70)));
             }
 
             // The commit is named on the block's first line that is in view,
@@ -1255,17 +1255,17 @@ fn blame_body(ui: &mut Ui, blame: &Blame, heat: &[f32], selected: Option<usize>,
             let label_top = top.max(view_top).min(bottom - LINE_H);
             let label = Rect::from_min_max(pos2(left, label_top), pos2(left + annot_w, label_top + LINE_H));
             let label_painter = painter.with_clip_rect(annot.intersect(clip));
-            let bright = if is_selected { theme::TEXT_BRIGHT } else { theme::TEXT };
+            let bright = if is_selected { theme::text_bright() } else { theme::text() };
             if commit.is_uncommitted() {
                 widgets::text_left(&label_painter, label, left + 12.0, "Not committed yet", theme::font(12.0), bright);
             } else {
                 let mut date_x = label.right() - 2.0;
                 if with_date {
-                    let date = label_painter.layout_no_wrap(short_date(commit.time), theme::font(11.5), theme::TEXT_DIM);
+                    let date = label_painter.layout_no_wrap(short_date(commit.time), theme::font(11.5), theme::text_dim());
                     date_x = label.right() - 10.0 - date.size().x;
                     galley_left(&label_painter, label, date_x, date);
                 }
-                let sha_color = if is_selected { theme::TEXT_BRIGHT } else { theme::TEXT_DIM };
+                let sha_color = if is_selected { theme::text_bright() } else { theme::text_dim() };
                 widgets::text_left(&label_painter, label, left + 12.0, &short(commit.oid), small.clone(), sha_color);
                 let author_x = left + 12.0 + digit_w * 7.0 + 10.0;
                 let author = elided(&label_painter, &commit.author, theme::font(12.0), bright, date_x - author_x - 8.0);
@@ -1297,23 +1297,23 @@ fn blame_body(ui: &mut Ui, blame: &Blame, heat: &[f32], selected: Option<usize>,
             response.on_hover_ui_at_pointer(|ui| {
                 ui.set_max_width(460.0);
                 if commit.is_uncommitted() {
-                    ui.label(egui::RichText::new("Not committed yet").font(theme::bold(13.0)).color(theme::TEXT_BRIGHT));
-                    ui.label(egui::RichText::new("These lines exist only in the working tree or the index.").color(theme::TEXT_DIM));
+                    ui.label(egui::RichText::new("Not committed yet").font(theme::bold(13.0)).color(theme::text_bright()));
+                    ui.label(egui::RichText::new("These lines exist only in the working tree or the index.").color(theme::text_dim()));
                     return;
                 }
-                ui.label(egui::RichText::new(&commit.summary).font(theme::bold(13.0)).color(theme::TEXT_BRIGHT));
-                ui.label(egui::RichText::new(format!("{} <{}>", commit.author, commit.email)).color(theme::TEXT));
+                ui.label(egui::RichText::new(&commit.summary).font(theme::bold(13.0)).color(theme::text_bright()));
+                ui.label(egui::RichText::new(format!("{} <{}>", commit.author, commit.email)).color(theme::text()));
                 let mut when = format_time(commit.time);
                 let ago = relative_time(commit.time);
                 if !ago.is_empty() {
                     when.push_str(&format!(" ({ago})"));
                 }
-                ui.label(egui::RichText::new(when).size(11.5).color(theme::TEXT_DIM));
+                ui.label(egui::RichText::new(when).size(11.5).color(theme::text_dim()));
                 let lines = if block.len == 1 { "1 line".to_owned() } else { format!("{} lines", block.len) };
                 ui.label(
                     egui::RichText::new(format!("{}   {lines} in this block", short(commit.oid)))
                         .font(theme::mono(11.5))
-                        .color(theme::TEXT_DIM),
+                        .color(theme::text_dim()),
                 );
             });
             index += 1;
@@ -1327,18 +1327,18 @@ fn blame_body(ui: &mut Ui, blame: &Blame, heat: &[f32], selected: Option<usize>,
                 Align2::RIGHT_CENTER,
                 (i + 1).to_string(),
                 small.clone(),
-                theme::TEXT_FAINT,
+                theme::text_faint(),
             );
             text_painter.text(
                 pos2(content.left() + gutter + 10.0, y),
                 Align2::LEFT_CENTER,
                 line,
                 font.clone(),
-                theme::TEXT,
+                theme::text(),
             );
         }
 
-        painter.vline(left + annot_w, clip.y_range(), Stroke::new(1.0, theme::BORDER));
-        painter.vline(left + gutter, clip.y_range(), Stroke::new(1.0, theme::with_alpha(theme::BORDER_LIGHT, 90)));
+        painter.vline(left + annot_w, clip.y_range(), Stroke::new(1.0, theme::border()));
+        painter.vline(left + gutter, clip.y_range(), Stroke::new(1.0, theme::with_alpha(theme::border_light(), 90)));
     });
 }

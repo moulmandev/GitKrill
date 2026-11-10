@@ -30,10 +30,10 @@ fn working_tree(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<
     egui::Panel::bottom("commit-box")
         .resizable(false)
         .show_separator_line(false)
-        .frame(Frame::new().fill(theme::BG_APP).inner_margin(Margin::same(10)))
+        .frame(Frame::new().fill(theme::bg_app()).inner_margin(Margin::same(10)))
         .show(ui, |ui| commit_box(ui, tab, snap));
 
-    egui::CentralPanel::default().frame(Frame::new().fill(theme::BG_APP)).show(ui, |ui| {
+    egui::CentralPanel::default().frame(Frame::new().fill(theme::bg_app())).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
 
         // "6 file changes on [main]"
@@ -47,11 +47,11 @@ fn working_tree(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<
             painter.rect(
                 trash,
                 4.0,
-                if response.hovered() { theme::RED_DARK } else { theme::BG_APP },
-                Stroke::new(1.0, theme::mix(theme::BG_APP, theme::RED, 0.6)),
+                if response.hovered() { theme::red_dark() } else { theme::bg_app() },
+                Stroke::new(1.0, theme::mix(theme::bg_app(), theme::red(), 0.6)),
                 egui::StrokeKind::Inside,
             );
-            painter.text(trash.center(), Align2::CENTER_CENTER, icons::TRASH, theme::font(14.0), theme::RED);
+            painter.text(trash.center(), Align2::CENTER_CENTER, icons::TRASH, theme::font(14.0), theme::red());
             if response.clicked() {
                 shared.show(discard_all_dialog(snap));
             }
@@ -59,14 +59,14 @@ fn working_tree(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<
             let count = snap.status.file_count();
             let text = format!("{count} file change{} on", if count == 1 { "" } else { "s" });
             let branch = snap.head_label();
-            let text_galley = painter.layout_no_wrap(text, theme::bold(13.0), theme::TEXT_BRIGHT);
-            let pill_galley = widgets::elided(painter, &branch, theme::font(12.5), theme::TEXT_BRIGHT, rect.width() * 0.4);
+            let text_galley = painter.layout_no_wrap(text, theme::bold(13.0), theme::text_bright());
+            let pill_galley = widgets::elided(painter, &branch, theme::font(12.5), theme::text_bright(), rect.width() * 0.4);
             let pill_w = pill_galley.size().x + 12.0;
             let total = text_galley.size().x + 8.0 + pill_w;
             let x = (rect.center().x - total / 2.0).max(trash.right() + 10.0);
             let w = widgets::galley_left(painter, rect, x, text_galley);
             let pill = egui::Rect::from_min_size(pos2(x + w + 8.0, rect.center().y - 10.0), vec2(pill_w, 20.0));
-            painter.rect_filled(pill, 3.0, theme::mix(theme::BG_APP, theme::ACCENT, 0.6));
+            painter.rect_filled(pill, 3.0, theme::mix(theme::bg_app(), theme::accent(), 0.6));
             widgets::galley_left(painter, pill, pill.left() + 6.0, pill_galley);
         }
 
@@ -103,14 +103,14 @@ fn working_tree(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<
 
         let unborn = snap.head.oid.is_none();
         list_header(ui, &format!("Unstaged Files ({})", unstaged.len()), |ui| {
-            if !unstaged.is_empty() && tint_button(ui, "Stage all changes", theme::GREEN).clicked() {
+            if !unstaged.is_empty() && tint_button(ui, "Stage all changes", theme::green()).clicked() {
                 tab.run(ops::stage_all());
             }
         });
         file_list(ui, tab, shared, unstaged, DiffSource::Unstaged, h_unstaged);
 
         list_header(ui, &format!("Staged Files ({})", staged.len()), |ui| {
-            if !staged.is_empty() && tint_button(ui, "Unstage all changes", theme::RED).clicked() {
+            if !staged.is_empty() && tint_button(ui, "Unstage all changes", theme::red()).clicked() {
                 tab.run(ops::unstage_all(unborn));
             }
         });
@@ -120,13 +120,13 @@ fn working_tree(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<
 
 fn list_header(ui: &mut Ui, title: &str, trailing: impl FnOnce(&mut Ui)) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
-    ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, theme::BORDER));
+    ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, theme::border()));
     ui.painter().text(
         pos2(rect.left() + 10.0, rect.center().y),
         Align2::LEFT_CENTER,
         format!("{}  {title}", icons::CARET_DOWN),
         theme::font(13.0),
-        theme::TEXT,
+        theme::text(),
     );
     let inner = rect.shrink2(vec2(8.0, 0.0));
     ui.scope_builder(
@@ -138,18 +138,18 @@ fn list_header(ui: &mut Ui, title: &str, trailing: impl FnOnce(&mut Ui)) {
 /// Shown while a merge, rebase, cherry-pick or revert is waiting on the user.
 fn operation_banner(ui: &mut Ui, tab: &mut RepoTab, state: RepoState, label: &str) {
     Frame::new()
-        .fill(theme::mix(theme::BG_APP, theme::ORANGE, 0.18))
+        .fill(theme::mix(theme::bg_app(), theme::orange(), 0.18))
         .inner_margin(Margin::symmetric(10, 6))
         .show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{}  {label}", icons::WARNING)).color(theme::ORANGE));
+                ui.label(RichText::new(format!("{}  {label}", icons::WARNING)).color(theme::orange()));
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if let Some(cmd) = ops::abort(state)
-                        && tint_button(ui, "Abort", theme::RED).clicked() {
+                        && tint_button(ui, "Abort", theme::red()).clicked() {
                             tab.run(cmd);
                         }
                     if let Some(cmd) = ops::continue_op(state)
-                        && tint_button(ui, "Continue", theme::GREEN).clicked() {
+                        && tint_button(ui, "Continue", theme::green()).clicked() {
                             tab.run(cmd);
                         }
                 });
@@ -162,7 +162,7 @@ fn commit_box(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot) {
     ui.spacing_mut().item_spacing.y = 6.0;
 
     ui.horizontal(|ui| {
-        ui.label(RichText::new("Commit Message").color(theme::TEXT));
+        ui.label(RichText::new("Commit Message").color(theme::text()));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let can_amend = snap.head.oid.is_some();
             let before = tab.amend;
@@ -206,13 +206,13 @@ fn commit_box(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot) {
         (format!("Commit changes to {staged} file{}", if staged == 1 { "" } else { "s" }), true, false)
     };
 
-    let fill = if enabled { theme::mix(theme::BG_APP, theme::GREEN, 0.55) } else { theme::GREEN_DARK };
-    let text = RichText::new(label).color(if enabled { theme::TEXT_BRIGHT } else { theme::TEXT_DIM });
+    let fill = if enabled { theme::mix(theme::bg_app(), theme::green(), 0.55) } else { theme::green_dark() };
+    let text = RichText::new(label).color(if enabled { theme::text_bright() } else { theme::text_dim() });
     let button = ui.add_enabled(
         enabled,
         Button::new(text)
             .fill(fill)
-            .stroke(Stroke::new(1.0, theme::mix(theme::BG_APP, theme::GREEN, 0.7)))
+            .stroke(Stroke::new(1.0, theme::mix(theme::bg_app(), theme::green(), 0.7)))
             .min_size(vec2(ui.available_width(), 34.0)),
     );
 
@@ -247,20 +247,20 @@ fn commit(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<RepoSn
 
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
-            ui.label(RichText::new(if is_stash { "stash:" } else { "commit:" }).color(theme::TEXT_DIM));
-            ui.label(RichText::new(short(oid)).font(theme::mono(12.5)).color(theme::TEXT));
+            ui.label(RichText::new(if is_stash { "stash:" } else { "commit:" }).color(theme::text_dim()));
+            ui.label(RichText::new(short(oid)).font(theme::mono(12.5)).color(theme::text()));
             if icon_button(ui, icons::COPY, 13.0, "Copy full SHA").clicked() {
                 ui.ctx().copy_text(oid.to_string());
             }
         });
 
         ui.add(
-            Label::new(RichText::new(&details.summary).font(theme::bold(15.0)).color(theme::TEXT_BRIGHT))
+            Label::new(RichText::new(&details.summary).font(theme::bold(15.0)).color(theme::text_bright()))
                 .wrap(),
         );
         if !details.body.is_empty() {
             ScrollArea::vertical().id_salt("commit-body").max_height(150.0).show(ui, |ui| {
-                ui.add(Label::new(RichText::new(&details.body).color(theme::TEXT)).wrap());
+                ui.add(Label::new(RichText::new(&details.body).color(theme::text())).wrap());
             });
         }
         ui.add_space(4.0);
@@ -279,13 +279,13 @@ fn commit(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<RepoSn
             );
             ui.vertical(|ui| {
                 ui.spacing_mut().item_spacing.y = 1.0;
-                ui.label(RichText::new(&details.author).font(theme::bold(13.0)).color(theme::TEXT_BRIGHT));
+                ui.label(RichText::new(&details.author).font(theme::bold(13.0)).color(theme::text_bright()));
                 let mut when = format!("authored {}", format_time(details.author_time));
                 let ago = relative_time(details.author_time);
                 if !ago.is_empty() {
                     when.push_str(&format!("  ({ago})"));
                 }
-                ui.label(RichText::new(when).size(11.5).color(theme::TEXT_DIM))
+                ui.label(RichText::new(when).size(11.5).color(theme::text_dim()))
                     .on_hover_text(&details.author_email);
                 if details.committer != details.author {
                     ui.label(
@@ -295,7 +295,7 @@ fn commit(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<RepoSn
                             format_time(details.committer_time)
                         ))
                         .size(11.5)
-                        .color(theme::TEXT_DIM),
+                        .color(theme::text_dim()),
                     );
                 }
             });
@@ -305,11 +305,11 @@ fn commit(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<RepoSn
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 let word = if details.parents.len() == 1 { "parent:" } else { "parents:" };
-                ui.label(RichText::new(word).color(theme::TEXT_DIM));
+                ui.label(RichText::new(word).color(theme::text_dim()));
                 for parent in &details.parents {
                     let link = ui
                         .add(
-                            Label::new(RichText::new(short(*parent)).font(theme::mono(12.5)).color(theme::ACCENT))
+                            Label::new(RichText::new(short(*parent)).font(theme::mono(12.5)).color(theme::accent()))
                                 .sense(Sense::click()),
                         )
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -323,14 +323,14 @@ fn commit(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<RepoSn
 
     ui.spacing_mut().item_spacing.y = 0.0;
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
-    ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, theme::BORDER));
+    ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, theme::border()));
     let count = details.files.len();
     ui.painter().text(
         pos2(rect.left() + 12.0, rect.center().y),
         Align2::LEFT_CENTER,
         format!("{count} changed file{}", if count == 1 { "" } else { "s" }),
         theme::font(13.0),
-        theme::TEXT,
+        theme::text(),
     );
     ui.scope_builder(
         egui::UiBuilder::new()

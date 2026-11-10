@@ -42,8 +42,11 @@ already shown to the user as a toast).
 ## Conventions
 
 - Colours, fonts and icons come from `src/theme.rs` (`theme::icons::NAME` are
-  Phosphor icons; `theme::font`, `theme::bold`, `theme::mono`). Do not
-  hard-code colours in feature code.
+  Phosphor icons; `theme::font`, `theme::bold`, `theme::mono`). Colours are
+  functions (`theme::text_dim()`, `theme::lane_color(i)`) that read the
+  palette in use, so the theme can change at runtime: call them every frame
+  and do not keep their result in a cache or a `const`. Do not hard-code
+  colours in feature code.
 - Lists that can be long are virtualised: allocate the full content size, then
   paint only the rows inside the viewport (`ui/graph.rs`, `ui/diff.rs`).
 - Custom-painted rows use `ui.interact(rect, id, Sense::click())` for input and

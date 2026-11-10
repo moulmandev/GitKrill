@@ -87,29 +87,29 @@ impl Class {
     pub fn color(self) -> Color32 {
         use theme::mix;
         match self {
-            Class::Plain => theme::TEXT,
-            Class::Comment => mix(theme::TEXT_DIM, theme::TEXT, 0.25),
-            Class::Keyword | Class::Operator | Class::Storage => mix(theme::LANES[4], theme::TEXT_BRIGHT, 0.45),
-            Class::String => mix(theme::ORANGE, theme::TEXT, 0.5),
-            Class::Escape => mix(theme::LANES[1], theme::TEXT_BRIGHT, 0.5),
-            Class::Number => mix(theme::YELLOW, theme::TEXT, 0.3),
-            Class::Function => mix(theme::BLUE, theme::TEXT_BRIGHT, 0.4),
-            Class::Type => mix(theme::LANES[6], theme::TEXT, 0.4),
-            Class::Tag => mix(theme::RED, theme::TEXT_BRIGHT, 0.45),
-            Class::Property => mix(theme::ACCENT, theme::TEXT_BRIGHT, 0.5),
-            Class::Punctuation => mix(theme::TEXT, theme::TEXT_DIM, 0.35),
-            Class::Inserted => mix(theme::GREEN, theme::TEXT_BRIGHT, 0.35),
-            Class::Deleted => mix(theme::RED, theme::TEXT_BRIGHT, 0.35),
+            Class::Plain => theme::text(),
+            Class::Comment => mix(theme::text_dim(), theme::text(), 0.25),
+            Class::Keyword | Class::Operator | Class::Storage => mix(theme::lanes()[4], theme::text_bright(), 0.45),
+            Class::String => mix(theme::orange(), theme::text(), 0.5),
+            Class::Escape => mix(theme::lanes()[1], theme::text_bright(), 0.5),
+            Class::Number => mix(theme::yellow(), theme::text(), 0.3),
+            Class::Function => mix(theme::blue(), theme::text_bright(), 0.4),
+            Class::Type => mix(theme::lanes()[6], theme::text(), 0.4),
+            Class::Tag => mix(theme::red(), theme::text_bright(), 0.45),
+            Class::Property => mix(theme::accent(), theme::text_bright(), 0.5),
+            Class::Punctuation => mix(theme::text(), theme::text_dim(), 0.35),
+            Class::Inserted => mix(theme::green(), theme::text_bright(), 0.35),
+            Class::Deleted => mix(theme::red(), theme::text_bright(), 0.35),
         }
     }
 }
 
 /// Background behind the part of an added / removed line that actually
-/// changed, over [`theme::DIFF_ADD_BG`] / [`theme::DIFF_DEL_BG`].
+/// changed, over [`theme::diff_add_bg()`] / [`theme::diff_del_bg()`].
 pub fn emphasis_color(origin: char) -> Color32 {
     match origin {
-        '+' => theme::mix(theme::DIFF_ADD_BG, theme::GREEN, 0.3),
-        _ => theme::mix(theme::DIFF_DEL_BG, theme::RED, 0.34),
+        '+' => theme::mix(theme::diff_add_bg(), theme::green(), 0.3),
+        _ => theme::mix(theme::diff_del_bg(), theme::red(), 0.34),
     }
 }
 
@@ -339,7 +339,7 @@ impl HunkView<'_> {
 
 /// The text of a diff line as a layout job with one section per colour.
 pub fn layout(text: &str, spans: &[Span], font: &FontId) -> LayoutJob {
-    let plain = || LayoutJob::simple_singleline(text.to_owned(), font.clone(), theme::TEXT);
+    let plain = || LayoutJob::simple_singleline(text.to_owned(), font.clone(), theme::text());
     if spans.is_empty() {
         return plain();
     }
@@ -356,7 +356,7 @@ pub fn layout(text: &str, spans: &[Span], font: &FontId) -> LayoutJob {
         start = end;
     }
     if start < text.len() {
-        job.append(&text[start..], 0.0, TextFormat::simple(font.clone(), theme::TEXT));
+        job.append(&text[start..], 0.0, TextFormat::simple(font.clone(), theme::text()));
     }
     job
 }
@@ -1394,7 +1394,7 @@ mod tests {
         ];
         for class in classes {
             // Ordinary text contrast on the line backgrounds...
-            for bg in [theme::BG_APP, theme::DIFF_ADD_BG, theme::DIFF_DEL_BG] {
+            for bg in [theme::bg_app(), theme::diff_add_bg(), theme::diff_del_bg()] {
                 let ratio = contrast(class.color(), bg);
                 assert!(ratio >= 4.5, "{class:?} on {bg:?}: {ratio:.2}");
             }

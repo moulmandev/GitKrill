@@ -38,7 +38,7 @@ pub fn elided_pair(
 pub fn galley_left(painter: &Painter, rect: Rect, x: f32, galley: Arc<Galley>) -> f32 {
     let width = galley.size().x;
     let y = rect.center().y - galley.size().y / 2.0;
-    painter.galley(pos2(x, y.round()), galley, theme::TEXT);
+    painter.galley(pos2(x, y.round()), galley, theme::text());
     width
 }
 
@@ -65,16 +65,16 @@ pub fn icon_button(ui: &mut Ui, icon: &str, size: f32, tooltip: &str) -> Respons
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(size + 8.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let color = if !ui.is_enabled() {
-            theme::TEXT_FAINT
+            theme::text_faint()
         } else if response.hovered() {
-            theme::TEXT_BRIGHT
+            theme::text_bright()
         } else {
-            theme::TEXT_DIM
+            theme::text_dim()
         };
         if response.is_pointer_button_down_on() && ui.is_enabled() {
-            ui.painter().rect_filled(rect, 4.0, theme::BG_PRESSED);
+            ui.painter().rect_filled(rect, 4.0, theme::bg_pressed());
         } else if response.hovered() && ui.is_enabled() {
-            ui.painter().rect_filled(rect, 4.0, theme::BG_RAISED);
+            ui.painter().rect_filled(rect, 4.0, theme::bg_raised());
         }
         ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, theme::font(size), color);
     }
@@ -82,7 +82,7 @@ pub fn icon_button(ui: &mut Ui, icon: &str, size: f32, tooltip: &str) -> Respons
 }
 
 pub fn tint_button_size(ui: &Ui, text: &str) -> Vec2 {
-    ui.painter().layout_no_wrap(text.to_owned(), theme::font(12.0), theme::TEXT_BRIGHT).size()
+    ui.painter().layout_no_wrap(text.to_owned(), theme::font(12.0), theme::text_bright()).size()
         + vec2(16.0, 7.0)
 }
 
@@ -103,7 +103,7 @@ pub fn tint_button_at(ui: &mut Ui, rect: Rect, text: &str, color: Color32) -> Re
 }
 
 fn paint_tint_button(ui: &Ui, rect: Rect, response: &Response, text: &str, color: Color32) {
-    let galley = ui.painter().layout_no_wrap(text.to_owned(), theme::font(12.0), theme::TEXT_BRIGHT);
+    let galley = ui.painter().layout_no_wrap(text.to_owned(), theme::font(12.0), theme::text_bright());
     {
         let strength = if response.is_pointer_button_down_on() {
             0.45
@@ -115,12 +115,12 @@ fn paint_tint_button(ui: &Ui, rect: Rect, response: &Response, text: &str, color
         ui.painter().rect(
             rect,
             3.0,
-            theme::mix(theme::BG_APP, color, strength),
-            Stroke::new(1.0, theme::mix(theme::BG_APP, color, 0.75)),
+            theme::mix(theme::bg_app(), color, strength),
+            Stroke::new(1.0, theme::mix(theme::bg_app(), color, 0.75)),
             StrokeKind::Inside,
         );
         let pos = rect.center() - galley.size() / 2.0;
-        ui.painter().galley(pos2(pos.x.round(), pos.y.round()), galley, theme::TEXT_BRIGHT);
+        ui.painter().galley(pos2(pos.x.round(), pos.y.round()), galley, theme::text_bright());
     }
 }
 
@@ -128,14 +128,14 @@ fn paint_tint_button(ui: &Ui, rect: Rect, response: &Response, text: &str, color
 /// bar on its leading edge, so it reads as selected at a glance.
 pub fn row_background(painter: &Painter, rect: Rect, selected: bool, hovered: bool) {
     if selected {
-        painter.rect_filled(rect, 0.0, theme::BG_SELECTED);
+        painter.rect_filled(rect, 0.0, theme::bg_selected());
         painter.rect_filled(
             Rect::from_min_max(rect.min, pos2(rect.left() + 3.0, rect.bottom())),
             0.0,
-            theme::ACCENT,
+            theme::accent(),
         );
     } else if hovered {
-        painter.rect_filled(rect, 0.0, theme::BG_HOVER);
+        painter.rect_filled(rect, 0.0, theme::bg_hover());
     }
 }
 
@@ -195,7 +195,7 @@ pub fn avatar_picture(
     };
     // Pictures with transparent parts are meant to sit on a light page.
     // Slightly smaller, so it never shows as a rim around a dark picture.
-    painter.circle_filled(center, radius - 0.75, theme::TEXT_BRIGHT);
+    painter.circle_filled(center, radius - 0.75, theme::text_bright());
     let whole = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
     painter.add(
         egui::epaint::RectShape::filled(
@@ -212,11 +212,11 @@ pub fn avatar_picture(
 
 pub fn kind_icon(kind: ChangeKind) -> (&'static str, Color32) {
     match kind {
-        ChangeKind::Added | ChangeKind::Untracked => (icons::PLUS, theme::GREEN),
-        ChangeKind::Modified | ChangeKind::Typechange => (icons::PENCIL_SIMPLE, theme::YELLOW),
-        ChangeKind::Deleted => (icons::MINUS, theme::RED),
-        ChangeKind::Renamed => (icons::ARROW_RIGHT, theme::BLUE),
-        ChangeKind::Conflicted => (icons::WARNING, theme::ORANGE),
+        ChangeKind::Added | ChangeKind::Untracked => (icons::PLUS, theme::green()),
+        ChangeKind::Modified | ChangeKind::Typechange => (icons::PENCIL_SIMPLE, theme::yellow()),
+        ChangeKind::Deleted => (icons::MINUS, theme::red()),
+        ChangeKind::Renamed => (icons::ARROW_RIGHT, theme::blue()),
+        ChangeKind::Conflicted => (icons::WARNING, theme::orange()),
     }
 }
 
@@ -242,7 +242,7 @@ pub fn segmented(ui: &mut Ui, value: &mut bool, first: (&str, &str), second: (&s
     let font = theme::font(12.0);
     let measure = |ui: &Ui, (icon, label): (&str, &str)| {
         ui.painter()
-            .layout_no_wrap(format!("{icon} {label}"), font.clone(), theme::TEXT)
+            .layout_no_wrap(format!("{icon} {label}"), font.clone(), theme::text())
             .size()
             .x
             + 18.0
@@ -257,11 +257,11 @@ pub fn segmented(ui: &mut Ui, value: &mut bool, first: (&str, &str), second: (&s
         let response = ui.interact(half, ui.id().with((label, "segment")), Sense::click());
         let active = *value == is_second;
         let fill = if active {
-            theme::BG_SELECTED
+            theme::bg_selected()
         } else if response.hovered() {
-            theme::BG_RAISED
+            theme::bg_raised()
         } else {
-            theme::BG_HEADER
+            theme::bg_header()
         };
         let radius = if is_second {
             egui::CornerRadius { nw: 0, sw: 0, ne: 3, se: 3 }
@@ -274,7 +274,7 @@ pub fn segmented(ui: &mut Ui, value: &mut bool, first: (&str, &str), second: (&s
             Align2::CENTER_CENTER,
             format!("{icon} {label}"),
             font.clone(),
-            if active { theme::TEXT_BRIGHT } else { theme::TEXT_DIM },
+            if active { theme::text_bright() } else { theme::text_dim() },
         );
         if response.clicked() {
             *value = is_second;
@@ -289,23 +289,23 @@ pub fn segmented(ui: &mut Ui, value: &mut bool, first: (&str, &str), second: (&s
 /// (the free space between the title and the close button).
 pub fn overlay_bar(ui: &mut Ui, icon: &str, title: &str, subtitle: &str) -> (bool, Rect) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 38.0), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, theme::BG_HEADER);
-    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+    ui.painter().rect_filled(rect, 0.0, theme::bg_header());
+    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::border()));
 
     let close = Rect::from_center_size(pos2(rect.right() - 20.0, rect.center().y), Vec2::splat(24.0));
     let response = ui
         .interact(close, ui.id().with(("overlay-close", title)), Sense::click())
         .on_hover_text("Close (Esc)");
     if response.hovered() {
-        ui.painter().rect_filled(close, 4.0, theme::BG_RAISED);
+        ui.painter().rect_filled(close, 4.0, theme::bg_raised());
     }
-    ui.painter().text(close.center(), Align2::CENTER_CENTER, icons::X, theme::font(14.0), theme::TEXT_DIM);
+    ui.painter().text(close.center(), Align2::CENTER_CENTER, icons::X, theme::font(14.0), theme::text_dim());
 
     let painter = ui.painter().with_clip_rect(rect);
     let mut x = rect.left() + 12.0;
-    x += text_left(&painter, rect, x, icon, theme::font(15.0), theme::ACCENT) + 8.0;
-    x += text_left(&painter, rect, x, title, theme::bold(13.5), theme::TEXT_BRIGHT) + 12.0;
-    x += text_left(&painter, rect, x, subtitle, theme::font(12.0), theme::TEXT_DIM) + 12.0;
+    x += text_left(&painter, rect, x, icon, theme::font(15.0), theme::accent()) + 8.0;
+    x += text_left(&painter, rect, x, title, theme::bold(13.5), theme::text_bright()) + 12.0;
+    x += text_left(&painter, rect, x, subtitle, theme::font(12.0), theme::text_dim()) + 12.0;
 
     let free = Rect::from_min_max(pos2(x.min(close.left()), rect.top()), pos2(close.left() - 8.0, rect.bottom()));
     (response.clicked(), free)
@@ -314,6 +314,6 @@ pub fn overlay_bar(ui: &mut Ui, icon: &str, title: &str, subtitle: &str) -> (boo
 /// Centred placeholder text for empty or loading regions.
 pub fn placeholder(ui: &mut Ui, text: &str) {
     let rect = ui.available_rect_before_wrap();
-    ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, theme::font(14.0), theme::TEXT_FAINT);
+    ui.painter().text(rect.center(), Align2::CENTER_CENTER, text, theme::font(14.0), theme::text_faint());
     ui.allocate_rect(rect, Sense::hover());
 }

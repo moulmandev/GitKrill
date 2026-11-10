@@ -581,8 +581,8 @@ pub fn highlight_row(painter: &Painter, rect: Rect) {
     painter.rect(
         rect.shrink(0.5),
         2.0,
-        theme::with_alpha(theme::ACCENT, 46),
-        Stroke::new(1.5, theme::ACCENT),
+        theme::with_alpha(theme::accent(), 46),
+        Stroke::new(1.5, theme::accent()),
         StrokeKind::Inside,
     );
 }
@@ -592,8 +592,8 @@ pub fn highlight_pill(painter: &Painter, rect: Rect) {
     painter.rect(
         rect.expand(2.0),
         5.0,
-        theme::with_alpha(theme::TEXT_BRIGHT, 30),
-        Stroke::new(2.0, theme::TEXT_BRIGHT),
+        theme::with_alpha(theme::text_bright(), 30),
+        Stroke::new(2.0, theme::text_bright()),
         StrokeKind::Outside,
     );
 }
@@ -645,13 +645,13 @@ fn menu(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, dropped: &Dropped) 
             icons::ARROW_RIGHT,
             dropped.target.name()
         ))
-        .color(theme::TEXT_DIM)
+        .color(theme::text_dim())
         .size(11.5),
     );
     ui.separator();
 
     let quiet = |ui: &mut Ui, text: String| {
-        ui.label(egui::RichText::new(text).color(theme::TEXT_DIM));
+        ui.label(egui::RichText::new(text).color(theme::text_dim()));
     };
     let Some(snap) = tab.snap.clone() else { return };
     if let Some(state) = snap.state.label() {
@@ -721,8 +721,8 @@ fn ghost(ctx: &Context, dragged: &Dragged, frame: u64) {
     let Some(pointer) = ctx.pointer_latest_pos() else { return };
     let painter = ctx.layer_painter(LayerId::new(Order::Tooltip, Id::new("branch-drag-ghost")));
 
-    let name = painter.layout_no_wrap(dragged.branch.name(), theme::bold(12.5), theme::TEXT_BRIGHT);
-    let glyph = painter.layout_no_wrap(dragged.branch.icon().to_owned(), theme::font(13.0), theme::TEXT_BRIGHT);
+    let name = painter.layout_no_wrap(dragged.branch.name(), theme::bold(12.5), theme::text_bright());
+    let glyph = painter.layout_no_wrap(dragged.branch.icon().to_owned(), theme::font(13.0), theme::text_bright());
     let width = 7.0 + name.size().x + 6.0 + glyph.size().x + 7.0;
     let pill = Rect::from_min_size(pointer + vec2(14.0, 12.0), vec2(width, 22.0));
 
@@ -730,14 +730,14 @@ fn ghost(ctx: &Context, dragged: &Dragged, frame: u64) {
     painter.rect(
         pill,
         4.0,
-        theme::mix(theme::BG_APP, dragged.color, 0.55),
-        Stroke::new(1.0, theme::mix(dragged.color, theme::TEXT_BRIGHT, 0.35)),
+        theme::mix(theme::bg_app(), dragged.color, 0.55),
+        Stroke::new(1.0, theme::mix(dragged.color, theme::text_bright(), 0.35)),
         StrokeKind::Inside,
     );
     let y = |h: f32| (pill.center().y - h / 2.0).round();
     let name_w = name.size().x;
-    painter.galley(pos2(pill.left() + 7.0, y(name.size().y)), name, theme::TEXT_BRIGHT);
-    painter.galley(pos2(pill.left() + 7.0 + name_w + 6.0, y(glyph.size().y)), glyph, theme::TEXT_BRIGHT);
+    painter.galley(pos2(pill.left() + 7.0, y(name.size().y)), name, theme::text_bright());
+    painter.galley(pos2(pill.left() + 7.0 + name_w + 6.0, y(glyph.size().y)), glyph, theme::text_bright());
 
     // Targets report themselves while they are laid out, so the name shown is
     // the one from the frame before.
@@ -746,20 +746,20 @@ fn ghost(ctx: &Context, dragged: &Dragged, frame: u64) {
         .filter(|(seen, _)| seen + 1 >= frame);
     if let Some((_, target)) = over {
         let text = format!("{}  {target}", icons::ARROW_RIGHT);
-        let galley = painter.layout_no_wrap(text, theme::font(12.5), theme::TEXT_BRIGHT);
+        let galley = painter.layout_no_wrap(text, theme::font(12.5), theme::text_bright());
         let hint = Rect::from_min_size(
             pos2(pill.right() + 6.0, pill.top()),
             vec2(galley.size().x + 14.0, pill.height()),
         );
-        painter.rect(hint, 4.0, theme::BG_RAISED, Stroke::new(1.0, theme::ACCENT), StrokeKind::Inside);
-        painter.galley(pos2(hint.left() + 7.0, y(galley.size().y)), galley, theme::TEXT_BRIGHT);
+        painter.rect(hint, 4.0, theme::bg_raised(), Stroke::new(1.0, theme::accent()), StrokeKind::Inside);
+        painter.galley(pos2(hint.left() + 7.0, y(galley.size().y)), galley, theme::text_bright());
     } else {
         painter.text(
             pos2(pill.right() + 8.0, pill.center().y),
             Align2::LEFT_CENTER,
             icons::PROHIBIT,
             theme::font(13.0),
-            theme::TEXT_DIM,
+            theme::text_dim(),
         );
     }
 }

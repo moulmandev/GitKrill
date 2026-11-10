@@ -317,7 +317,7 @@ impl App {
     fn tab_strip(&mut self, ui: &mut Ui) {
         let rect = ui.max_rect();
         let painter = ui.painter().clone();
-        painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+        painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::border()));
 
         let count = self.tabs.len().max(1) as f32;
         let max_w = ((rect.width() - 44.0) / count).clamp(70.0, 220.0);
@@ -325,7 +325,7 @@ impl App {
 
         for (i, tab) in self.tabs.iter().enumerate() {
             let active = i == self.active;
-            let color = if active { theme::TEXT_BRIGHT } else { theme::TEXT_DIM };
+            let color = if active { theme::text_bright() } else { theme::text_dim() };
             let font = if active { theme::bold(13.5) } else { theme::font(13.5) };
             let galley = widgets::elided(&painter, &tab.name, font, color, max_w - 58.0);
             let width = (galley.size().x + 58.0).min(max_w);
@@ -333,10 +333,10 @@ impl App {
             let response = ui.interact(tab_rect, ui.id().with(("tab", i)), Sense::click());
 
             if active {
-                painter.rect_filled(tab_rect, 0.0, theme::BG_TOOLBAR);
-                painter.hline(tab_rect.x_range(), tab_rect.top() + 1.0, Stroke::new(2.0, theme::ACCENT));
+                painter.rect_filled(tab_rect, 0.0, theme::bg_toolbar());
+                painter.hline(tab_rect.x_range(), tab_rect.top() + 1.0, Stroke::new(2.0, theme::accent()));
             } else if response.hovered() {
-                painter.rect_filled(tab_rect, 0.0, theme::BG_HOVER);
+                painter.rect_filled(tab_rect, 0.0, theme::bg_hover());
             }
             painter.text(
                 pos2(tab_rect.left() + 12.0, tab_rect.center().y),
@@ -351,9 +351,9 @@ impl App {
             let close_response = ui.interact(close, ui.id().with(("tab-close", i)), Sense::click());
             if active || response.hovered() || close_response.hovered() {
                 if close_response.hovered() {
-                    painter.rect_filled(close, 3.0, theme::BG_RAISED);
+                    painter.rect_filled(close, 3.0, theme::bg_raised());
                 }
-                painter.text(close.center(), Align2::CENTER_CENTER, icons::X, theme::font(11.0), theme::TEXT_DIM);
+                painter.text(close.center(), Align2::CENTER_CENTER, icons::X, theme::font(11.0), theme::text_dim());
             }
 
             if close_response.clicked() || response.middle_clicked() {
@@ -374,7 +374,7 @@ impl App {
                 }
             });
 
-            painter.vline(tab_rect.right(), tab_rect.shrink2(vec2(0.0, 7.0)).y_range(), Stroke::new(1.0, theme::BORDER));
+            painter.vline(tab_rect.right(), tab_rect.shrink2(vec2(0.0, 7.0)).y_range(), Stroke::new(1.0, theme::border()));
             x += width + 1.0;
         }
 
@@ -383,9 +383,9 @@ impl App {
             .interact(plus, ui.id().with("tab-new"), Sense::click())
             .on_hover_text("Open a repository (Ctrl+O)");
         if response.hovered() {
-            painter.rect_filled(plus, 4.0, theme::BG_RAISED);
+            painter.rect_filled(plus, 4.0, theme::bg_raised());
         }
-        painter.text(plus.center(), Align2::CENTER_CENTER, icons::PLUS, theme::font(14.0), theme::TEXT_DIM);
+        painter.text(plus.center(), Align2::CENTER_CENTER, icons::PLUS, theme::font(14.0), theme::text_dim());
         if response.clicked() {
             self.shared.actions.push(AppAction::OpenDialog);
         }
@@ -395,17 +395,17 @@ impl App {
         let tab = self.tabs.get(self.active);
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
-            let dim = |text: String| egui::RichText::new(text).size(11.5).color(theme::TEXT_DIM);
+            let dim = |text: String| egui::RichText::new(text).size(11.5).color(theme::text_dim());
 
             let busy = tab
                 .and_then(|t| t.busy_label().map(str::to_owned))
                 .or(self.cloning.as_ref().map(|c| c.0.clone()));
             if let Some(label) = busy {
-                ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
+                ui.add(egui::Spinner::new().size(12.0).color(theme::accent()));
                 ui.label(dim(format!("{label}…")));
             } else if let Some(tab) = tab {
                 if tab.is_loading() {
-                    ui.add(egui::Spinner::new().size(12.0).color(theme::ACCENT));
+                    ui.add(egui::Spinner::new().size(12.0).color(theme::accent()));
                     ui.label(dim("Loading…".to_owned()));
                 } else if let Some(snap) = &tab.snap {
                     let mut text = format!("{}  {}", icons::GIT_BRANCH, snap.head_label());
@@ -419,7 +419,7 @@ impl App {
                     }
                     ui.label(dim(text));
                     if let Some(state) = snap.state.label() {
-                        ui.label(egui::RichText::new(state).size(11.5).color(theme::ORANGE));
+                        ui.label(egui::RichText::new(state).size(11.5).color(theme::orange()));
                     }
                 }
             }
@@ -442,10 +442,10 @@ impl App {
     fn welcome(&mut self, ui: &mut Ui) {
         ui.vertical_centered(|ui| {
             ui.add_space((ui.available_height() * 0.28).max(20.0));
-            ui.label(egui::RichText::new(icons::GIT_BRANCH).size(54.0).color(theme::ACCENT));
+            ui.label(egui::RichText::new(icons::GIT_BRANCH).size(54.0).color(theme::accent()));
             ui.add_space(6.0);
-            ui.label(egui::RichText::new("GitKrill").font(theme::bold(26.0)).color(theme::TEXT_BRIGHT));
-            ui.label(egui::RichText::new("Open a repository to get started, or drop a folder here.").color(theme::TEXT_DIM));
+            ui.label(egui::RichText::new("GitKrill").font(theme::bold(26.0)).color(theme::text_bright()));
+            ui.label(egui::RichText::new("Open a repository to get started, or drop a folder here.").color(theme::text_dim()));
             ui.add_space(18.0);
 
             let big = |text: String| egui::Button::new(egui::RichText::new(text).size(14.0)).min_size(vec2(230.0, 36.0));
@@ -461,11 +461,11 @@ impl App {
 
             if !self.shared.settings.recent.is_empty() {
                 ui.add_space(22.0);
-                ui.label(egui::RichText::new("RECENT").font(theme::bold(11.0)).color(theme::TEXT_DIM));
+                ui.label(egui::RichText::new("RECENT").font(theme::bold(11.0)).color(theme::text_dim()));
                 ui.add_space(4.0);
                 for path in self.shared.settings.recent.iter().take(8).cloned().collect::<Vec<_>>() {
                     let link = ui
-                        .add(egui::Label::new(egui::RichText::new(path.display().to_string()).color(theme::ACCENT)).sense(Sense::click()))
+                        .add(egui::Label::new(egui::RichText::new(path.display().to_string()).color(theme::accent())).sense(Sense::click()))
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
                     if link.clicked() {
                         self.shared.actions.push(AppAction::Open(path));
@@ -495,15 +495,15 @@ impl eframe::App for App {
             egui::Panel::top(id).exact_size(height).show_separator_line(false).frame(Frame::new().fill(fill))
         };
 
-        bar("menu", 24.0, theme::BG_TABBAR)
-            .frame(Frame::new().fill(theme::BG_TABBAR).inner_margin(Margin::symmetric(4, 0)))
+        bar("menu", 24.0, theme::bg_tabbar())
+            .frame(Frame::new().fill(theme::bg_tabbar()).inner_margin(Margin::symmetric(4, 0)))
             .show(ui, |ui| self.menu_bar(ui));
-        bar("tabs", 34.0, theme::BG_TABBAR).show(ui, |ui| self.tab_strip(ui));
+        bar("tabs", 34.0, theme::bg_tabbar()).show(ui, |ui| self.tab_strip(ui));
 
         egui::Panel::bottom("status")
             .exact_size(24.0)
             .show_separator_line(false)
-            .frame(Frame::new().fill(theme::BG_TABBAR).inner_margin(Margin::symmetric(10, 0)))
+            .frame(Frame::new().fill(theme::bg_tabbar()).inner_margin(Margin::symmetric(10, 0)))
             .show(ui, |ui| self.status_bar(ui));
 
         if self.active < self.tabs.len() {
@@ -511,10 +511,10 @@ impl eframe::App for App {
             let tab = &mut tabs[*active];
             tab.start(&ctx);
 
-            bar("toolbar", 54.0, theme::BG_TOOLBAR).show(ui, |ui| {
+            bar("toolbar", 54.0, theme::bg_toolbar()).show(ui, |ui| {
                 ui::toolbar::show(ui, tab, shared);
                 let rect = ui.max_rect();
-                ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+                ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::border()));
                 if tab.busy_label().is_some() {
                     ui::toolbar::progress_strip(ui, rect);
                 }
@@ -525,7 +525,7 @@ impl eframe::App for App {
                     .resizable(true)
                     .default_size(230.0)
                     .size_range(170.0..=460.0)
-                    .frame(Frame::new().fill(theme::BG_PANEL))
+                    .frame(Frame::new().fill(theme::bg_panel()))
                     .show(ui, |ui| ui::sidebar::show(ui, tab, shared));
             }
 
@@ -533,10 +533,10 @@ impl eframe::App for App {
                 .resizable(true)
                 .default_size(420.0)
                 .size_range(300.0..=900.0)
-                .frame(Frame::new().fill(theme::BG_APP))
+                .frame(Frame::new().fill(theme::bg_app()))
                 .show(ui, |ui| ui::panel::show(ui, tab, shared));
 
-            egui::CentralPanel::default().frame(Frame::new().fill(theme::BG_APP)).show(ui, |ui| {
+            egui::CentralPanel::default().frame(Frame::new().fill(theme::bg_app())).show(ui, |ui| {
                 if tab.overlay.is_some() {
                     ui::overlay(ui, tab, shared);
                 } else if tab.diff.is_some() {
@@ -547,7 +547,7 @@ impl eframe::App for App {
             });
         } else {
             egui::CentralPanel::default()
-                .frame(Frame::new().fill(theme::BG_APP))
+                .frame(Frame::new().fill(theme::bg_app()))
                 .show(ui, |ui| self.welcome(ui));
         }
 

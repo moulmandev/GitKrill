@@ -40,7 +40,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                     shared.settings.recent.iter().filter(|p| **p != tab.path).take(10).cloned().collect();
                 if !recent.is_empty() {
                     ui.separator();
-                    ui.label(egui::RichText::new("Recent").size(11.0).color(theme::TEXT_DIM));
+                    ui.label(egui::RichText::new("Recent").size(11.0).color(theme::text_dim()));
                     for path in recent {
                         let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
                         if ui.button(name).on_hover_text(path.display().to_string()).clicked() {
@@ -50,7 +50,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                 }
             });
 
-            ui.label(egui::RichText::new(icons::CARET_RIGHT).size(12.0).color(theme::TEXT_FAINT));
+            ui.label(egui::RichText::new(icons::CARET_RIGHT).size(12.0).color(theme::text_faint()));
 
             let branch = snap.as_ref().map(|s| s.head_label()).unwrap_or_default();
             let response = picker(ui, "branch", &branch, 220.0);
@@ -117,14 +117,14 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
             }
             let (caret, response) = ui.allocate_exact_size(vec2(14.0, BUTTON.y), Sense::click());
             if response.hovered() {
-                ui.painter().rect_filled(caret, 4.0, theme::BG_RAISED);
+                ui.painter().rect_filled(caret, 4.0, theme::bg_raised());
             }
             ui.painter().text(
                 pos2(caret.center().x, caret.top() + 31.0),
                 Align2::CENTER_CENTER,
                 icons::CARET_DOWN,
                 theme::font(10.0),
-                theme::TEXT_DIM,
+                theme::text_dim(),
             );
             Popup::menu(&response).show(|ui| {
                 ui.set_min_width(230.0);
@@ -180,7 +180,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
             }
 
             let (sep, _) = ui.allocate_exact_size(vec2(13.0, BUTTON.y), Sense::hover());
-            ui.painter().vline(sep.center().x, sep.shrink2(vec2(0.0, 6.0)).y_range(), egui::Stroke::new(1.0, theme::BORDER));
+            ui.painter().vline(sep.center().x, sep.shrink2(vec2(0.0, 6.0)).y_range(), egui::Stroke::new(1.0, theme::border()));
 
             if tool_button(ui, "Terminal", icons::TERMINAL_WINDOW, true, false, "Open a terminal in this repository").clicked() {
                 platform::terminal(&tab.path);
@@ -236,19 +236,19 @@ pub fn push_cmd(tab: &RepoTab, force: bool) -> Option<ops::GitCmd> {
 /// A caption-over-value dropdown trigger ("repository / MelonLoader7").
 fn picker(ui: &mut Ui, caption: &str, value: &str, max_width: f32) -> Response {
     let font = theme::bold(15.0);
-    let galley = elided(ui.painter(), value, font, theme::TEXT_BRIGHT, max_width - 34.0);
+    let galley = elided(ui.painter(), value, font, theme::text_bright(), max_width - 34.0);
     let width = (galley.size().x + 34.0).max(70.0);
     let (rect, response) = ui.allocate_exact_size(vec2(width, BUTTON.y), Sense::click());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
         if response.hovered() {
-            painter.rect_filled(rect, 4.0, theme::BG_RAISED);
+            painter.rect_filled(rect, 4.0, theme::bg_raised());
         }
-        painter.text(pos2(rect.left() + 8.0, rect.top() + 12.0), Align2::LEFT_CENTER, caption, theme::font(10.5), theme::TEXT_DIM);
+        painter.text(pos2(rect.left() + 8.0, rect.top() + 12.0), Align2::LEFT_CENTER, caption, theme::font(10.5), theme::text_dim());
         let y = rect.top() + 30.0;
         let text_w = galley.size().x;
-        painter.galley(pos2(rect.left() + 8.0, (y - galley.size().y / 2.0).round()), galley, theme::TEXT_BRIGHT);
-        painter.text(pos2(rect.left() + 14.0 + text_w, y + 1.0), Align2::LEFT_CENTER, icons::CARET_DOWN, theme::font(11.0), theme::TEXT_DIM);
+        painter.galley(pos2(rect.left() + 8.0, (y - galley.size().y / 2.0).round()), galley, theme::text_bright());
+        painter.text(pos2(rect.left() + 14.0 + text_w, y + 1.0), Align2::LEFT_CENTER, icons::CARET_DOWN, theme::font(11.0), theme::text_dim());
     }
     response
 }
@@ -263,20 +263,20 @@ fn tool_button(ui: &mut Ui, label: &str, icon: &str, enabled: bool, busy: bool, 
         let painter = ui.painter();
         let pressed = clickable && response.is_pointer_button_down_on();
         let (label_color, icon_color) = if busy {
-            (theme::ACCENT, theme::ACCENT)
+            (theme::accent(), theme::accent())
         } else if !enabled {
-            (theme::TEXT_FAINT, theme::TEXT_FAINT)
+            (theme::text_faint(), theme::text_faint())
         } else if response.hovered() {
-            (theme::TEXT_BRIGHT, theme::TEXT_BRIGHT)
+            (theme::text_bright(), theme::text_bright())
         } else {
-            (theme::TEXT_DIM, theme::TEXT)
+            (theme::text_dim(), theme::text())
         };
         if pressed {
-            painter.rect_filled(rect, 4.0, theme::BG_PRESSED);
+            painter.rect_filled(rect, 4.0, theme::bg_pressed());
         } else if busy {
-            painter.rect_filled(rect, 4.0, theme::with_alpha(theme::ACCENT, 28));
+            painter.rect_filled(rect, 4.0, theme::with_alpha(theme::accent(), 28));
         } else if clickable && response.hovered() {
-            painter.rect_filled(rect, 4.0, theme::BG_RAISED);
+            painter.rect_filled(rect, 4.0, theme::bg_raised());
         }
         // The content sinks a pixel while held, like a physical key.
         let nudge = if pressed { 1.0 } else { 0.0 };
@@ -289,7 +289,7 @@ fn tool_button(ui: &mut Ui, label: &str, icon: &str, enabled: bool, busy: bool, 
         );
         let icon_at = pos2(rect.center().x, rect.top() + 30.0 + nudge);
         if busy {
-            crate::ui::widgets::spinner(painter, icon_at, 8.0, theme::ACCENT);
+            crate::ui::widgets::spinner(painter, icon_at, 8.0, theme::accent());
         } else {
             painter.text(icon_at, Align2::CENTER_CENTER, icon, theme::font(20.0), icon_color);
         }
@@ -304,5 +304,5 @@ pub fn progress_strip(ui: &Ui, rect: Rect) {
     let travel = rect.width() + width;
     let x = rect.left() - width + (time * 0.9).fract() * travel;
     let bar = Rect::from_min_max(pos2(x, rect.bottom() - 2.0), pos2(x + width, rect.bottom()));
-    ui.painter().with_clip_rect(rect).rect_filled(bar, 1.0, theme::ACCENT);
+    ui.painter().with_clip_rect(rect).rect_filled(bar, 1.0, theme::accent());
 }

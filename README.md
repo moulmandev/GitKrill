@@ -146,7 +146,7 @@ src/
   worker.rs      reader / operator threads and the file watcher
   theme.rs       colours, fonts, egui style
   avatars.rs     author pictures: fetch, disk cache, textures
-  hosting.rs     GitHub client for pull requests, issues and Actions
+  hosting/       GitHub client for pull requests, issues and Actions
   git/
     repo.rs      snapshot loading (refs, status, history walk)
     graph.rs     lane layout and line colours

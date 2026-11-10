@@ -69,8 +69,8 @@ fn title_bar(
 ) -> bool {
     let mut close = false;
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), BAR_H), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, theme::BG_HEADER);
-    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+    ui.painter().rect_filled(rect, 0.0, theme::bg_header());
+    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::border()));
 
     let unborn = tab.snap.as_ref().is_some_and(|s| s.head.oid.is_none());
     let kind = diff.and_then(|d| d.kind);
@@ -93,11 +93,11 @@ fn title_bar(
             }
             match target.source {
                 DiffSource::Unstaged => {
-                    if tint_button(ui, "Stage File", theme::GREEN).clicked() {
+                    if tint_button(ui, "Stage File", theme::green()).clicked() {
                         tab.run(ops::stage(std::slice::from_ref(&target.path)));
                     }
                     if kind != Some(ChangeKind::Conflicted)
-                        && tint_button(ui, "Discard", theme::RED).clicked()
+                        && tint_button(ui, "Discard", theme::red()).clicked()
                     {
                         shared.show(Dialog::confirm(
                             "Discard changes",
@@ -108,7 +108,7 @@ fn title_bar(
                     }
                 }
                 DiffSource::Staged => {
-                    if tint_button(ui, "Unstage File", theme::RED).clicked() {
+                    if tint_button(ui, "Unstage File", theme::red()).clicked() {
                         tab.run(ops::unstage(std::slice::from_ref(&target.path), unborn));
                     }
                 }
@@ -116,8 +116,8 @@ fn title_bar(
             }
             if let Some(diff) = diff {
                 ui.add_space(6.0);
-                ui.label(egui::RichText::new(format!("-{}", diff.deletions)).color(theme::RED).font(theme::mono(12.0)));
-                ui.label(egui::RichText::new(format!("+{}", diff.additions)).color(theme::GREEN).font(theme::mono(12.0)));
+                ui.label(egui::RichText::new(format!("-{}", diff.deletions)).color(theme::red()).font(theme::mono(12.0)));
+                ui.label(egui::RichText::new(format!("+{}", diff.additions)).color(theme::green()).font(theme::mono(12.0)));
             }
             controls_left = ui.min_rect().left();
         },
@@ -133,17 +133,17 @@ fn title_bar(
         Some(i) => (&target.path[..=i], &target.path[i + 1..]),
         None => ("", target.path.as_str()),
     };
-    x += widgets::text_left(&painter, rect, x, dir, theme::font(13.5), theme::TEXT_DIM);
-    x += widgets::text_left(&painter, rect, x, name, theme::bold(13.5), theme::TEXT_BRIGHT) + 12.0;
+    x += widgets::text_left(&painter, rect, x, dir, theme::font(13.5), theme::text_dim());
+    x += widgets::text_left(&painter, rect, x, name, theme::bold(13.5), theme::text_bright()) + 12.0;
 
     let origin = match target.source {
         DiffSource::Unstaged => "unstaged changes".to_owned(),
         DiffSource::Staged => "staged changes".to_owned(),
         DiffSource::Commit(oid) => format!("in commit {}", short(oid)),
     };
-    x += widgets::text_left(&painter, rect, x, &origin, theme::font(12.0), theme::TEXT_DIM) + 12.0;
+    x += widgets::text_left(&painter, rect, x, &origin, theme::font(12.0), theme::text_dim()) + 12.0;
     if let Some(old) = diff.and_then(|d| d.old_path.as_deref()).or(target.old_path.as_deref()) {
-        widgets::text_left(&painter, rect, x, &format!("renamed from {old}"), theme::font(12.0), theme::TEXT_FAINT);
+        widgets::text_left(&painter, rect, x, &format!("renamed from {old}"), theme::font(12.0), theme::text_faint());
     }
 
     close
@@ -246,8 +246,8 @@ impl LineSelection {
 /// line grey. The gutter is what says "selected".
 pub(super) fn line_background(origin: char, selected: bool) -> Option<Color32> {
     let (base, full) = match origin {
-        '+' => (theme::DIFF_ADD_BG, theme::GREEN),
-        '-' => (theme::DIFF_DEL_BG, theme::RED),
+        '+' => (theme::diff_add_bg(), theme::green()),
+        '-' => (theme::diff_del_bg(), theme::red()),
         _ => return None,
     };
     Some(if selected { theme::mix(base, full, 0.16) } else { base })
@@ -336,14 +336,14 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
             // Hunk header.
             let y = content.top() + top;
             let bar = Rect::from_min_max(pos2(left, y), pos2(right, y + HUNK_H));
-            painter.rect_filled(bar, 0.0, theme::DIFF_HUNK_BG);
-            painter.hline(bar.x_range(), bar.top(), Stroke::new(1.0, theme::BORDER));
+            painter.rect_filled(bar, 0.0, theme::diff_hunk_bg());
+            painter.hline(bar.x_range(), bar.top(), Stroke::new(1.0, theme::border()));
             painter.text(
                 pos2(left + 12.0, bar.center().y),
                 Align2::LEFT_CENTER,
                 &hunk.header,
                 theme::mono(12.0),
-                theme::TEXT_DIM,
+                theme::text_dim(),
             );
             hunk_buttons(ui, tab, shared, target, diff, h, bar, selection.as_deref_mut());
 
@@ -357,9 +357,9 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
                 let row = Rect::from_min_max(pos2(left, y), pos2(right, y + LINE_H));
                 let selected = selection.as_ref().is_some_and(|s| s.lines.contains(&(h, i)));
                 let sign_color = match line.origin {
-                    '+' => theme::GREEN,
-                    '-' => theme::RED,
-                    _ => theme::TEXT_FAINT,
+                    '+' => theme::green(),
+                    '-' => theme::red(),
+                    _ => theme::text_faint(),
                 };
                 if let Some(bg) = line_background(line.origin, selected) {
                     painter.rect_filled(row, 0.0, bg);
@@ -371,11 +371,11 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
                 if selected {
                     widgets::row_background(&painter, numbers, true, false);
                 } else if hovered == Some((h, i)) {
-                    painter.rect_filled(numbers, 0.0, theme::with_alpha(theme::ACCENT, 46));
+                    painter.rect_filled(numbers, 0.0, theme::with_alpha(theme::accent(), 46));
                 }
 
                 let cy = row.center().y;
-                let number_color = if selected { theme::TEXT_BRIGHT } else { theme::TEXT_FAINT };
+                let number_color = if selected { theme::text_bright() } else { theme::text_faint() };
                 let number = |n: Option<u32>, x: f32| {
                     if let Some(n) = n {
                         painter.text(pos2(x, cy), Align2::RIGHT_CENTER, n.to_string(), theme::mono(11.5), number_color);
@@ -414,7 +414,7 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
                         text_painter.rect_filled(mark, 2.0, highlight::emphasis_color(line.origin));
                     }
                 }
-                text_painter.galley(origin, galley, theme::TEXT);
+                text_painter.galley(origin, galley, theme::text());
             }
         }
 
@@ -425,7 +425,7 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
                 Align2::CENTER_CENTER,
                 "This diff is very large; the rest is not shown.",
                 theme::font(12.0),
-                theme::TEXT_DIM,
+                theme::text_dim(),
             );
         }
 
@@ -433,7 +433,7 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
         painter.vline(
             numbers_right,
             painter.clip_rect().y_range(),
-            Stroke::new(1.0, theme::with_alpha(theme::BORDER_LIGHT, 90)),
+            Stroke::new(1.0, theme::with_alpha(theme::border_light(), 90)),
         );
     });
 }
@@ -492,13 +492,13 @@ fn hunk_buttons(
         };
         match target.source {
             DiffSource::Unstaged => {
-                if place(ui, &format!("Stage {lines}"), theme::GREEN) {
+                if place(ui, &format!("Stage {lines}"), theme::green()) {
                     match patch(LineApply::Forward) {
                         Some(patch) => tab.run(ops::apply_patch(STAGE_LINES, patch, true, false)),
                         None => stale(shared),
                     }
                 }
-                if place(ui, &format!("Discard {lines}"), theme::RED) {
+                if place(ui, &format!("Discard {lines}"), theme::red()) {
                     match patch(LineApply::Reverse) {
                         Some(patch) => shared.show(Dialog::confirm(
                             "Discard lines",
@@ -514,7 +514,7 @@ fn hunk_buttons(
                 }
             }
             DiffSource::Staged => {
-                if place(ui, &format!("Unstage {lines}"), theme::RED) {
+                if place(ui, &format!("Unstage {lines}"), theme::red()) {
                     match patch(LineApply::Reverse) {
                         Some(patch) => tab.run(ops::apply_patch(UNSTAGE_LINES, patch, true, true)),
                         None => stale(shared),
@@ -523,7 +523,7 @@ fn hunk_buttons(
             }
             DiffSource::Commit(_) => {}
         }
-        if place(ui, "Clear selection", theme::TEXT_DIM) {
+        if place(ui, "Clear selection", theme::text_dim()) {
             selection.clear();
         }
         return;
@@ -531,10 +531,10 @@ fn hunk_buttons(
 
     match target.source {
         DiffSource::Unstaged => {
-            if place(ui, "Stage Hunk", theme::GREEN) {
+            if place(ui, "Stage Hunk", theme::green()) {
                 tab.run(ops::apply_patch("Stage hunk", patch.clone(), true, false));
             }
-            if place(ui, "Discard Hunk", theme::RED) {
+            if place(ui, "Discard Hunk", theme::red()) {
                 shared.show(Dialog::confirm(
                     "Discard hunk",
                     "Discard this hunk from the working tree? This cannot be undone.",
@@ -544,7 +544,7 @@ fn hunk_buttons(
             }
         }
         DiffSource::Staged => {
-            if place(ui, "Unstage Hunk", theme::RED) {
+            if place(ui, "Unstage Hunk", theme::red()) {
                 tab.run(ops::apply_patch("Unstage hunk", patch, true, true));
             }
         }

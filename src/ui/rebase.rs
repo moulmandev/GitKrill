@@ -281,21 +281,21 @@ fn notice(ui: &mut Ui, text: &str) {
     let galley = ui.painter().layout(
         format!("{}  {text}", icons::WARNING),
         theme::font(14.0),
-        theme::TEXT_DIM,
+        theme::text_dim(),
         width,
     );
     let pos = rect.center() - galley.size() / 2.0;
-    ui.painter().galley(pos2(pos.x.round(), pos.y.round()), galley, theme::TEXT_DIM);
+    ui.painter().galley(pos2(pos.x.round(), pos.y.round()), galley, theme::text_dim());
     ui.allocate_rect(rect, Sense::hover());
 }
 
 fn action_style(action: Action) -> (&'static str, Color32, Key) {
     match action {
-        Action::Pick => (icons::CHECK, theme::TEXT_DIM, Key::P),
-        Action::Reword => (icons::PENCIL_SIMPLE, theme::BLUE, Key::R),
-        Action::Squash => (icons::ARROWS_MERGE, theme::ACCENT, Key::S),
-        Action::Fixup => (icons::WRENCH, theme::YELLOW, Key::F),
-        Action::Drop => (icons::TRASH, theme::RED, Key::D),
+        Action::Pick => (icons::CHECK, theme::text_dim(), Key::P),
+        Action::Reword => (icons::PENCIL_SIMPLE, theme::blue(), Key::R),
+        Action::Squash => (icons::ARROWS_MERGE, theme::accent(), Key::S),
+        Action::Fixup => (icons::WRENCH, theme::yellow(), Key::F),
+        Action::Drop => (icons::TRASH, theme::red(), Key::D),
     }
 }
 
@@ -463,10 +463,10 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, plan: &mut Plan, co
     egui::Panel::bottom("rebase-footer")
         .resizable(false)
         .show_separator_line(false)
-        .frame(Frame::new().fill(theme::BG_HEADER).inner_margin(Margin::symmetric(12, 9)))
+        .frame(Frame::new().fill(theme::bg_header()).inner_margin(Margin::symmetric(12, 9)))
         .show(ui, |ui| {
             let top = ui.max_rect().top() - 9.0;
-            ui.painter().hline(ui.max_rect().x_range().expand(12.0), top, Stroke::new(1.0, theme::BORDER));
+            ui.painter().hline(ui.max_rect().x_range().expand(12.0), top, Stroke::new(1.0, theme::border()));
             ui.horizontal(|ui| {
                 let buttons_w = 230.0;
                 let text_w = (ui.available_width() - buttons_w).max(160.0);
@@ -477,27 +477,27 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, plan: &mut Plan, co
                     };
 
                     if let Some(error) = &controls.error {
-                        line(ui, icons::WARNING_CIRCLE, theme::RED, error);
+                        line(ui, icons::WARNING_CIRCLE, theme::red(), error);
                     }
                     for problem in &problems {
-                        line(ui, icons::WARNING, theme::ORANGE, problem);
+                        line(ui, icons::WARNING, theme::orange(), problem);
                     }
-                    if stale && !blocked && widgets::tint_button(ui, "Reload the commits", theme::ACCENT).clicked() {
+                    if stale && !blocked && widgets::tint_button(ui, "Reload the commits", theme::accent()).clicked() {
                         outcome = Outcome::Restart(plan.range.base);
                     }
                     if let Some(base) = plan.range.suggested_base {
                         let label = format!("Start from {} instead", short(base));
-                        if widgets::tint_button(ui, &label, theme::ACCENT).clicked() {
+                        if widgets::tint_button(ui, &label, theme::accent()).clicked() {
                             outcome = Outcome::Restart(base);
                         }
                     }
                     if let Some(tree) = &tree {
-                        line(ui, icons::WARNING, theme::ORANGE, tree);
+                        line(ui, icons::WARNING, theme::orange(), tree);
                         let stashing = tab.is_running("Stash");
                         let can_stash = snap.as_ref().is_some_and(|s| s.state == crate::git::RepoState::Clean);
                         if can_stash
                             && !stashing
-                            && widgets::tint_button(ui, "Stash the changes", theme::ACCENT)
+                            && widgets::tint_button(ui, "Stash the changes", theme::accent())
                                 .on_hover_text("Saves them as a stash; pop it again after the rebase")
                                 .clicked()
                         {
@@ -510,7 +510,7 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, plan: &mut Plan, co
                             line(
                                 ui,
                                 icons::INFO,
-                                theme::TEXT_DIM,
+                                theme::text_dim(),
                                 "Nothing to do yet. Change an action, edit a message or move a commit.",
                             );
                         } else {
@@ -525,7 +525,7 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, plan: &mut Plan, co
                                     short(plan.range.base),
                                 ));
                             }
-                            line(ui, icons::LIST_NUMBERS, theme::TEXT_BRIGHT, &text);
+                            line(ui, icons::LIST_NUMBERS, theme::text_bright(), &text);
                         }
                     }
                     if controls.restored {
@@ -533,9 +533,9 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, plan: &mut Plan, co
                             ui.label(
                                 RichText::new("Picked up the plan you had open for these commits.")
                                     .size(12.0)
-                                    .color(theme::TEXT_DIM),
+                                    .color(theme::text_dim()),
                             );
-                            if widgets::tint_button(ui, "Start over", theme::TEXT_DIM).clicked() {
+                            if widgets::tint_button(ui, "Start over", theme::text_dim()).clicked() {
                                 outcome = Outcome::Restart(plan.range.base);
                             }
                         });
@@ -544,9 +544,9 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, plan: &mut Plan, co
 
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     let label = if controls.starting || running { "Starting…" } else { "Start rebase" };
-                    let fill = if can_start { theme::mix(theme::BG_APP, theme::ACCENT, 0.8) } else { theme::BG_RAISED };
+                    let fill = if can_start { theme::mix(theme::bg_app(), theme::accent(), 0.8) } else { theme::bg_raised() };
                     let text = RichText::new(format!("{}  {label}", icons::PLAY))
-                        .color(if can_start { Color32::WHITE } else { theme::TEXT_DIM });
+                        .color(if can_start { Color32::WHITE } else { theme::text_dim() });
                     let button = Button::new(text).fill(fill).min_size(vec2(124.0, 30.0));
                     let response = ui
                         .add_enabled(can_start, button)
@@ -573,7 +573,7 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, plan: &mut Plan, co
     let (hint, _) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::hover());
     {
         let painter = ui.painter().with_clip_rect(hint);
-        painter.rect_filled(hint, 0.0, theme::BG_PANEL);
+        painter.rect_filled(hint, 0.0, theme::bg_panel());
         let order = format!(
             "{}  Newest commit on top, oldest at the bottom, like the graph. Git applies them from \
              the bottom up, onto {}.",
@@ -584,19 +584,19 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, plan: &mut Plan, co
                     set its action (pick, reword, squash, fixup, drop).";
         let width = hint.width() - 24.0;
         let (upper, lower) = hint.split_top_bottom_at_y(hint.center().y);
-        let galley = widgets::elided(&painter, &order, theme::font(12.0), theme::TEXT, width);
+        let galley = widgets::elided(&painter, &order, theme::font(12.0), theme::text(), width);
         widgets::galley_left(&painter, upper.translate(vec2(0.0, 3.0)), hint.left() + 12.0, galley);
-        let galley = widgets::elided(&painter, keys, theme::font(12.0), theme::TEXT_DIM, width - 20.0);
+        let galley = widgets::elided(&painter, keys, theme::font(12.0), theme::text_dim(), width - 20.0);
         widgets::galley_left(&painter, lower.translate(vec2(0.0, -3.0)), hint.left() + 32.0, galley);
     }
     let (caption, _) = ui.allocate_exact_size(vec2(ui.available_width(), CAPTION_H), Sense::hover());
     {
         let painter = ui.painter().with_clip_rect(caption);
-        painter.rect_filled(caption, 0.0, theme::BG_HEADER);
-        painter.hline(caption.x_range(), caption.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+        painter.rect_filled(caption, 0.0, theme::bg_header());
+        painter.hline(caption.x_range(), caption.bottom() - 0.5, Stroke::new(1.0, theme::border()));
         let bar = ui.spacing().scroll.bar_width;
         let label = |x: f32, text: &str| {
-            painter.text(pos2(x, caption.center().y), Align2::LEFT_CENTER, text, theme::font(10.5), theme::TEXT_DIM);
+            painter.text(pos2(x, caption.center().y), Align2::LEFT_CENTER, text, theme::font(10.5), theme::text_dim());
         };
         label(caption.left() + HANDLE_W, "ACTION");
         label(caption.left() + HANDLE_W + CHIP_W + 12.0, "SHA");
@@ -654,16 +654,16 @@ fn line(painter: &Painter, text: &str, font: FontId, color: Color32, strike: boo
 fn icon_at(ui: &mut Ui, rect: Rect, salt: (&str, usize), icon: &str, enabled: bool, tooltip: &str) -> bool {
     let response = ui.interact(rect, ui.id().with(salt), if enabled { Sense::click() } else { Sense::hover() });
     let color = if !enabled {
-        theme::TEXT_FAINT
+        theme::text_faint()
     } else if response.hovered() {
-        theme::TEXT_BRIGHT
+        theme::text_bright()
     } else {
-        theme::TEXT_DIM
+        theme::text_dim()
     };
     if enabled && response.is_pointer_button_down_on() {
-        ui.painter().rect_filled(rect, 4.0, theme::BG_PRESSED);
+        ui.painter().rect_filled(rect, 4.0, theme::bg_pressed());
     } else if enabled && response.hovered() {
-        ui.painter().rect_filled(rect, 4.0, theme::BG_RAISED);
+        ui.painter().rect_filled(rect, 4.0, theme::bg_raised());
     }
     ui.painter().text(rect.center(), Align2::CENTER_CENTER, icon, theme::font(14.0), color);
     enabled && response.on_hover_text(tooltip).clicked()
@@ -735,12 +735,12 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
             let response = if locked { response } else { response.on_hover_cursor(CursorIcon::Grab) };
 
             widgets::row_background(&painter, rect, controls.selected == Some(source), response.hovered());
-            painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BG_PANEL));
+            painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::bg_panel()));
 
             // A squash or fixup with no kept commit below it has nowhere to go.
             let orphan = action.folds() && info.into.is_none();
             let (icon, color, _) = action_style(action);
-            let fade = |c: Color32| if dragging { theme::mix(c, theme::BG_APP, 0.6) } else { c };
+            let fade = |c: Color32| if dragging { theme::mix(c, theme::bg_app(), 0.6) } else { c };
             let mid = rect.center().y;
 
             painter.text(
@@ -748,18 +748,18 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
                 Align2::CENTER_CENTER,
                 icons::DOTS_SIX_VERTICAL,
                 theme::font(14.0),
-                if locked { theme::BG_RAISED } else { theme::TEXT_FAINT },
+                if locked { theme::bg_raised() } else { theme::text_faint() },
             );
 
             // ---- action chip, with its menu ----
             let chip = Rect::from_min_size(pos2(rect.left() + HANDLE_W, mid - 11.0), vec2(CHIP_W, 22.0));
             let chip_response = ui.interact(chip, ui.id().with(("action", source)), Sense::click());
             let strength = if chip_response.hovered() && !locked { 0.34 } else { 0.18 };
-            let outline = if orphan { theme::RED } else { theme::mix(theme::BG_APP, color, 0.6) };
+            let outline = if orphan { theme::red() } else { theme::mix(theme::bg_app(), color, 0.6) };
             painter.rect(
                 chip,
                 4.0,
-                theme::mix(theme::BG_APP, color, strength),
+                theme::mix(theme::bg_app(), color, strength),
                 Stroke::new(1.0, outline),
                 StrokeKind::Inside,
             );
@@ -769,7 +769,7 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
                 Align2::LEFT_CENTER,
                 action.label(),
                 theme::font(12.5),
-                fade(theme::TEXT_BRIGHT),
+                fade(theme::text_bright()),
             );
             if !locked {
                 painter.text(
@@ -777,7 +777,7 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
                     Align2::CENTER_CENTER,
                     icons::CARET_DOWN,
                     theme::font(10.0),
-                    theme::TEXT_DIM,
+                    theme::text_dim(),
                 );
                 Popup::menu(&chip_response).show(|ui| {
                     ui.set_min_width(300.0);
@@ -795,7 +795,7 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
             // ---- sha, message, author ----
             let commit = plan.commit(pos);
             let mut x = chip.right() + 12.0;
-            painter.text(pos2(x, mid), Align2::LEFT_CENTER, short(commit.oid), theme::mono(11.5), fade(theme::TEXT_DIM));
+            painter.text(pos2(x, mid), Align2::LEFT_CENTER, short(commit.oid), theme::mono(11.5), fade(theme::text_dim()));
             x += SHA_W;
 
             let bar = ui.spacing().scroll.bar_width;
@@ -803,22 +803,22 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
             let author_left = buttons_left - AUTHOR_W;
 
             if info.into.is_some() || orphan {
-                let (arrow, tint) = if orphan { (icons::WARNING, theme::RED) } else { (icons::ARROW_BEND_LEFT_DOWN, color) };
+                let (arrow, tint) = if orphan { (icons::WARNING, theme::red()) } else { (icons::ARROW_BEND_LEFT_DOWN, color) };
                 painter.text(pos2(x, mid), Align2::LEFT_CENTER, arrow, theme::font(13.0), fade(tint));
                 x += 20.0;
             } else if commit.is_merge {
                 // The reason the range cannot be rebased here.
-                painter.text(pos2(x, mid), Align2::LEFT_CENTER, icons::GIT_MERGE, theme::font(13.0), theme::ORANGE);
+                painter.text(pos2(x, mid), Align2::LEFT_CENTER, icons::GIT_MERGE, theme::font(13.0), theme::orange());
                 x += 20.0;
             }
             // A commit that gets a new message shows that message.
             let new_message = info.group.map(|g| plan.message(&groups[g])).filter(|m| *m != rebase::normalize(&commit.message));
             let (text, text_color, strike) = match (&new_message, action) {
-                (Some(message), _) => (subject(message).to_owned(), theme::TEXT_BRIGHT, false),
-                (None, Action::Drop) => (commit.summary.clone(), theme::TEXT_FAINT, true),
-                (None, Action::Fixup) => (commit.summary.clone(), theme::TEXT_DIM, true),
-                (None, Action::Squash) => (commit.summary.clone(), theme::TEXT_DIM, false),
-                (None, _) => (commit.summary.clone(), theme::TEXT, false),
+                (Some(message), _) => (subject(message).to_owned(), theme::text_bright(), false),
+                (None, Action::Drop) => (commit.summary.clone(), theme::text_faint(), true),
+                (None, Action::Fixup) => (commit.summary.clone(), theme::text_dim(), true),
+                (None, Action::Squash) => (commit.summary.clone(), theme::text_dim(), false),
+                (None, _) => (commit.summary.clone(), theme::text(), false),
             };
             let mut note = String::new();
             if let Some(g) = info.group
@@ -831,7 +831,7 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
             } else if d == n - 1 {
                 note = if note.is_empty() { "oldest".to_owned() } else { format!("{note}  ·  oldest") };
             }
-            let note_color = if controls.selected == Some(source) { theme::TEXT_DIM } else { theme::TEXT_FAINT };
+            let note_color = if controls.selected == Some(source) { theme::text_dim() } else { theme::text_faint() };
             let note_galley = line(&painter, &note, theme::font(11.0), fade(note_color), false, 220.0);
             let note_w = if note.is_empty() { 0.0 } else { note_galley.size().x + 14.0 };
             let room = (author_left - 10.0 - x - note_w).max(40.0);
@@ -842,7 +842,7 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
             }
 
             widgets::avatar(&painter, pos2(author_left + 9.0, mid), 9.0, &commit.author, &commit.email, None);
-            let author = line(&painter, &commit.author, theme::font(12.0), fade(theme::TEXT_DIM), false, AUTHOR_W - 34.0);
+            let author = line(&painter, &commit.author, theme::font(12.0), fade(theme::text_dim()), false, AUTHOR_W - 34.0);
             widgets::galley_left(&painter, rect, author_left + 26.0, author);
 
             // ---- fold toggle and move buttons ----
@@ -877,18 +877,18 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
         let base = Rect::from_min_size(pos2(content.left(), content.top() + tops[n]), vec2(content.width(), ROW_H));
         if ui.is_rect_visible(base) {
             let mid = base.center().y;
-            painter.rect_filled(base, 0.0, theme::BG_PANEL);
+            painter.rect_filled(base, 0.0, theme::bg_panel());
             painter.text(
                 pos2(base.left() + HANDLE_W + 8.0, mid),
                 Align2::LEFT_CENTER,
                 format!("{}  Base", icons::LOCK_SIMPLE),
                 theme::font(12.5),
-                theme::TEXT_FAINT,
+                theme::text_faint(),
             );
             let x = base.left() + HANDLE_W + CHIP_W + 12.0;
-            painter.text(pos2(x, mid), Align2::LEFT_CENTER, short(plan.range.base), theme::mono(11.5), theme::TEXT_FAINT);
+            painter.text(pos2(x, mid), Align2::LEFT_CENTER, short(plan.range.base), theme::mono(11.5), theme::text_faint());
             let text = format!("{}   (not changed; the commits above are replayed onto it)", plan.range.base_summary);
-            let galley = line(&painter, &text, theme::font(13.0), theme::TEXT_FAINT, false, base.right() - x - SHA_W - 20.0);
+            let galley = line(&painter, &text, theme::font(13.0), theme::text_faint(), false, base.right() - x - SHA_W - 20.0);
             widgets::galley_left(&painter, base, x + SHA_W, galley);
         }
 
@@ -907,8 +907,8 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
                         ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
                         if target != d {
                             let at = content.top() + tops[slot];
-                            painter.hline(content.x_range(), at, Stroke::new(2.0, theme::ACCENT));
-                            painter.circle_filled(pos2(content.left() + 6.0, at), 4.0, theme::ACCENT);
+                            painter.hline(content.x_range(), at, Stroke::new(2.0, theme::accent()));
+                            painter.circle_filled(pos2(content.left() + 6.0, at), 4.0, theme::accent());
                         }
                         // The row itself follows the pointer, above everything.
                         let ghost = Rect::from_min_size(
@@ -919,13 +919,13 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
                         top.rect(
                             ghost,
                             4.0,
-                            theme::BG_RAISED,
-                            Stroke::new(1.0, theme::ACCENT),
+                            theme::bg_raised(),
+                            Stroke::new(1.0, theme::accent()),
                             StrokeKind::Inside,
                         );
                         let commit = plan.commit(from);
                         let text = format!("{}   {}", short(commit.oid), commit.summary);
-                        let galley = line(&top, &text, theme::font(13.0), theme::TEXT_BRIGHT, false, ghost.width() - 24.0);
+                        let galley = line(&top, &text, theme::font(13.0), theme::text_bright(), false, ghost.width() - 24.0);
                         widgets::galley_left(&top, ghost, ghost.left() + 12.0, galley);
 
                         // Near an edge, scroll so far-away places can be reached.
@@ -968,9 +968,9 @@ fn editor(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, group: &Group, 
     let (_, color, _) = action_style(if kind == Editor::Combined { Action::Squash } else { Action::Reword });
 
     let painter = ui.painter().clone();
-    painter.rect_filled(block, 0.0, theme::BG_PANEL);
+    painter.rect_filled(block, 0.0, theme::bg_panel());
     painter.rect_filled(Rect::from_min_max(block.min, pos2(block.left() + 3.0, block.bottom())), 0.0, color);
-    painter.hline(block.x_range(), block.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+    painter.hline(block.x_range(), block.bottom() - 0.5, Stroke::new(1.0, theme::border()));
 
     // What the editor shows until the user types something else.
     let (default, title) = match kind {
@@ -1004,17 +1004,17 @@ fn editor(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, group: &Group, 
         ui.spacing_mut().item_spacing = vec2(8.0, 4.0);
         ui.horizontal(|ui| {
             ui.set_height(22.0);
-            ui.label(RichText::new(title).size(12.0).color(theme::TEXT_DIM));
+            ui.label(RichText::new(title).size(12.0).color(theme::text_dim()));
             if outdated {
                 ui.label(
                     RichText::new(format!("{}  The commits in this group changed after you wrote this.", icons::WARNING))
                         .size(12.0)
-                        .color(theme::ORANGE),
+                        .color(theme::orange()),
                 );
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let label = if kind == Editor::Combined { "Use the proposal" } else { "Original message" };
-                if edited && !locked && widgets::tint_button(ui, label, theme::TEXT_DIM).clicked() {
+                if edited && !locked && widgets::tint_button(ui, label, theme::text_dim()).clicked() {
                     reset = true;
                 }
             });

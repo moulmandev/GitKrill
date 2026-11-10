@@ -47,7 +47,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
             tree(ui, tab, "local", &locals, 0, !filter.is_empty(), &mut |ui, tab, index, name, depth| {
                 let branch = &snap.branches[index];
                 let response = local_row(ui, tab, shared, &snap, branch, name, depth);
-                drag::source(&response, || Some(Branch::local(&branch.name)), theme::ACCENT);
+                drag::source(&response, || Some(Branch::local(&branch.name)), theme::accent());
                 landing(ui, tab, &snap, session, &response, || Target::Branch(Branch::local(&branch.name)));
             });
         }
@@ -61,10 +61,10 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                 let collapsed = tab.collapsed.contains(&key);
                 let response = row(ui, 0, false, |painter, rect, x| {
                     let caret = if collapsed { icons::CARET_RIGHT } else { icons::CARET_DOWN };
-                    painter.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, caret, theme::font(11.0), theme::TEXT_DIM);
-                    painter.text(pos2(x + 16.0, rect.center().y), Align2::LEFT_CENTER, icons::GLOBE, theme::font(14.0), theme::TEXT_DIM);
-                    let galley = elided(painter, &remote.name, theme::bold(13.0), theme::TEXT, rect.right() - x - 44.0);
-                    painter.galley(pos2(x + 36.0, rect.center().y - galley.size().y / 2.0), galley, theme::TEXT);
+                    painter.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, caret, theme::font(11.0), theme::text_dim());
+                    painter.text(pos2(x + 16.0, rect.center().y), Align2::LEFT_CENTER, icons::GLOBE, theme::font(14.0), theme::text_dim());
+                    let galley = elided(painter, &remote.name, theme::bold(13.0), theme::text(), rect.right() - x - 44.0);
+                    painter.galley(pos2(x + 36.0, rect.center().y - galley.size().y / 2.0), galley, theme::text());
                 });
                 if response.clicked() {
                     toggle(tab, &key);
@@ -97,7 +97,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                 tree(ui, tab, &key, &items, 1, !filter.is_empty(), &mut |ui, tab, index, name, depth| {
                     let branch = &snap.remote_branches[index];
                     let response = remote_row(ui, tab, shared, &snap, branch, name, depth);
-                    drag::source(&response, || Some(Branch::remote(branch)), theme::ACCENT);
+                    drag::source(&response, || Some(Branch::remote(branch)), theme::accent());
                     landing(ui, tab, &snap, session, &response, || Target::Branch(Branch::remote(branch)));
                 });
             }
@@ -107,7 +107,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
         let stashes: Vec<_> = snap.stashes.iter().filter(|s| matches(&s.message)).collect();
         if section(ui, tab, "STASHES", icons::ARCHIVE, stashes.len(), snap.stashes.len()) {
             for stash in stashes {
-                let response = leaf(ui, 0, false, icons::ARCHIVE, &stash.message, theme::TEXT, "");
+                let response = leaf(ui, 0, false, icons::ARCHIVE, &stash.message, theme::text(), "");
                 if response.clicked() {
                     tab.jump_to(stash.oid);
                 }
@@ -119,7 +119,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
         let tags: Vec<_> = snap.tags.iter().filter(|t| matches(&t.name)).collect();
         if section(ui, tab, "TAGS", icons::TAG, tags.len(), snap.tags.len()) {
             for tag in tags {
-                let response = leaf(ui, 0, false, icons::TAG, &tag.name, theme::TEXT, "");
+                let response = leaf(ui, 0, false, icons::TAG, &tag.name, theme::text(), "");
                 if response.clicked() {
                     tab.jump_to(tag.oid);
                 }
@@ -153,7 +153,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
         let total = snap.submodules.len();
         if section(ui, tab, "SUBMODULES", icons::STACK, total, total) {
             for sub in &snap.submodules {
-                leaf(ui, 0, false, icons::PACKAGE, &sub.name, theme::TEXT, "").on_hover_text(&sub.path);
+                leaf(ui, 0, false, icons::PACKAGE, &sub.name, theme::text(), "").on_hover_text(&sub.path);
             }
         }
 
@@ -199,19 +199,19 @@ pub fn section(ui: &mut Ui, tab: &mut RepoTab, title: &str, icon: &str, shown: u
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        painter.rect_filled(rect, 0.0, if response.hovered() { theme::BG_HOVER } else { theme::BG_PANEL });
-        painter.hline(rect.x_range(), rect.top(), egui::Stroke::new(1.0, theme::BORDER));
+        painter.rect_filled(rect, 0.0, if response.hovered() { theme::bg_hover() } else { theme::bg_panel() });
+        painter.hline(rect.x_range(), rect.top(), egui::Stroke::new(1.0, theme::border()));
         let y = rect.center().y;
         let caret = if open { icons::CARET_DOWN } else { icons::CARET_RIGHT };
-        painter.text(pos2(rect.left() + 9.0, y), Align2::LEFT_CENTER, caret, theme::font(11.0), theme::TEXT_DIM);
-        painter.text(pos2(rect.left() + 26.0, y), Align2::LEFT_CENTER, icon, theme::font(15.0), theme::TEXT_DIM);
+        painter.text(pos2(rect.left() + 9.0, y), Align2::LEFT_CENTER, caret, theme::font(11.0), theme::text_dim());
+        painter.text(pos2(rect.left() + 26.0, y), Align2::LEFT_CENTER, icon, theme::font(15.0), theme::text_dim());
         let count = if shown == total { total.to_string() } else { format!("{shown}/{total}") };
         let count_rect =
-            painter.text(pos2(rect.right() - 12.0, y), Align2::RIGHT_CENTER, count, theme::bold(11.5), theme::ACCENT);
+            painter.text(pos2(rect.right() - 12.0, y), Align2::RIGHT_CENTER, count, theme::bold(11.5), theme::accent());
         // The title gives way to the count when the sidebar is narrow.
         let title_x = rect.left() + 48.0;
-        let galley = elided(painter, title, theme::bold(11.5), theme::TEXT, count_rect.left() - 8.0 - title_x);
-        painter.galley(pos2(title_x, (y - galley.size().y / 2.0).round()), galley, theme::TEXT);
+        let galley = elided(painter, title, theme::bold(11.5), theme::text(), count_rect.left() - 8.0 - title_x);
+        painter.galley(pos2(title_x, (y - galley.size().y / 2.0).round()), galley, theme::text());
     }
     if response.clicked() {
         toggle(tab, &key);
@@ -248,11 +248,11 @@ pub fn leaf(
 ) -> Response {
     row(ui, depth, highlighted, |painter, rect, x| {
         let y = rect.center().y;
-        let icon_color = if highlighted { theme::TEXT_BRIGHT } else { theme::TEXT_DIM };
+        let icon_color = if highlighted { theme::text_bright() } else { theme::text_dim() };
         painter.text(pos2(x, y), Align2::LEFT_CENTER, icon, theme::font(14.0), icon_color);
         let mut right = rect.right() - 10.0;
         if !trailing.is_empty() {
-            let used = painter.text(pos2(right, y), Align2::RIGHT_CENTER, trailing, theme::font(11.0), theme::TEXT_DIM);
+            let used = painter.text(pos2(right, y), Align2::RIGHT_CENTER, trailing, theme::font(11.0), theme::text_dim());
             right = used.left() - 6.0;
         }
         let font = if highlighted { theme::bold(13.0) } else { theme::font(13.0) };
@@ -298,9 +298,9 @@ fn tree(
             let response = row(ui, base_depth + depth, false, |painter, rect, x| {
                 let y = rect.center().y;
                 let icon = if collapsed { icons::FOLDER } else { icons::FOLDER_OPEN };
-                painter.text(pos2(x, y), Align2::LEFT_CENTER, icon, theme::font(14.0), theme::TEXT_DIM);
-                let galley = elided(painter, part, theme::font(13.0), theme::TEXT_DIM, rect.right() - x - 30.0);
-                painter.galley(pos2(x + 20.0, (y - galley.size().y / 2.0).round()), galley, theme::TEXT_DIM);
+                painter.text(pos2(x, y), Align2::LEFT_CENTER, icon, theme::font(14.0), theme::text_dim());
+                let galley = elided(painter, part, theme::font(13.0), theme::text_dim(), rect.right() - x - 30.0);
+                painter.galley(pos2(x + 20.0, (y - galley.size().y / 2.0).round()), galley, theme::text_dim());
             });
             if response.clicked() {
                 toggle(tab, &key);
@@ -336,9 +336,9 @@ fn local_row(
         trailing.push_str(&format!("{}{}", branch.behind, icons::ARROW_DOWN));
     }
     let (icon, color) = if branch.is_head {
-        (icons::CHECK, theme::TEXT_BRIGHT)
+        (icons::CHECK, theme::text_bright())
     } else {
-        (icons::GIT_BRANCH, theme::TEXT)
+        (icons::GIT_BRANCH, theme::text())
     };
 
     // Branch rows can also be dragged; a click is still a click.
@@ -426,7 +426,7 @@ fn remote_row(
     name: &str,
     depth: usize,
 ) -> Response {
-    let response = leaf(ui, depth, false, icons::GIT_BRANCH, name, theme::TEXT, "").interact(Sense::drag());
+    let response = leaf(ui, depth, false, icons::GIT_BRANCH, name, theme::text(), "").interact(Sense::drag());
     if response.double_clicked() {
         tab.run(checkout_remote(snap, branch));
     } else if response.clicked() {

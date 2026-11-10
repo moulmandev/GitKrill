@@ -63,13 +63,15 @@ static PARKED: Mutex<Vec<Resolver>> = Mutex::new(Vec::new());
 
 fn side_color(side: Side) -> Color32 {
     match side {
-        Side::Ours => theme::BLUE,
-        Side::Theirs => theme::YELLOW,
+        Side::Ours => theme::blue(),
+        Side::Theirs => theme::yellow(),
     }
 }
 
 /// Colour for text typed by hand.
-const TYPED: Color32 = theme::GREEN;
+fn typed() -> Color32 {
+    theme::green()
+}
 
 enum Phase {
     /// Nothing requested yet.
@@ -965,14 +967,14 @@ fn text_ui(
         detail: "click a line to edit it by hand".to_owned(),
         marker: String::new(),
     };
-    pane_header(ui, result_head, &result_info, TYPED);
+    pane_header(ui, result_head, &result_info, typed());
     if !status.is_empty() {
         ui.painter().text(
             pos2(result_head.right() - 10.0, result_head.center().y),
             Align2::RIGHT_CENTER,
             status,
             theme::font(12.0),
-            theme::YELLOW,
+            theme::yellow(),
         );
     }
 
@@ -991,7 +993,7 @@ fn text_ui(
     let cursor = result_pane(ui, &scene, result_rect, text_w, &mut view.editing, &mut actions);
 
     let painter = ui.painter();
-    painter.vline(middle + 0.5, sides.y_range(), Stroke::new(1.0, theme::BORDER));
+    painter.vline(middle + 0.5, sides.y_range(), Stroke::new(1.0, theme::border()));
 
     // Scrollbars, with a tick for every conflict.
     let marks: Vec<(f32, Color32)> = view
@@ -1001,7 +1003,7 @@ fn text_ui(
         .filter_map(|block| match block.kind {
             Kind::Conflict { index } => {
                 let open = view.draft.choices.get(index) == Some(&Resolution::Unresolved);
-                Some((block.top, if open { theme::ORANGE } else { theme::GREEN }))
+                Some((block.top, if open { theme::orange() } else { theme::green() }))
             }
             _ => None,
         })
@@ -1048,16 +1050,16 @@ fn title_buttons(ui: &mut Ui, free: Rect, open: usize, dirty: bool, saving: bool
         pos2((free.right() - width).max(free.left()), free.top() + 1.0),
         pos2(free.right(), free.bottom() - 1.0),
     );
-    ui.painter().rect_filled(backing, 0.0, theme::BG_HEADER);
+    ui.painter().rect_filled(backing, 0.0, theme::bg_header());
 
     ui.scope_builder(UiBuilder::new().max_rect(free).layout(Layout::right_to_left(Align::Center)), |ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         if saving {
-            ui.label(RichText::new("Saving…").color(theme::TEXT_DIM));
-            ui.add(egui::Spinner::new().size(13.0).color(theme::ACCENT));
+            ui.label(RichText::new("Saving…").color(theme::text_dim()));
+            ui.add(egui::Spinner::new().size(13.0).color(theme::accent()));
             return;
         }
-        let resolve = ui.add_enabled_ui(open == 0, |ui| tint_button(ui, RESOLVE, theme::GREEN)).inner;
+        let resolve = ui.add_enabled_ui(open == 0, |ui| tint_button(ui, RESOLVE, theme::green())).inner;
         let hint = match open {
             0 => "Write the result to the file and stage it, which marks the conflict as resolved".to_owned(),
             1 => "1 conflict is still unresolved".to_owned(),
@@ -1066,7 +1068,7 @@ fn title_buttons(ui: &mut Ui, free: Rect, open: usize, dirty: bool, saving: bool
         if resolve.on_hover_text(&hint).on_disabled_hover_text(&hint).clicked() {
             actions.push(Action::Save { mark_resolved: true });
         }
-        let save = ui.add_enabled_ui(dirty, |ui| tint_button(ui, SAVE, theme::ACCENT)).inner;
+        let save = ui.add_enabled_ui(dirty, |ui| tint_button(ui, SAVE, theme::accent())).inner;
         let hint = "Write the result to the file but leave it marked as conflicted. \
                     Unresolved regions keep their conflict markers.";
         if save.on_hover_text(hint).on_disabled_hover_text("Nothing new to save").clicked() {
@@ -1078,25 +1080,25 @@ fn title_buttons(ui: &mut Ui, free: Rect, open: usize, dirty: bool, saving: bool
 /// Progress, navigation and the bulk choices.
 fn toolbar(ui: &mut Ui, open: usize, total: usize, saving: bool, actions: &mut Vec<Action>) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), TOOLBAR_H), Sense::hover());
-    ui.painter().rect_filled(rect, 0.0, theme::BG_PANEL);
-    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+    ui.painter().rect_filled(rect, 0.0, theme::bg_panel());
+    ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::border()));
 
     let inner = rect.shrink2(vec2(10.0, 0.0));
     ui.scope_builder(UiBuilder::new().max_rect(inner).layout(Layout::left_to_right(Align::Center)), |ui| {
         ui.spacing_mut().item_spacing.x = 6.0;
         let (icon, color, text) = if total == 0 {
-            (icons::CHECK_CIRCLE, theme::GREEN, "No conflicting lines: the two sides merge cleanly".to_owned())
+            (icons::CHECK_CIRCLE, theme::green(), "No conflicting lines: the two sides merge cleanly".to_owned())
         } else if open == 0 {
             let all = match total {
                 1 => "The conflict is resolved".to_owned(),
                 n => format!("All {n} conflicts resolved"),
             };
-            (icons::CHECK_CIRCLE, theme::GREEN, all)
+            (icons::CHECK_CIRCLE, theme::green(), all)
         } else {
-            (icons::WARNING, theme::ORANGE, format!("{} of {total} conflicts resolved", total - open))
+            (icons::WARNING, theme::orange(), format!("{} of {total} conflicts resolved", total - open))
         };
         ui.label(RichText::new(icon).size(15.0).color(color));
-        ui.label(RichText::new(text).font(theme::bold(13.0)).color(theme::TEXT_BRIGHT));
+        ui.label(RichText::new(text).font(theme::bold(13.0)).color(theme::text_bright()));
         if total > 0 {
             ui.add_space(6.0);
             if icon_button(ui, icons::ARROW_UP, 14.0, "Previous conflict (Alt+Up)").clicked() {
@@ -1112,7 +1114,7 @@ fn toolbar(ui: &mut Ui, open: usize, total: usize, saving: bool, actions: &mut V
                 return;
             }
             ui.add_enabled_ui(!saving, |ui| {
-                if tint_button(ui, "Reset", theme::RED)
+                if tint_button(ui, "Reset", theme::red())
                     .on_hover_text("Forget every choice and edit, back to all conflicts unresolved")
                     .clicked()
                 {
@@ -1132,32 +1134,32 @@ fn toolbar(ui: &mut Ui, open: usize, total: usize, saving: bool, actions: &mut V
 fn notice(ui: &mut Ui, text: &str) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), NOTICE_H), Sense::hover());
     let painter = ui.painter().with_clip_rect(rect);
-    painter.rect_filled(rect, 0.0, theme::mix(theme::BG_APP, theme::YELLOW, 0.14));
+    painter.rect_filled(rect, 0.0, theme::mix(theme::bg_app(), theme::yellow(), 0.14));
     let x = rect.left() + 12.0;
-    let w = widgets::text_left(&painter, rect, x, icons::INFO, theme::font(14.0), theme::YELLOW);
-    widgets::text_left(&painter, rect, x + w + 8.0, text, theme::font(12.0), theme::TEXT);
+    let w = widgets::text_left(&painter, rect, x, icons::INFO, theme::font(14.0), theme::yellow());
+    widgets::text_left(&painter, rect, x + w + 8.0, text, theme::font(12.0), theme::text());
 }
 
 /// The strip above a pane saying what it shows: `CURRENT  main  1a2b3c4 Summary`.
 fn pane_header(ui: &Ui, rect: Rect, info: &SideInfo, color: Color32) {
     let painter = ui.painter().with_clip_rect(rect);
-    painter.rect_filled(rect, 0.0, theme::BG_HEADER);
-    painter.hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, theme::BORDER));
-    painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::BORDER));
+    painter.rect_filled(rect, 0.0, theme::bg_header());
+    painter.hline(rect.x_range(), rect.top() + 0.5, Stroke::new(1.0, theme::border()));
+    painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::border()));
 
-    let tag = painter.layout_no_wrap(info.role.to_uppercase(), theme::bold(10.5), theme::TEXT_BRIGHT);
+    let tag = painter.layout_no_wrap(info.role.to_uppercase(), theme::bold(10.5), theme::text_bright());
     let chip = Rect::from_min_size(
         pos2(rect.left() + 10.0, rect.center().y - 9.0),
         vec2(tag.size().x + 12.0, 18.0),
     );
-    painter.rect_filled(chip, 3.0, theme::mix(theme::BG_APP, color, 0.45));
+    painter.rect_filled(chip, 3.0, theme::mix(theme::bg_app(), color, 0.45));
     widgets::galley_left(&painter, chip, chip.left() + 6.0, tag);
 
     let x = chip.right() + 8.0;
     let galley = widgets::elided_pair(
         &painter,
-        (&info.name, theme::bold(13.0), theme::TEXT_BRIGHT),
-        (&info.detail, theme::font(12.0), theme::TEXT_DIM),
+        (&info.name, theme::bold(13.0), theme::text_bright()),
+        (&info.detail, theme::font(12.0), theme::text_dim()),
         rect.right() - x - 8.0,
     );
     widgets::galley_left(&painter, rect, x, galley);
@@ -1187,7 +1189,7 @@ fn draw_number(painter: &Painter, gutter: f32, pane: Rect, top: f32, number: usi
         Align2::RIGHT_CENTER,
         number.to_string(),
         theme::mono(11.0),
-        theme::TEXT_FAINT,
+        theme::text_faint(),
     );
 }
 
@@ -1218,9 +1220,9 @@ fn pane_ui(ui: &mut Ui, rect: Rect, salt: &str) -> Ui {
 /// the line numbers).
 fn pane_backdrop(ui: &Ui, rect: Rect, gutter: f32) -> (Painter, Painter) {
     let painter = ui.painter().clone();
-    painter.rect_filled(rect, 0.0, theme::BG_APP);
+    painter.rect_filled(rect, 0.0, theme::bg_app());
     let numbers = Rect::from_min_max(rect.min, pos2(rect.left() + gutter, rect.bottom()));
-    painter.rect_filled(numbers, 0.0, theme::BG_PANEL);
+    painter.rect_filled(numbers, 0.0, theme::bg_panel());
     let text_clip = Rect::from_min_max(pos2(rect.left() + gutter, rect.top()), rect.max);
     let text_painter = painter.with_clip_rect(text_clip.intersect(painter.clip_rect()));
     (painter, text_painter)
@@ -1232,7 +1234,7 @@ fn outline_current(painter: &Painter, pane: Rect, block: &Block, top: f32) {
         rect,
         0.0,
         Color32::TRANSPARENT,
-        Stroke::new(1.0, theme::with_alpha(theme::TEXT_BRIGHT, 70)),
+        Stroke::new(1.0, theme::with_alpha(theme::text_bright(), 70)),
         StrokeKind::Inside,
     );
 }
@@ -1259,17 +1261,17 @@ fn side_pane(ui: &mut Ui, scene: &Scene<'_>, rect: Rect, side: Side, actions: &m
                 for row in visible_rows(top, to - from, rect) {
                     let y = top + row as f32 * LINE_H;
                     draw_number(&painter, scene.gutter, rect, y, block.above[pane] + row + 1);
-                    draw_line(&text_painter, text_x, y, &chunk.line(from + row), &scene.font, theme::TEXT);
+                    draw_line(&text_painter, text_x, y, &chunk.line(from + row), &scene.font, theme::text());
                 }
             }
             Kind::Edited { seg, line } => {
                 // The sides keep showing the line as it was merged.
                 let Segment::Stable(chunk) = &scene.merge.segments[seg] else { continue };
                 draw_number(&painter, scene.gutter, rect, top, block.above[pane] + 1);
-                draw_line(&text_painter, text_x, top, &chunk.line(line), &scene.font, theme::TEXT);
+                draw_line(&text_painter, text_x, top, &chunk.line(line), &scene.font, theme::text());
                 for row in 1..block.rows {
                     let filler = row_rect(scene.gutter, rect, top + row as f32 * LINE_H);
-                    painter.rect_filled(filler, 0.0, theme::BG_INPUT);
+                    painter.rect_filled(filler, 0.0, theme::bg_input());
                 }
             }
             Kind::Conflict { index } => {
@@ -1292,11 +1294,11 @@ fn side_pane(ui: &mut Ui, scene: &Scene<'_>, rect: Rect, side: Side, actions: &m
                     (false, true) => 0.26,
                     (false, false) => 0.17,
                 };
-                painter.rect_filled(head, 0.0, theme::mix(theme::BG_APP, color, strength));
+                painter.rect_filled(head, 0.0, theme::mix(theme::bg_app(), color, strength));
                 let cy = head.center().y;
                 let (icon, icon_color) = match used {
-                    Used::No => (icons::SQUARE, theme::TEXT_DIM),
-                    _ => (icons::CHECK_SQUARE, theme::TEXT_BRIGHT),
+                    Used::No => (icons::SQUARE, theme::text_dim()),
+                    _ => (icons::CHECK_SQUARE, theme::text_bright()),
                 };
                 painter.text(pos2(head.left() + 12.0, cy), Align2::LEFT_CENTER, icon, theme::font(16.0), icon_color);
                 let label = match used {
@@ -1304,7 +1306,7 @@ fn side_pane(ui: &mut Ui, scene: &Scene<'_>, rect: Rect, side: Side, actions: &m
                     Used::Second => format!("{take}  ·  placed second"),
                     _ => take.to_owned(),
                 };
-                let label_color = if used == Used::No { theme::TEXT } else { theme::TEXT_BRIGHT };
+                let label_color = if used == Used::No { theme::text() } else { theme::text_bright() };
                 let at = pos2(head.left() + 36.0, cy);
                 painter.text(at, Align2::LEFT_CENTER, label, theme::font(12.5), label_color);
                 let lines = match chunk.len() {
@@ -1313,7 +1315,7 @@ fn side_pane(ui: &mut Ui, scene: &Scene<'_>, rect: Rect, side: Side, actions: &m
                     n => format!("{n} lines"),
                 };
                 let at = pos2(head.right() - 10.0, cy);
-                painter.text(at, Align2::RIGHT_CENTER, lines, theme::font(11.5), theme::TEXT_DIM);
+                painter.text(at, Align2::RIGHT_CENTER, lines, theme::font(11.5), theme::text_dim());
                 if hit.clicked() {
                     actions.push(Action::Toggle(index, side));
                 }
@@ -1321,22 +1323,22 @@ fn side_pane(ui: &mut Ui, scene: &Scene<'_>, rect: Rect, side: Side, actions: &m
                 // This side's lines.
                 let body_top = top + HEAD_H;
                 let (tint, text_color) = match (used != Used::No, open) {
-                    (true, _) => (0.22, theme::TEXT_BRIGHT),
-                    (false, true) => (0.11, theme::TEXT),
+                    (true, _) => (0.22, theme::text_bright()),
+                    (false, true) => (0.11, theme::text()),
                     // Resolved without this side.
-                    (false, false) => (0.04, theme::TEXT_DIM),
+                    (false, false) => (0.04, theme::text_dim()),
                 };
                 for row in visible_rows(body_top, block.rows, rect) {
                     let y = body_top + row as f32 * LINE_H;
                     if row < chunk.len() {
-                        let fill = theme::mix(theme::BG_APP, color, tint);
+                        let fill = theme::mix(theme::bg_app(), color, tint);
                         painter.rect_filled(row_rect(scene.gutter, rect, y), 0.0, fill);
                         draw_number(&painter, scene.gutter, rect, y, block.above[pane] + row + 1);
                         draw_line(&text_painter, text_x, y, &chunk.line(row), &scene.font, text_color);
                     } else {
-                        painter.rect_filled(row_rect(scene.gutter, rect, y), 0.0, theme::BG_INPUT);
+                        painter.rect_filled(row_rect(scene.gutter, rect, y), 0.0, theme::bg_input());
                         if chunk.is_empty() && row == 0 {
-                            draw_remark(&painter, scene.gutter, rect, y, "no lines on this side", theme::TEXT_FAINT);
+                            draw_remark(&painter, scene.gutter, rect, y, "no lines on this side", theme::text_faint());
                         }
                     }
                 }
@@ -1364,13 +1366,13 @@ fn side_pane(ui: &mut Ui, scene: &Scene<'_>, rect: Rect, side: Side, actions: &m
 
 fn state_label(choice: &Resolution) -> (&'static str, Color32) {
     match choice {
-        Resolution::Unresolved => ("unresolved", theme::ORANGE),
+        Resolution::Unresolved => ("unresolved", theme::orange()),
         Resolution::Ours => ("current taken", side_color(Side::Ours)),
         Resolution::Theirs => ("incoming taken", side_color(Side::Theirs)),
-        Resolution::OursTheirs => ("both taken: current, then incoming", theme::TEXT),
-        Resolution::TheirsOurs => ("both taken: incoming, then current", theme::TEXT),
-        Resolution::Neither => ("both sides dropped", theme::TEXT),
-        Resolution::Custom(_) => ("typed by hand", TYPED),
+        Resolution::OursTheirs => ("both taken: current, then incoming", theme::text()),
+        Resolution::TheirsOurs => ("both taken: incoming, then current", theme::text()),
+        Resolution::Neither => ("both sides dropped", theme::text()),
+        Resolution::Custom(_) => ("typed by hand", typed()),
     }
 }
 
@@ -1399,7 +1401,7 @@ fn result_pane(
                 for row in visible_rows(top, to - from, rect) {
                     let y = top + row as f32 * LINE_H;
                     draw_number(&painter, scene.gutter, rect, y, block.above[2] + row + 1);
-                    draw_line(&text_painter, text_x, y, &chunk.line(from + row), &scene.font, theme::TEXT);
+                    draw_line(&text_painter, text_x, y, &chunk.line(from + row), &scene.font, theme::text());
                 }
             }
             Kind::Edited { seg, line } => {
@@ -1408,7 +1410,7 @@ fn result_pane(
                     pos2(rect.left() + scene.gutter, top),
                     pos2(rect.right(), top + block.rows as f32 * LINE_H),
                 );
-                painter.rect_filled(area, 0.0, theme::mix(theme::BG_APP, TYPED, 0.13));
+                painter.rect_filled(area, 0.0, theme::mix(theme::bg_app(), typed(), 0.13));
                 if let Some(open) = editing.as_mut().filter(|e| e.target == target) {
                     for row in visible_rows(top, block.rows, rect) {
                         let y = top + row as f32 * LINE_H;
@@ -1418,25 +1420,25 @@ fn result_pane(
                 } else {
                     let typed = scene.draft.edits.get(&(seg, line)).map(String::as_str).unwrap_or_default();
                     if typed.is_empty() {
-                        draw_remark(&painter, scene.gutter, rect, top, "line removed", theme::TEXT_DIM);
+                        draw_remark(&painter, scene.gutter, rect, top, "line removed", theme::text_dim());
                     }
                     for (row, text) in typed.split('\n').enumerate().take(text_rows(typed)) {
                         let y = top + row as f32 * LINE_H;
                         draw_number(&painter, scene.gutter, rect, y, block.above[2] + row + 1);
-                        draw_line(&text_painter, text_x, y, text, &scene.font, theme::TEXT_BRIGHT);
+                        draw_line(&text_painter, text_x, y, text, &scene.font, theme::text_bright());
                     }
                     let size = tint_button_size(ui, "Restore");
                     let corner = pos2(rect.right() - size.x - 8.0, top + (LINE_H - size.y) / 2.0);
                     let button = Rect::from_min_size(corner, size);
                     if ui.rect_contains_pointer(area)
-                        && tint_button_at(ui, button, "Restore", theme::RED)
+                        && tint_button_at(ui, button, "Restore", theme::red())
                             .on_hover_text("Put the merged line back")
                             .clicked()
                     {
                         actions.push(Action::Restore(seg, line));
                     }
                 }
-                painter.rect_filled(Rect::from_min_size(area.min, vec2(3.0, area.height())), 0.0, TYPED);
+                painter.rect_filled(Rect::from_min_size(area.min, vec2(3.0, area.height())), 0.0, typed());
             }
             Kind::Conflict { index } => {
                 let Some((ours, theirs)) = scene.merge.conflict(index) else { continue };
@@ -1447,14 +1449,14 @@ fn result_pane(
 
                 // Header strip: state and the choices that are not a side.
                 let head = Rect::from_min_max(pos2(rect.left(), top), pos2(rect.right(), top + HEAD_H));
-                let accent = if open { theme::ORANGE } else { theme::GREEN };
-                painter.rect_filled(head, 0.0, theme::mix(theme::BG_APP, accent, if open { 0.22 } else { 0.13 }));
+                let accent = if open { theme::orange() } else { theme::green() };
+                painter.rect_filled(head, 0.0, theme::mix(theme::bg_app(), accent, if open { 0.22 } else { 0.13 }));
                 let cy = head.center().y;
                 let icon = if open { icons::WARNING } else { icons::CHECK_CIRCLE };
                 painter.text(pos2(head.left() + 12.0, cy), Align2::LEFT_CENTER, icon, theme::font(15.0), accent);
                 let title = format!("Conflict {} of {total}", index + 1);
                 let x = head.left() + 36.0;
-                let w = widgets::text_left(&painter, head, x, &title, theme::bold(12.5), theme::TEXT_BRIGHT);
+                let w = widgets::text_left(&painter, head, x, &title, theme::bold(12.5), theme::text_bright());
                 let (state, state_color) = state_label(choice);
                 widgets::text_left(&painter, head, x + w + 10.0, state, theme::font(12.5), state_color);
 
@@ -1465,14 +1467,14 @@ fn result_pane(
                     right = button.left() - 6.0;
                     tint_button_at(ui, button, label, tint).on_hover_text(hint).clicked()
                 };
-                if !open && place(ui, "Reset", theme::RED, "Back to unresolved") {
+                if !open && place(ui, "Reset", theme::red(), "Back to unresolved") {
                     actions.push(Action::Set(index, Resolution::Unresolved));
                 }
                 if is_editing {
-                    if place(ui, "Done", TYPED, "Finish typing (Esc)") {
+                    if place(ui, "Done", typed(), "Finish typing (Esc)") {
                         actions.push(Action::StopEditing);
                     }
-                } else if place(ui, "Edit", TYPED, "Type the result for this conflict by hand") {
+                } else if place(ui, "Edit", typed(), "Type the result for this conflict by hand") {
                     actions.push(Action::Edit(target, (usize::MAX, 0)));
                 }
                 // One more button, depending on where the conflict stands.
@@ -1489,7 +1491,7 @@ fn result_pane(
                     _ => None,
                 };
                 if let Some((label, hint, becomes)) = extra
-                    && place(ui, label, theme::ACCENT, hint)
+                    && place(ui, label, theme::accent(), hint)
                 {
                     actions.push(Action::Set(index, becomes));
                 }
@@ -1501,22 +1503,22 @@ fn result_pane(
                     pos2(rect.right(), body_top + block.rows as f32 * LINE_H),
                 );
                 if let Some(open) = editing.as_mut().filter(|e| e.target == target) {
-                    painter.rect_filled(area, 0.0, theme::mix(theme::BG_APP, TYPED, 0.13));
+                    painter.rect_filled(area, 0.0, theme::mix(theme::bg_app(), typed(), 0.13));
                     for row in visible_rows(body_top, text_rows(&open.text).max(1), rect) {
                         let y = body_top + row as f32 * LINE_H;
                         draw_number(&painter, scene.gutter, rect, y, block.above[2] + row + 1);
                     }
                     cursor = editor(ui, scene, rect, area, text_x, text_w, open, actions);
-                    painter.rect_filled(Rect::from_min_size(area.min, vec2(3.0, area.height())), 0.0, TYPED);
+                    painter.rect_filled(Rect::from_min_size(area.min, vec2(3.0, area.height())), 0.0, typed());
                 } else if open {
-                    painter.rect_filled(area, 0.0, theme::mix(theme::BG_APP, theme::ORANGE, 0.08));
+                    painter.rect_filled(area, 0.0, theme::mix(theme::bg_app(), theme::orange(), 0.08));
                     draw_remark(
                         &painter,
                         scene.gutter,
                         rect,
                         body_top,
                         "Unresolved: take a side above, or click here to type the result",
-                        theme::mix(theme::BG_APP, theme::ORANGE, 0.8),
+                        theme::mix(theme::bg_app(), theme::orange(), 0.8),
                     );
                 } else {
                     let count = resolved_rows(choice, ours, theirs);
@@ -1525,19 +1527,19 @@ fn result_pane(
                     let lines = resolved_lines(choice, ours, theirs, shown.clone());
                     for (row, (text, from)) in shown.zip(lines) {
                         let y = body_top + row as f32 * LINE_H;
-                        let color = from.map_or(TYPED, side_color);
+                        let color = from.map_or(typed(), side_color);
                         let row_area = row_rect(scene.gutter, rect, y);
-                        painter.rect_filled(row_area, 0.0, theme::mix(theme::BG_APP, color, 0.15));
+                        painter.rect_filled(row_area, 0.0, theme::mix(theme::bg_app(), color, 0.15));
                         painter.rect_filled(Rect::from_min_size(row_area.min, vec2(3.0, LINE_H)), 0.0, color);
                         draw_number(&painter, scene.gutter, rect, y, block.above[2] + row + 1);
-                        draw_line(&text_painter, text_x, y, &text, &scene.font, theme::TEXT_BRIGHT);
+                        draw_line(&text_painter, text_x, y, &text, &scene.font, theme::text_bright());
                     }
                     for row in rows.start.max(count)..rows.end {
                         let y = body_top + row as f32 * LINE_H;
-                        painter.rect_filled(row_rect(scene.gutter, rect, y), 0.0, theme::BG_INPUT);
+                        painter.rect_filled(row_rect(scene.gutter, rect, y), 0.0, theme::bg_input());
                         if count == 0 && row == 0 {
                             let remark = "no lines here in the result";
-                            draw_remark(&painter, scene.gutter, rect, y, remark, theme::TEXT_FAINT);
+                            draw_remark(&painter, scene.gutter, rect, y, remark, theme::text_faint());
                         }
                     }
                 }
@@ -1618,7 +1620,7 @@ fn editor(
 
     let font = scene.font.clone();
     let mut layouter = |ui: &Ui, buffer: &dyn TextBuffer, _wrap: f32| {
-        ui.painter().layout_job(row_job(buffer.as_str(), &font, theme::TEXT_BRIGHT))
+        ui.painter().layout_job(row_job(buffer.as_str(), &font, theme::text_bright()))
     };
     let output = TextEdit::multiline(&mut editing.text)
         .id(id)
@@ -1665,7 +1667,7 @@ fn scrollbar(
     marks: &[(f32, Color32)],
 ) {
     let painter = ui.painter().with_clip_rect(rect);
-    painter.rect_filled(rect, 0.0, theme::BG_PANEL);
+    painter.rect_filled(rect, 0.0, theme::bg_panel());
     let length = if vertical { rect.height() } else { rect.width() };
     let content = (max + view).max(1.0);
 
@@ -1686,11 +1688,11 @@ fn scrollbar(
             Rect::from_min_size(pos2(rect.left() + start, rect.top() + 2.0), vec2(thumb, rect.height() - 4.0))
         };
         let fill = if response.is_pointer_button_down_on() {
-            theme::TEXT_DIM
+            theme::text_dim()
         } else if response.hovered() {
-            theme::TEXT_FAINT
+            theme::text_faint()
         } else {
-            theme::BORDER_LIGHT
+            theme::border_light()
         };
         painter.rect_filled(thumb_rect, 3.0, fill);
     }
@@ -1714,37 +1716,37 @@ enum Answer {
 fn ask(ctx: &egui::Context, tab: &mut RepoTab, shared: &mut Shared, view: &mut Resolver, file: &ConflictFile) {
     let open = view.draft.open_conflicts();
     let frame = Frame::new()
-        .fill(theme::BG_TOOLBAR)
-        .stroke(Stroke::new(1.0, theme::BORDER_LIGHT))
+        .fill(theme::bg_toolbar())
+        .stroke(Stroke::new(1.0, theme::border_light()))
         .corner_radius(8.0)
         .inner_margin(Margin::same(20));
     let modal = Modal::new(Id::new("conflict-unsaved")).frame(frame).show(ctx, |ui| {
         ui.set_width(430.0);
         ui.spacing_mut().item_spacing.y = 8.0;
-        ui.label(RichText::new("Unsaved choices").font(theme::bold(16.0)).color(theme::TEXT_BRIGHT));
+        ui.label(RichText::new("Unsaved choices").font(theme::bold(16.0)).color(theme::text_bright()));
         ui.label(
             RichText::new(format!("What you chose for \"{}\" has not been saved to the file yet.", view.path))
-                .color(theme::TEXT),
+                .color(theme::text()),
         );
         let remark = match open {
             0 => "Every conflict in it is resolved.".to_owned(),
             1 => "1 conflict is still unresolved; saving keeps it marked as conflicted.".to_owned(),
             n => format!("{n} conflicts are still unresolved; saving keeps it marked as conflicted."),
         };
-        ui.label(RichText::new(remark).color(theme::TEXT_DIM));
+        ui.label(RichText::new(remark).color(theme::text_dim()));
         ui.add_space(6.0);
 
         let mut answer = None;
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let label = if open == 0 { "Save and mark resolved" } else { "Save" };
             let primary = Button::new(RichText::new(label).color(Color32::WHITE))
-                .fill(theme::mix(theme::BG_APP, theme::GREEN, 0.6))
+                .fill(theme::mix(theme::bg_app(), theme::green(), 0.6))
                 .min_size(vec2(84.0, 28.0));
             if ui.add(primary).clicked() {
                 answer = Some(Answer::Save { mark_resolved: open == 0 });
             }
             let discard = Button::new(RichText::new("Discard").color(Color32::WHITE))
-                .fill(theme::mix(theme::BG_APP, theme::RED, 0.7))
+                .fill(theme::mix(theme::bg_app(), theme::red(), 0.7))
                 .min_size(vec2(84.0, 28.0));
             if ui.add(discard).clicked() {
                 answer = Some(Answer::Discard);
@@ -1833,9 +1835,9 @@ fn whole_ui(ui: &mut Ui, tab: &mut RepoTab, view: &mut Resolver, file: &Conflict
     ui.scope_builder(UiBuilder::new().max_rect(column).layout(Layout::top_down(Align::Center)), |ui| {
         ui.spacing_mut().item_spacing.y = 8.0;
         ui.add_space((column.height() * 0.16).max(8.0));
-        ui.label(RichText::new(icons::WARNING).size(40.0).color(theme::ORANGE));
-        ui.label(RichText::new(headline).font(theme::bold(17.0)).color(theme::TEXT_BRIGHT));
-        ui.add(egui::Label::new(RichText::new(explanation).color(theme::TEXT_DIM)).wrap());
+        ui.label(RichText::new(icons::WARNING).size(40.0).color(theme::orange()));
+        ui.label(RichText::new(headline).font(theme::bold(17.0)).color(theme::text_bright()));
+        ui.add(egui::Label::new(RichText::new(explanation).color(theme::text_dim())).wrap());
         ui.add_space(14.0);
 
         for (side, info, stage) in [(Side::Ours, ours, &file.ours), (Side::Theirs, theirs, &file.theirs)] {
@@ -1844,13 +1846,13 @@ fn whole_ui(ui: &mut Ui, tab: &mut RepoTab, view: &mut Resolver, file: &Conflict
         ui.add_space(14.0);
 
         if saving {
-            ui.add(egui::Spinner::new().size(18.0).color(theme::ACCENT));
+            ui.add(egui::Spinner::new().size(18.0).color(theme::accent()));
             return;
         }
         let wide = |text: String, tint: Color32| {
-            Button::new(RichText::new(text).size(13.5).color(theme::TEXT_BRIGHT))
-                .fill(theme::mix(theme::BG_APP, tint, 0.3))
-                .stroke(Stroke::new(1.0, theme::mix(theme::BG_APP, tint, 0.75)))
+            Button::new(RichText::new(text).size(13.5).color(theme::text_bright()))
+                .fill(theme::mix(theme::bg_app(), tint, 0.3))
+                .stroke(Stroke::new(1.0, theme::mix(theme::bg_app(), tint, 0.75)))
                 .min_size(vec2(column.width().min(380.0), 32.0))
         };
         for side in [Side::Ours, Side::Theirs] {
@@ -1861,7 +1863,7 @@ fn whole_ui(ui: &mut Ui, tab: &mut RepoTab, view: &mut Resolver, file: &Conflict
                 run = Some((conflict::keep(&file.path, side), done));
             }
         }
-        if ui.add(wide(format!("{}  Delete the file", icons::TRASH), theme::RED)).clicked() {
+        if ui.add(wide(format!("{}  Delete the file", icons::TRASH), theme::red())).clicked() {
             run = Some((conflict::delete(&file.path), "The file is deleted.".to_owned()));
         }
     });
@@ -1880,25 +1882,25 @@ fn side_card(ui: &mut Ui, info: &SideInfo, stage: Option<&Stage>, color: Color32
     painter.rect(
         rect,
         5.0,
-        theme::mix(theme::BG_APP, color, 0.10),
-        Stroke::new(1.0, theme::mix(theme::BG_APP, color, 0.5)),
+        theme::mix(theme::bg_app(), color, 0.10),
+        Stroke::new(1.0, theme::mix(theme::bg_app(), color, 0.5)),
         StrokeKind::Inside,
     );
     let top = Rect::from_min_max(rect.min, pos2(rect.right(), rect.center().y + 2.0));
     let bottom = Rect::from_min_max(pos2(rect.left(), rect.center().y - 2.0), rect.max);
     let mut x = rect.left() + 12.0;
     x += widgets::text_left(&painter, top, x, &info.role.to_uppercase(), theme::bold(10.5), color) + 8.0;
-    x += widgets::text_left(&painter, top, x, &info.name, theme::bold(13.0), theme::TEXT_BRIGHT) + 10.0;
-    let detail = widgets::elided(&painter, &info.detail, theme::font(12.0), theme::TEXT_DIM, rect.right() - x - 10.0);
+    x += widgets::text_left(&painter, top, x, &info.name, theme::bold(13.0), theme::text_bright()) + 10.0;
+    let detail = widgets::elided(&painter, &info.detail, theme::font(12.0), theme::text_dim(), rect.right() - x - 10.0);
     widgets::galley_left(&painter, top, x, detail);
 
     let (text, text_color) = match stage {
-        None => ("does not have this file".to_owned(), theme::TEXT_DIM),
-        Some(stage) if stage.mode & 0o170000 == 0o160000 => ("a submodule commit".to_owned(), theme::TEXT),
-        Some(stage) if stage.mode & 0o170000 == 0o120000 => ("a symbolic link".to_owned(), theme::TEXT),
+        None => ("does not have this file".to_owned(), theme::text_dim()),
+        Some(stage) if stage.mode & 0o170000 == 0o160000 => ("a submodule commit".to_owned(), theme::text()),
+        Some(stage) if stage.mode & 0o170000 == 0o120000 => ("a symbolic link".to_owned(), theme::text()),
         Some(stage) => {
             let kind = if stage.binary { "binary file" } else { "text file" };
-            (format!("{kind}, {}", file_size(stage.size)), theme::TEXT)
+            (format!("{kind}, {}", file_size(stage.size)), theme::text())
         }
     };
     widgets::text_left(&painter, bottom, rect.left() + 12.0, &text, theme::font(12.5), text_color);
