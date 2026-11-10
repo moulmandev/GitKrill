@@ -269,9 +269,17 @@ fn operator(
             _ => None,
         };
 
+        // Preferences > General > Keep submodules up to date. It runs while
+        // the operation still shows as busy; only a failure is reported, on
+        // its own, since the operation itself did what it was asked.
+        let submodules = result.as_ref().ok().and_then(|()| crate::prefs::general::run_submodule_update(workdir, &cmd));
+
         let done = Response::OpDone { cmd, result: result.map(|()| output), undo, origin };
         if res_tx.send(done).is_err() {
             return;
+        }
+        if let Some((update, e)) = submodules {
+            let _ = res_tx.send(Response::OpDone { cmd: update, result: Err(e), undo: None, origin: Origin::User });
         }
         let _ = req_tx.send(Request::Refresh);
         ctx.request_repaint();

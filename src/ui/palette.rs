@@ -542,13 +542,14 @@ fn app_actions(list: &mut Vec<Entry>, has_tab: bool, settings: &Settings) {
         "tree view list folders",
         |s| s.tree_view = !s.tree_view,
     ));
+    let auto_fetch = crate::prefs::general::auto_fetch_label(settings);
     list.push(toggle(
         "auto-fetch",
         icons::CLOCK_COUNTER_CLOCKWISE,
         settings.auto_fetch_minutes > 0,
-        ("Stop fetching automatically", "Fetch automatically every 5 minutes"),
-        "auto background",
-        |s| s.auto_fetch_minutes = if s.auto_fetch_minutes > 0 { 0 } else { 5 },
+        ("Stop fetching automatically", &auto_fetch),
+        "auto background interval",
+        crate::prefs::general::toggle_auto_fetch,
     ));
     list.push(toggle(
         "avatars",

@@ -620,6 +620,7 @@ impl RepoTab {
         let has_remote = self.snap.as_ref().is_some_and(|s| !s.remotes.is_empty());
         if minutes > 0 && has_remote {
             let now = Instant::now();
+            crate::prefs::general::reschedule(&mut self.next_auto_fetch, now, minutes);
             if now >= self.next_auto_fetch {
                 self.next_auto_fetch = now + Duration::from_secs(minutes as u64 * 60);
                 if self.busy.is_empty() {

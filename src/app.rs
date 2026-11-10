@@ -56,12 +56,15 @@ impl App {
             palette: Default::default(),
         };
 
-        for path in &settings.tabs {
-            if path.is_dir() {
-                app.tabs.push(RepoTab::new(path.clone()));
+        // Preferences > General > Remember tabs.
+        if settings.general.remember_tabs {
+            for path in &settings.tabs {
+                if path.is_dir() {
+                    app.tabs.push(RepoTab::new(path.clone()));
+                }
             }
+            app.active = settings.active.min(app.tabs.len().saturating_sub(1));
         }
-        app.active = settings.active.min(app.tabs.len().saturating_sub(1));
         if let Some(path) = open {
             app.open_repo(&path);
         }
@@ -176,7 +179,8 @@ impl App {
                 }
                 AppAction::Clone { url, dest } => self.start_clone(ctx, url, dest),
                 AppAction::InitDialog => {
-                    let picked = rfd::FileDialog::new().set_title("Initialise a repository in…").pick_folder();
+                    let picked = crate::shot::Shot::picked_folder()
+                        .or_else(|| rfd::FileDialog::new().set_title("Initialise a repository in…").pick_folder());
                     if let Some(dir) = picked {
                         match cli::run(&dir, &["init".to_owned()], cli::Options::default()) {
                             Ok(_) => self.open_repo(&dir),
@@ -367,8 +371,9 @@ impl App {
                     shared.settings.show_sidebar = !shared.settings.show_sidebar;
                 }
                 let mut auto_fetch = shared.settings.auto_fetch_minutes > 0;
-                if ui.checkbox(&mut auto_fetch, "Fetch automatically every 5 minutes").changed() {
-                    shared.settings.auto_fetch_minutes = if auto_fetch { 5 } else { 0 };
+                let label = crate::prefs::general::auto_fetch_label(&shared.settings);
+                if ui.checkbox(&mut auto_fetch, label).changed() {
+                    crate::prefs::general::set_auto_fetch(&mut shared.settings, auto_fetch);
                 }
                 ui.checkbox(&mut shared.settings.fetch_avatars, "Author pictures from Gravatar and GitHub");
                 ui.checkbox(&mut shared.settings.hosting_integration, "Pull requests, issues and CI from GitHub and GitLab");

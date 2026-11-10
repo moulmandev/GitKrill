@@ -115,7 +115,11 @@ be installed.
 
 **Remotes**
 - Fetch, pull (default / ff-only / rebase), push, force push with lease
-- Automatic fetch every five minutes
+- Automatic fetch, every five minutes unless you pick another interval
+  (0 to 60, **File > Preferences > General**), pruning remote branches
+  deleted on the remote unless Auto-Prune is off
+- Optionally keep submodules at the commits HEAD records after checkout,
+  pull, merge, rebase, reset, cherry-pick and revert
 - GitHub, GitHub Enterprise and GitLab (gitlab.com or your own server): open
   pull requests (merge requests on GitLab), issues and CI runs (Actions,
   pipelines) in the sidebar, each request with the CI status of its head;
@@ -129,7 +133,8 @@ be installed.
   "Open on GitHub" (or GitLab) works without signing in
 
 **Shell**
-- Multiple repositories in tabs, restored on start; drop a folder to open it
+- Multiple repositories in tabs, restored on start (unless **Remember tabs** is
+  off); drop a folder to open it
 - Folders of repositories (workspaces): pick a parent folder once (**File >
   Add Folder of Repositories**, or the repository menu) and every Git
   repository in it, up to five levels down, is listed with its branch,
@@ -156,7 +161,7 @@ in the **Help** menu, the others in the **View** menu.
 | --- | --- | --- |
 | Author pictures | SHA-256 of each author's email address, or the GitHub user id from a `noreply` address | gravatar.com, avatars.githubusercontent.com |
 | Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, and the requests you open, with a token when one is found for that host (below) | api.github.com, gitlab.com, and only the servers you connected |
-| Automatic fetch | `git fetch --all --prune`, as you would run it | your remotes |
+| Automatic fetch | `git fetch --prune --all` (without `--prune` when Auto-Prune is off), as you would run it | your remotes |
 | Updates | A request for the latest release shortly after start and every six hours; the download when there is a newer one | api.github.com, github.com and its download host |
 
 A server other than github.com and gitlab.com is never sent anything until

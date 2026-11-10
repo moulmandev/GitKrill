@@ -76,7 +76,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                     if menu_item(ui, icons::ARROWS_CLOCKWISE, &format!("Fetch {}", remote.name)) {
                         tab.run(ops::GitCmd::new(
                             format!("Fetch {}", remote.name),
-                            &["fetch", "--prune", &remote.name],
+                            &ops::fetch(&[remote.name.as_str()]),
                         ));
                     }
                     if menu_item(ui, icons::COPY, "Copy URL") {

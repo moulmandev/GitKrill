@@ -406,13 +406,24 @@ pub fn stash_drop(index: usize) -> GitCmd {
 
 // ---- remotes --------------------------------------------------------------
 
+/// `git fetch <args>`, with `--prune` unless Auto-Prune (Preferences >
+/// General) is off.
+pub fn fetch<'a>(args: &[&'a str]) -> Vec<&'a str> {
+    let mut all = vec!["fetch"];
+    if crate::prefs::general::auto_prune() {
+        all.push("--prune");
+    }
+    all.extend_from_slice(args);
+    all
+}
+
 pub fn fetch_all() -> GitCmd {
-    GitCmd::new("Fetch", &["fetch", "--all", "--prune"]).done("Fetched all remotes")
+    GitCmd::new("Fetch", &fetch(&["--all"])).done("Fetched all remotes")
 }
 
 /// The periodic fetch that keeps remote branches current without being asked.
 pub fn auto_fetch() -> GitCmd {
-    let mut cmd = GitCmd::new("Auto-fetch", &["fetch", "--all", "--prune"]).quiet();
+    let mut cmd = GitCmd::new("Auto-fetch", &fetch(&["--all"])).quiet();
     cmd.background = true;
     cmd
 }

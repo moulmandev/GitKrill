@@ -39,6 +39,13 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Give every git command an environment variable | `git::cli::set_session_env` (the SSH key and author of the profile in use). |
 | Do network or other non-repository background work | Spawn your own thread, send results over a channel, call `ctx.request_repaint()` when something arrives, and poll the channel from your UI code. Never block in UI code. |
 
+Fetch commands start from `ops::fetch(&[...])`, which adds `--prune`
+unless Auto-Prune (Preferences > General) is off. After any command whose
+steps run checkout, switch, pull, merge, rebase, reset to a commit,
+cherry-pick or revert (`prefs::general::moves_head`), the operator thread
+runs `git submodule update --init --recursive` when "Keep submodules up to
+date" is on and the repository has a `.gitmodules` file.
+
 `tab.jump_to(oid)` selects a commit and scrolls the graph to it.
 `tab.is_running("Label prefix")` tells whether an operation is in flight, and
 `tab.take_outcome(label, since)` how one you started ended (its failure is
@@ -113,6 +120,10 @@ front, and the global and repository git configuration files.
   and `ui.menu_button` (they close on click by default); modals via
   `egui::Modal`. When unsure, read the source:
   `~/.cargo/registry/src/index.crates.io-*/egui-0.36.2/src`.
+- `Response::has_focus()` is false whenever the window itself has no
+  keyboard focus, which is always the case in `tools/shot.sh` runs (the
+  window is off-screen and takes none). Logic that must survive that (keep
+  what is being typed) asks `ui.memory(|m| m.has_focus(response.id))`.
 - **git2 0.21**: most string getters return `Result<&str, Error>`; prefer the
   `*_bytes()` variants. `Repository::stash_foreach` needs `&mut`.
 - **libgit2 revwalk**: any sort mode makes it walk all of history first. See
