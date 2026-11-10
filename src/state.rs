@@ -16,7 +16,8 @@ use crate::git::{
 };
 use crate::worker::{Origin, RepoHandle, Response};
 
-/// Commits loaded up front; more are pulled in as the graph is scrolled.
+/// Commits loaded up front unless Preferences > Commit Graph says otherwise;
+/// more are pulled in as the graph is scrolled.
 pub const INITIAL_LIMIT: usize = 3000;
 /// Minimum gap between refreshes triggered by file system activity.
 const FS_DEBOUNCE: Duration = Duration::from_millis(350);
@@ -339,6 +340,12 @@ pub struct RepoTab {
     /// Row the graph should bring into view on the next frame.
     pub scroll_to: Option<usize>,
     pub limit: usize,
+    /// The "initial commits" preference `limit` started from; see
+    /// [`RepoTab::set_initial_limit`].
+    initial_limit: usize,
+    /// The branch the pointer is on, for the graph to highlight what it
+    /// contains (set by the left panel and the graph's labels).
+    pub ref_hover: crate::ui::graph::reach::RefHover,
 
     pub sidebar_filter: String,
     pub search: String,
@@ -384,7 +391,9 @@ impl RepoTab {
             redo: Vec::new(),
             busy: Vec::new(),
             scroll_to: None,
-            limit: INITIAL_LIMIT,
+            limit: crate::prefs::graph::initial_limit(),
+            initial_limit: crate::prefs::graph::initial_limit(),
+            ref_hover: Default::default(),
             sidebar_filter: String::new(),
             search: String::new(),
             search_open: false,
@@ -564,11 +573,32 @@ impl RepoTab {
         // Only once the current page has arrived, or scrolling at the bottom
         // would keep doubling the limit.
         if snap.history.has_more && snap.history.commits.len() >= self.limit {
-            self.limit *= 2;
+            self.limit = self.limit.saturating_mul(2);
             if let Some(handle) = &self.handle {
                 handle.set_limit(self.limit);
                 handle.refresh();
             }
+        }
+    }
+
+    /// Whether a bigger page of history has been asked for and not arrived.
+    pub fn loading_more(&self) -> bool {
+        self.snap.as_ref().is_some_and(|snap| snap.history.has_more && snap.history.commits.len() < self.limit)
+    }
+
+    /// Follows a change of the "initial commits" preference (`usize::MAX`
+    /// for all of them): the history is loaded again to that size, dropping
+    /// pages loaded by scrolling. Nothing happens while it is unchanged, so
+    /// the graph calls this every frame.
+    pub fn set_initial_limit(&mut self, limit: usize) {
+        if self.initial_limit == limit {
+            return;
+        }
+        self.initial_limit = limit;
+        self.limit = limit;
+        if let Some(handle) = &self.handle {
+            handle.set_limit(limit);
+            handle.refresh();
         }
     }
 

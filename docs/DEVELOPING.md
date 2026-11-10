@@ -53,6 +53,9 @@ runs `git submodule update --init --recursive` when "Keep submodules up to
 date" is on and the repository has a `.gitmodules` file.
 
 `tab.jump_to(oid)` selects a commit and scrolls the graph to it.
+`tab.ref_hover.hover(ui.ctx(), tip)`, called on each frame the pointer is on
+something that stands for a branch (sidebar rows and graph labels do), makes
+the graph dim the loaded commits that `tip` does not reach.
 `tab.is_running("Label prefix")` tells whether an operation is in flight, and
 `tab.take_outcome(label, since)` how one you started ended (its failure is
 already shown to the user as a toast).
