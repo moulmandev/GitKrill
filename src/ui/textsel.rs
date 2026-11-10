@@ -426,6 +426,10 @@ impl Selection {
     /// is laid out as `galley` placed at `left`, in the row `row`. A
     /// selected line break shows as `newline` points more.
     pub fn paint(&self, painter: &Painter, line: usize, galley: &Galley, left: f32, row: Rect, newline: f32) {
+        // Most rows are not selected; they need no counting.
+        if self.range().is_none_or(|(start, end)| line < start.line || line > end.line) {
+            return;
+        }
         let Some((cols, more)) = self.columns(line, char_count(galley.text())) else { return };
         let from = left + x_at(galley, cols.start);
         let to = left + x_at(galley, cols.end) + if more { newline } else { 0.0 };
@@ -641,5 +645,91 @@ mod tests {
         let empty = galley("", theme::mono(12.5));
         assert_eq!(column_at(&empty, 30.0), 0);
         assert_eq!(x_at(&empty, 0), 0.0);
+    }
+
+    /// Runs one frame per batch of events over a view showing `text` on a
+    /// grid of 10 x 20 points, and returns what the last frame asked of the
+    /// platform (cursor, clipboard).
+    fn drive(selection: &mut Selection, text: &Vec<String>, frames: Vec<Vec<Event>>) -> egui::PlatformOutput {
+        let ctx = egui::Context::default();
+        let area = Rect::from_min_size(Pos2::ZERO, egui::vec2(300.0, 200.0));
+        let hit = |at: Pos2| {
+            let line = ((at.y / 20.0).max(0.0) as usize).min(text.len() - 1);
+            Pos::new(line, (at.x / 10.0).round().max(0.0) as usize)
+        };
+        let mut platform = egui::PlatformOutput::default();
+        for (frame, events) in frames.into_iter().enumerate() {
+            let input = egui::RawInput {
+                events,
+                time: Some(frame as f64 * 0.05),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, egui::vec2(400.0, 300.0))),
+                ..Default::default()
+            };
+            let output = ctx.run_ui(input, |ui| {
+                selection.interact(ui, Id::new("text"), area, area, text, hit);
+            });
+            platform = output.platform_output.clone();
+            output.drop_without_applying_deltas();
+        }
+        platform
+    }
+
+    fn button(at: Pos2, pressed: bool) -> Event {
+        Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: Modifiers::NONE }
+    }
+
+    #[test]
+    fn the_pointer_selects_through_egui() {
+        let text = lines(&["alpha beta", "gamma delta"]);
+        let (start, end) = (Pos2::new(21.0, 5.0), Pos2::new(48.0, 25.0));
+
+        // Hovering shows the I-beam; press, drag, release selects.
+        let mut selection = Selection::default();
+        let output = drive(
+            &mut selection,
+            &text,
+            vec![
+                vec![Event::PointerMoved(start)],
+                vec![button(start, true)],
+                vec![Event::PointerMoved(Pos2::new(30.0, 15.0))],
+                vec![Event::PointerMoved(end)],
+                vec![button(end, false)],
+                vec![Event::PointerMoved(end)],
+            ],
+        );
+        assert_eq!(output.cursor_icon, CursorIcon::Text);
+        assert_eq!(selection.text(&text).as_deref(), Some("pha beta\ngamma"));
+
+        // Two quick clicks select a word; Ctrl+A then copying puts all of the
+        // text on the clipboard.
+        let word = Pos2::new(72.0, 5.0);
+        let mut selection = Selection::default();
+        let output = drive(
+            &mut selection,
+            &text,
+            vec![
+                vec![Event::PointerMoved(word)],
+                vec![button(word, true)],
+                vec![button(word, false)],
+                vec![button(word, true)],
+                vec![button(word, false)],
+            ],
+        );
+        assert_eq!(selection.text(&text).as_deref(), Some("beta"));
+        assert!(output.commands.is_empty());
+        let ctrl_a = Event::Key {
+            key: Key::A,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: Modifiers::COMMAND,
+        };
+        let output = drive(
+            &mut selection,
+            &text,
+            vec![vec![Event::PointerMoved(word)], vec![Event::PointerMoved(word), ctrl_a, Event::Copy]],
+        );
+        let copied = egui::OutputCommand::CopyText("alpha beta\ngamma delta".to_owned());
+        assert!(output.commands.contains(&copied), "{:?}", output.commands);
     }
 }

@@ -395,6 +395,9 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
             pos2(right, content.top() + viewport.max.y),
         );
         let hit = |pos: Pos2| {
+            if text.count() == 0 {
+                return Pos::default();
+            }
             let (line, col) = text.line_at(&tops, pos.y - content.top());
             let shown = text.shown(line);
             let col = match col {
