@@ -671,7 +671,15 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
                 ui.label(RichText::new(format!("{}  Add a title.", icons::WARNING)).color(theme::orange()));
             }
             if signed_out && form.problem.is_none() {
-                let text = hosting::create_problem(&hosting::Problem::NotSignedIn, form.repo.service);
+                let text = match shown.as_ref().is_some_and(|shown| shown.disconnected) {
+                    true => format!(
+                        "GitKrill does not use your {} sign-in: the account is disconnected in Preferences > \
+                         Integrations. Connect it there to open a {} from here.",
+                        form.repo.host,
+                        form.repo.service.pull_word()
+                    ),
+                    false => hosting::create_problem(&hosting::Problem::NotSignedIn, form.repo.service),
+                };
                 ui.label(RichText::new(text).size(12.0).color(theme::text_dim()));
                 let busy = shown.as_ref().is_some_and(|shown| shown.view.busy);
                 let button = Button::new(format!("{}  Check again", icons::ARROWS_CLOCKWISE)).small();

@@ -171,6 +171,9 @@ pub struct Settings {
     pub editor: crate::prefs::editor::Editor,
     /// Repository-specific preferences, by working directory.
     pub repos: std::collections::BTreeMap<PathBuf, crate::prefs::RepoPrefs>,
+    /// Hosts whose sign-in GitKrill does not use (Preferences > Integrations
+    /// > Disconnect); see `crate::hosting::Disconnected`.
+    pub hosting_disconnected: crate::hosting::Disconnected,
 }
 
 impl Default for Settings {
@@ -201,6 +204,7 @@ impl Default for Settings {
             appearance: Default::default(),
             editor: Default::default(),
             repos: Default::default(),
+            hosting_disconnected: Default::default(),
         }
     }
 }

@@ -35,7 +35,8 @@ pub fn sections(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Repo
     let ctx = ui.ctx().clone();
     let servers = &shared.settings.hosting_servers;
     let offers = if enabled { hosting::offers(&snap.remotes, servers) } else { Vec::new() };
-    let shown = tab.hosting.sync(&ctx, &snap.workdir, &snap.remotes, servers, enabled);
+    let disconnected = &shared.settings.hosting_disconnected;
+    let shown = tab.hosting.sync(&ctx, &snap.workdir, &snap.remotes, servers, disconnected, enabled);
 
     let mut act = None;
     if let Some(shown) = &shown {
@@ -256,7 +257,11 @@ fn header(
     }
     response.on_hover_ui(|ui| {
         let mut text = format!("Refresh from {}  ({})", shown.repo.site(), shown.repo.slug());
-        let auth = shown.view.auth.describe(shown.repo.service);
+        let auth = match shown.disconnected {
+            // No sign-in is looked for: say why, rather than "not signed in".
+            true => "Disconnected in Preferences > Integrations: no sign-in is used".to_owned(),
+            false => shown.view.auth.describe(shown.repo.service),
+        };
         if !auth.is_empty() {
             text.push_str(&format!("\n{auth}"));
         }
@@ -322,7 +327,15 @@ fn notice<T>(ui: &mut Ui, shown: &Shown, feed: &Feed<T>, act: &mut Option<Act>) 
         });
         response.on_hover_ui(|ui| {
             ui.set_max_width(320.0);
-            ui.label(problem.detail(service));
+            let mut detail = problem.detail(service);
+            if shown.disconnected {
+                detail.push_str(&format!(
+                    "\n\nGitKrill does not use your {} sign-in: the account is disconnected in \
+                     Preferences > Integrations.",
+                    shown.repo.host
+                ));
+            }
+            ui.label(detail);
         });
     } else if !feed.loaded && shown.view.busy {
         leaf(ui, 0, false, icons::CIRCLE_NOTCH, "Loading…", theme::text_faint(), "");
@@ -659,6 +672,9 @@ pub fn remote_menu(ui: &mut Ui, shared: &mut Shared, remote: &RemoteInfo) {
 /// The body of [`Dialog::ConnectServer`]. Returns true when it should close.
 pub fn connect_body(ui: &mut Ui, shared: &mut Shared, host: &str, path: &str, choice: &mut Option<ServerKind>) -> bool {
     dialogs::title(ui, &format!("Connect {host}"));
+    // Opened from Preferences > Integrations, it is about no repository in
+    // particular.
+    let path = if path.is_empty() { "its repositories" } else { path };
     ui.label(
         RichText::new(format!(
             "What runs on {host}? Once you say, the sidebar shows the requests, issues and CI \
