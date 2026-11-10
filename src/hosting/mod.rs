@@ -2349,10 +2349,15 @@ mod tests {
 
     #[test]
     fn switching_off_or_repointing_the_remote_ends_the_session() {
-        /// Dropped with the worker thread that owns it.
-        struct Tracked(Stub, #[allow(dead_code)] Arc<()>);
+        /// Dropped with the worker thread that owns it. With a gate, the
+        /// first request waits until the gate's sender is dropped, so the test
+        /// can look at a session before its thread has answered anything.
+        struct Tracked(Stub, #[allow(dead_code)] Arc<()>, Option<Receiver<()>>);
         impl Backend for Tracked {
             fn pulls(&mut self, now: u64) -> Outcome<PullRequest> {
+                if let Some(gate) = self.2.take() {
+                    let _ = gate.recv();
+                }
                 self.0.pulls(now)
             }
             fn issues(&mut self, now: u64) -> Outcome<Issue> {
@@ -2383,7 +2388,7 @@ mod tests {
         let mut state = HostingState::default();
         {
             let alive = alive.clone();
-            state.sync_with(&hosted(), true, true, move |_| Box::new(Tracked(Stub::default(), alive)), || {});
+            state.sync_with(&hosted(), true, true, move |_| Box::new(Tracked(Stub::default(), alive, None)), || {});
         }
         settle(&mut state, &hosted());
 
@@ -2391,13 +2396,15 @@ mod tests {
         // with none of the old repository's data.
         let moved = [remote("origin", "https://github.com/octo/other.git")];
         let second = Arc::new(());
+        let (open_gate, gate) = channel::<()>();
         let shown = {
             let second = second.clone();
-            let connect = move |_: &RepoId| -> Box<dyn Backend> { Box::new(Tracked(Stub::default(), second)) };
+            let connect = move |_: &RepoId| -> Box<dyn Backend> { Box::new(Tracked(Stub::default(), second, Some(gate))) };
             state.sync_with(&moved, true, true, connect, || {}).unwrap()
         };
         assert_eq!(shown.repo.slug(), "octo/other");
         assert!(shown.view.pulls.items.is_empty() && !shown.view.pulls.loaded);
+        drop(open_gate);
         wait_until_alone(&alive);
 
         // Switched off: the session and its thread go away.
