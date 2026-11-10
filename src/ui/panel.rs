@@ -4,18 +4,20 @@
 use std::sync::Arc;
 
 use eframe::egui::{
-    self, Align, Align2, Button, Frame, Key, Label, Layout, Margin, Modifiers, RichText,
+    self, Align, Align2, Frame, Key, Label, Layout, Margin, Modifiers, RichText,
     ScrollArea, Sense, Stroke, TextEdit, Ui, pos2, vec2,
 };
 
 use crate::git::{DiffSource, Oid, RepoSnapshot, RepoState, RowKind, ops, short};
 use crate::state::{RepoTab, Selection, Shared, format_time, relative_time};
 use crate::theme::{self, icons};
+use crate::ui::commit_button;
 use crate::ui::files::{self, file_list};
 use crate::ui::graph::discard_all_dialog;
 use crate::ui::widgets::{self, icon_button, segmented, tint_button};
 
 pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
+    commit_button::follow_up(ui.ctx(), tab, shared);
     let Some(snap) = tab.snap.clone() else { return };
     match tab.selection {
         Selection::Wip => working_tree(ui, tab, shared, &snap),
@@ -31,7 +33,7 @@ fn working_tree(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<
         .resizable(false)
         .show_separator_line(false)
         .frame(Frame::new().fill(theme::bg_app()).inner_margin(Margin::same(10)))
-        .show(ui, |ui| commit_box(ui, tab, snap));
+        .show(ui, |ui| commit_box(ui, tab, shared, snap));
 
     egui::CentralPanel::default().frame(Frame::new().fill(theme::bg_app())).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -158,8 +160,10 @@ fn operation_banner(ui: &mut Ui, tab: &mut RepoTab, state: RepoState, label: &st
     ui.add_space(4.0);
 }
 
-fn commit_box(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot) {
+fn commit_box(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSnapshot) {
     ui.spacing_mut().item_spacing.y = 6.0;
+    let prefs = crate::prefs::repo(&shared.settings, &tab.path).commit.clone();
+    commit_button::prefill(ui.ctx(), tab, &prefs, snap.head.oid);
 
     ui.horizontal(|ui| {
         ui.label(RichText::new("Commit Message").color(theme::text()));
@@ -167,7 +171,8 @@ fn commit_box(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot) {
             let can_amend = snap.head.oid.is_some();
             let before = tab.amend;
             ui.add_enabled(can_amend, egui::Checkbox::new(&mut tab.amend, "Amend"));
-            if tab.amend && !before && tab.summary.is_empty() && tab.description.is_empty() {
+            let empty = tab.summary.is_empty() && tab.description.is_empty();
+            if tab.amend && !before && (empty || commit_button::untouched_template(ui.ctx(), tab)) {
                 // Start from the message being amended.
                 let (summary, body) = snap.head_message.split_once('\n').unwrap_or((&snap.head_message, ""));
                 tab.summary = summary.trim().to_owned();
@@ -177,8 +182,12 @@ fn commit_box(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot) {
     });
 
     let summary = ui.add(
-        TextEdit::singleline(&mut tab.summary).hint_text("Summary").desired_width(f32::INFINITY),
+        TextEdit::singleline(&mut tab.summary)
+            .hint_text("Summary")
+            .desired_width(f32::INFINITY)
+            .margin(Margin { left: 4, right: 34, top: 2, bottom: 2 }),
     );
+    commit_button::summary_counter(ui, &summary, &tab.summary);
     let description = ui.add(
         TextEdit::multiline(&mut tab.description)
             .hint_text("Description")
@@ -186,47 +195,9 @@ fn commit_box(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot) {
             .desired_width(f32::INFINITY),
     );
 
-    let staged = snap.status.staged.len();
-    let unstaged = snap.status.unstaged.len();
-    let has_message = !tab.summary.trim().is_empty();
-    let committing = tab.is_running("Commit") || tab.is_running("Amend commit");
-
-    // What the button does depends on what is staged.
-    let (label, enabled, everything) = if committing {
-        ("Committing…".to_owned(), false, false)
-    } else if tab.amend {
-        ("Amend previous commit".to_owned(), has_message, false)
-    } else if staged == 0 && unstaged == 0 {
-        ("Nothing to commit".to_owned(), false, false)
-    } else if !has_message {
-        ("Type a message to commit".to_owned(), false, false)
-    } else if staged == 0 {
-        ("Stage all changes and commit".to_owned(), true, true)
-    } else {
-        (format!("Commit changes to {staged} file{}", if staged == 1 { "" } else { "s" }), true, false)
-    };
-
-    let fill = if enabled { theme::solid(theme::green(), 0.55) } else { theme::green_dark() };
-    let text = RichText::new(label).color(if enabled { theme::on_accent() } else { theme::text_dim() });
-    let button = ui.add_enabled(
-        enabled,
-        Button::new(text)
-            .fill(fill)
-            .stroke(Stroke::new(1.0, theme::mix(theme::bg_app(), theme::green(), 0.7)))
-            .min_size(vec2(ui.available_width(), 34.0)),
-    );
-
-    let shortcut = (summary.has_focus() || description.has_focus())
-        && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter));
-    if enabled && (button.clicked() || shortcut) {
-        let mut message = tab.summary.trim().to_owned();
-        let body = tab.description.trim();
-        if !body.is_empty() {
-            message.push_str("\n\n");
-            message.push_str(body);
-        }
-        tab.run(if everything { ops::commit_everything(&message) } else { ops::commit(&message, tab.amend) });
-    }
+    let focused = summary.has_focus() || description.has_focus();
+    let shortcut = focused && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter));
+    commit_button::show(ui, tab, shared, snap, &prefs, shortcut);
 }
 
 // ---- commit details ---------------------------------------------------------

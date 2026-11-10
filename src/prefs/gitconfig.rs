@@ -130,7 +130,8 @@ pub fn write(scope: &Scope, key: &str, value: Option<&str>) -> Result<(), String
     match cli::run(&dir, &args, cli::Options::default()) {
         Ok(_) => Ok(()),
         // Unsetting what is not set (exit status 5) is no failure.
-        Err(e) if value.is_none() && (e.contains("exit code: 5") || e.contains("no such section")) => Ok(()),
+        // Windows prints the status as "exit code: 5", Unix as "exit status: 5".
+        Err(e) if value.is_none() && (e.contains("exit code: 5") || e.contains("exit status: 5") || e.contains("no such section")) => Ok(()),
         Err(e) => Err(e),
     }
 }
