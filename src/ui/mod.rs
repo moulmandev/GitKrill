@@ -18,6 +18,7 @@ pub mod textsel;
 pub mod toolbar;
 pub mod update;
 pub mod widgets;
+pub mod workspace;
 
 use eframe::egui::Ui;
 

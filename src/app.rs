@@ -14,6 +14,7 @@ use crate::platform;
 use crate::state::{AppAction, Dialog, RepoTab, Settings, Shared, ToastKind};
 use crate::theme::{self, icons};
 use crate::ui::{self, widgets};
+use crate::workspace::Opens;
 
 pub struct App {
     tabs: Vec<RepoTab>,
@@ -43,6 +44,7 @@ impl App {
                 toasts: Vec::new(),
                 actions: Vec::new(),
                 updater: crate::update::Updater::new(),
+                workspaces: Default::default(),
             },
             cloning: None,
             saved_settings: String::new(),
@@ -65,13 +67,43 @@ impl App {
 
     /// Opens (or focuses) the repository containing `path`.
     fn open_repo(&mut self, path: &Path) {
-        let workdir = match git2::Repository::discover(path) {
+        let Some(workdir) = self.workdir_of(path) else { return };
+        self.shared.settings.remember(&workdir);
+        match self.tabs.iter().position(|t| t.path == workdir) {
+            Some(i) => self.active = i,
+            None => {
+                self.tabs.push(RepoTab::new(workdir));
+                self.active = self.tabs.len() - 1;
+            }
+        }
+    }
+
+    /// Shows the repository containing `path` in the current tab; see
+    /// [`AppAction::Switch`].
+    fn switch_repo(&mut self, path: &Path) {
+        let Some(workdir) = self.workdir_of(path) else { return };
+        if self.tabs.iter().any(|t| t.path == workdir) {
+            return self.open_repo(&workdir);
+        }
+        match self.tabs.get_mut(self.active) {
+            Some(tab) if tab.can_switch() => {
+                self.shared.settings.remember(&workdir);
+                *tab = RepoTab::new(workdir);
+            }
+            _ => self.open_repo(&workdir),
+        }
+    }
+
+    /// The working directory of the repository containing `path`, or a
+    /// toast saying why there is none.
+    fn workdir_of(&mut self, path: &Path) -> Option<PathBuf> {
+        match git2::Repository::discover(path) {
             Ok(repo) => match repo.workdir() {
                 // Normalise separators and drop the trailing slash libgit2 adds.
-                Some(dir) => dir.components().collect::<PathBuf>(),
+                Some(dir) => Some(crate::workspace::clean(dir)),
                 None => {
                     self.shared.toast(ToastKind::Error, "Cannot open repository", "Bare repositories are not supported.");
-                    return;
+                    None
                 }
             },
             Err(_) => {
@@ -80,16 +112,7 @@ impl App {
                     "Not a Git repository",
                     format!("{} is not inside a Git repository.", path.display()),
                 );
-                return;
-            }
-        };
-
-        self.shared.settings.remember(&workdir);
-        match self.tabs.iter().position(|t| t.path == workdir) {
-            Some(i) => self.active = i,
-            None => {
-                self.tabs.push(RepoTab::new(workdir));
-                self.active = self.tabs.len() - 1;
+                None
             }
         }
     }
@@ -134,6 +157,14 @@ impl App {
                     }
                 }
                 AppAction::Open(path) => self.open_repo(&path),
+                AppAction::Switch(path) => self.switch_repo(&path),
+                AppAction::AddWorkspace(from) => {
+                    let picked = crate::shot::Shot::picked_folder()
+                        .or_else(|| rfd::FileDialog::new().set_title("Add a folder of repositories").pick_folder());
+                    if let Some(dir) = picked {
+                        crate::workspace::add(ctx, &mut self.shared, &dir, from);
+                    }
+                }
                 AppAction::CloseTab(i) => self.close_tab(i),
                 AppAction::Activate(i) => {
                     if i < self.tabs.len() {
@@ -159,6 +190,17 @@ impl App {
         let active = self.active;
         for (i, tab) in self.tabs.iter_mut().enumerate() {
             tab.poll(ctx, &mut self.shared, i == active);
+        }
+        self.shared.workspaces.open_tabs = self
+            .tabs
+            .iter()
+            .map(|t| (t.path.clone(), t.snap.as_deref().map(crate::workspace::Summary::of_snapshot)))
+            .collect();
+        crate::workspace::poll(ctx, &mut self.shared);
+        // Without a tab the welcome page lists what a new workspace holds;
+        // no menu needs to open for it.
+        if self.tabs.is_empty() {
+            self.shared.workspaces.reveal = None;
         }
 
         if let Some((_, rx)) = &self.cloning
@@ -262,6 +304,10 @@ impl App {
                 }
                 if ui.button("Init Repository…").clicked() {
                     shared.actions.push(AppAction::InitDialog);
+                }
+                ui.separator();
+                if ui.button("Add Folder of Repositories…").clicked() {
+                    shared.actions.push(AppAction::AddWorkspace(Opens::Here));
                 }
                 if !shared.settings.recent.is_empty() {
                     ui.menu_button("Open Recent", |ui| {
@@ -397,16 +443,15 @@ impl App {
         }
 
         let plus = Rect::from_center_size(pos2(x + 18.0, rect.center().y), vec2(24.0, 24.0));
-        let response = ui
-            .interact(plus, ui.id().with("tab-new"), Sense::click())
-            .on_hover_text("Open a repository (Ctrl+O)");
-        if response.hovered() {
+        let response = ui.interact(plus, ui.id().with("tab-new"), Sense::click());
+        let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&response));
+        if response.hovered() || open {
             painter.rect_filled(plus, 4.0, theme::bg_raised());
         }
         painter.text(plus.center(), Align2::CENTER_CENTER, icons::PLUS, theme::font(14.0), theme::text_dim());
-        if response.clicked() {
-            self.shared.actions.push(AppAction::OpenDialog);
-        }
+        let response = if open { response } else { response.on_hover_text("Open a repository in a new tab") };
+        let current = self.tabs.get(self.active).map(|t| t.path.clone());
+        ui::workspace::new_tab_menu(&response, &mut self.shared, current.as_deref());
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {
@@ -460,16 +505,25 @@ impl App {
 
     fn welcome(&mut self, ui: &mut Ui) {
         ui.vertical_centered(|ui| {
-            ui.add_space((ui.available_height() * 0.28).max(20.0));
+            // Higher up when the repository list below needs the room.
+            let top = if ui::workspace::has_rows(&self.shared) { 0.08 } else { 0.28 };
+            ui.add_space((ui.available_height() * top).max(20.0));
             ui.label(egui::RichText::new(icons::GIT_BRANCH).size(54.0).color(theme::accent()));
             ui.add_space(6.0);
             ui.label(egui::RichText::new("GitKrill").font(theme::bold(26.0)).color(theme::text_bright()));
             ui.label(egui::RichText::new("Open a repository to get started, or drop a folder here.").color(theme::text_dim()));
             ui.add_space(18.0);
 
-            let big = |text: String| egui::Button::new(egui::RichText::new(text).size(14.0)).min_size(vec2(230.0, 36.0));
+            let big = |text: String| egui::Button::new(egui::RichText::new(text).size(14.0)).min_size(vec2(260.0, 36.0));
             if ui.add(big(format!("{}   Open repository", icons::FOLDER_OPEN))).clicked() {
                 self.shared.actions.push(AppAction::OpenDialog);
+            }
+            if ui
+                .add(big(format!("{}   Add a folder of repositories", icons::FOLDERS)))
+                .on_hover_text("Pick a folder: every Git repository inside it is listed here")
+                .clicked()
+            {
+                self.shared.actions.push(AppAction::AddWorkspace(Opens::NewTab));
             }
             if ui.add(big(format!("{}   Clone repository", icons::CLOUD_ARROW_DOWN))).clicked() {
                 self.shared.show(ui::toolbar::clone_dialog());
@@ -478,18 +532,14 @@ impl App {
                 self.shared.actions.push(AppAction::InitDialog);
             }
 
-            if !self.shared.settings.recent.is_empty() {
+            if ui::workspace::has_rows(&self.shared) {
                 ui.add_space(22.0);
-                ui.label(egui::RichText::new("RECENT").font(theme::bold(11.0)).color(theme::text_dim()));
-                ui.add_space(4.0);
-                for path in self.shared.settings.recent.iter().take(8).cloned().collect::<Vec<_>>() {
-                    let link = ui
-                        .add(egui::Label::new(egui::RichText::new(path.display().to_string()).color(theme::accent())).sense(Sense::click()))
-                        .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if link.clicked() {
-                        self.shared.actions.push(AppAction::Open(path));
-                    }
-                }
+                let width = ui.available_width().min(560.0);
+                let height = (ui.available_height() - 16.0).max(120.0);
+                ui.allocate_ui(vec2(width, height), |ui| {
+                    ui.set_width(width);
+                    ui::workspace::list(ui, &mut self.shared, Opens::NewTab, None, egui::Id::new("welcome-repositories"), false, height);
+                });
             }
         });
     }

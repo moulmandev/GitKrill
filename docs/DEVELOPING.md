@@ -32,6 +32,7 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Ask the user something | `shared.show(Dialog::...)` (`src/ui/dialogs.rs`); `Dialog::confirm(title, body, button, cmd)` for destructive confirmations. |
 | Tell the user something | `shared.toast(ToastKind::Success \| Error, title, body)`. |
 | Offer an action in the command palette (`Ctrl+P`) | Push an `Entry` in `entries` (`src/ui/palette.rs`, see "More actions") whose closure calls the function the button or menu already calls. Leave the entry out while it cannot run. |
+| Offer a list of repositories to open | `ui::workspace::list` (filter, workspaces, recent, branch and changes per row); the summaries come from `shared.workspaces.summary`, read in the background |
 | Persist a preference | Add a field to `Settings` (`src/state.rs`) and to its `Default`; it is saved automatically. |
 | Do network or other non-repository background work | Spawn your own thread, send results over a channel, call `ctx.request_repaint()` when something arrives, and poll the channel from your UI code. Never block in UI code. |
 
@@ -145,6 +146,11 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   installed|portable|browser` to pick the flow. Screenshot runs only check
   against such a feed, and print instead of restarting. A portable run
   really replaces the executable it runs as: point `BIN` at a copy.
+- Folder dialogs cannot be clicked through by a script: with
+  `GITKRILL_SHOT_FOLDER=<dir>` set, "Add a folder of repositories" picks
+  `<dir>` instead of asking. Workspaces can also be put straight into the
+  run's `cfg/settings.json` (`"workspaces": [{"root": "<dir>", "repos": []}]`);
+  they are scanned on start.
 - `tools/shot.sh` keeps settings in a `cfg` folder next to the output. Never
   run the app for testing without `GITKRILL_CONFIG_DIR` set, or the user's real
   tab list gets temp repositories in it.

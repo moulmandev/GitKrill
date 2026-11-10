@@ -7,6 +7,7 @@
 //! To offer something new, push an [`Entry`] in [`entries`] (look for "More
 //! actions") with a closure that calls the existing function.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use eframe::egui::text::{LayoutJob, TextFormat, TextWrapping};
@@ -485,6 +486,12 @@ fn app_actions(list: &mut Vec<Entry>, has_tab: bool, settings: &Settings) {
     list.push(action("open", icons::FOLDER_OPEN, "Open repository", |env| env.shared.actions.push(AppAction::OpenDialog)).shortcut("Ctrl+O"));
     list.push(action("clone", icons::CLOUD_ARROW_DOWN, "Clone repository", |env| env.shared.show(toolbar::clone_dialog())));
     list.push(action("init", icons::PLUS, "Init repository", |env| env.shared.actions.push(AppAction::InitDialog)).keywords("new create"));
+    list.push(
+        action("add-workspace", icons::FOLDERS, "Add a folder of repositories", |env| {
+            env.shared.actions.push(AppAction::AddWorkspace(crate::workspace::Opens::Here))
+        })
+        .keywords("workspace projects parent scan"),
+    );
     if has_tab {
         list.push(action("close-tab", icons::X, "Close tab", |env| env.shared.actions.push(AppAction::CloseTab(env.active))).shortcut("Ctrl+W"));
     }
@@ -644,20 +651,36 @@ fn repositories(list: &mut Vec<Entry>, tabs: &[RepoTab], active: usize, settings
             .detail(tab.path.display().to_string()),
         );
     }
-    for path in settings.recent.iter().filter(|p| !tabs.iter().any(|t| &t.path == *p)) {
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| path.display().to_string());
-        let open = path.clone();
-        list.push(
-            Entry::new(
-                Kind::Repository,
-                format!("recent:{}", path.display()),
-                icons::FOLDER_SIMPLE,
-                format!("Open {name}"),
-                move |env: &mut Env<'_>| env.shared.actions.push(AppAction::Open(open)),
-            )
-            .detail(path.display().to_string()),
-        );
+    // Repositories in the workspaces, then recent ones, that no tab shows.
+    // They open in the current tab, as from the repository picker.
+    let open = |path: &PathBuf| tabs.iter().any(|t| &t.path == path);
+    let mut listed = Vec::new();
+    for ws in &settings.workspaces {
+        for path in &ws.repos {
+            if open(path) || listed.contains(path) {
+                continue;
+            }
+            let folder = ws.folder_of(path);
+            let place = if folder.is_empty() { ws.name() } else { format!("{}/{folder}", ws.name()) };
+            list.push(open_entry(path, format!("in {place}")));
+            listed.push(path.clone());
+        }
     }
+    for path in settings.recent.iter().filter(|p| !open(p) && !listed.contains(*p)) {
+        list.push(open_entry(path, path.display().to_string()));
+    }
+}
+
+fn open_entry(path: &Path, detail: String) -> Entry {
+    let switch = path.to_path_buf();
+    Entry::new(
+        Kind::Repository,
+        format!("repo:{}", path.display()),
+        icons::FOLDER_SIMPLE,
+        format!("Open {}", crate::workspace::display_name(path)),
+        move |env: &mut Env<'_>| env.shared.actions.push(AppAction::Switch(switch)),
+    )
+    .detail(detail)
 }
 
 /// "Go to commit" for each loaded commit whose SHA starts with `query`,

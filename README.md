@@ -130,6 +130,14 @@ be installed.
 
 **Shell**
 - Multiple repositories in tabs, restored on start; drop a folder to open it
+- Folders of repositories (workspaces): pick a parent folder once (**File >
+  Add Folder of Repositories**, or the repository menu) and every Git
+  repository in it, up to five levels down, is listed with its branch,
+  ahead / behind counts and changed files. Pick one from the repository menu
+  to show it in the current tab, from the `+` menu to open a new tab, or type
+  its name in the command palette. New repositories are found on each start
+  (or with the rescan button); dependency and build folders (`node_modules`,
+  `target`, `.venv`, ...) are not searched
 - Dark and light themes, or follow the system setting (**View > Theme**)
 - Clone and init
 - Open a terminal in the repository
@@ -174,6 +182,7 @@ with what they keep for that exact host.
 | `Ctrl+P` | Command palette |
 | `Ctrl+O` | Open repository |
 | `Ctrl+W` | Close tab |
+| `Up` / `Down`, `Enter` | In a repository list: choose, then open; `Ctrl+Enter` or `Ctrl`+click opens it in a new tab |
 | `Ctrl+Tab` | Next tab |
 | `Ctrl+F` | Search commits |
 | `Ctrl+Enter` | Commit (from the message fields); start an interactive rebase |

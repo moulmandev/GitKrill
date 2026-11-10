@@ -7,7 +7,7 @@ use eframe::egui::{
 
 use crate::git::ops::{self, PullMode};
 use crate::platform;
-use crate::state::{AppAction, Dialog, RepoTab, Shared};
+use crate::state::{Dialog, RepoTab, Shared};
 use crate::theme::{self, icons};
 use crate::ui::widgets::{elided, icon_button, menu_item};
 
@@ -25,30 +25,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
         |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let response = picker(ui, "repository", &tab.name, 190.0);
-            Popup::menu(&response).show(|ui| {
-                ui.set_min_width(260.0);
-                if menu_item(ui, icons::FOLDER_OPEN, "Open repository…") {
-                    shared.actions.push(AppAction::OpenDialog);
-                }
-                if menu_item(ui, icons::CLOUD_ARROW_DOWN, "Clone repository…") {
-                    shared.show(clone_dialog());
-                }
-                if menu_item(ui, icons::FOLDER_SIMPLE, "Show in file manager") {
-                    platform::reveal(&tab.path);
-                }
-                let recent: Vec<_> =
-                    shared.settings.recent.iter().filter(|p| **p != tab.path).take(10).cloned().collect();
-                if !recent.is_empty() {
-                    ui.separator();
-                    ui.label(egui::RichText::new("Recent").size(11.0).color(theme::text_dim()));
-                    for path in recent {
-                        let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                        if ui.button(name).on_hover_text(path.display().to_string()).clicked() {
-                            shared.actions.push(AppAction::Open(path));
-                        }
-                    }
-                }
-            });
+            crate::ui::workspace::repository_menu(&response, shared, &tab.path);
 
             ui.label(egui::RichText::new(icons::CARET_RIGHT).size(12.0).color(theme::text_faint()));
 

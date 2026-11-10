@@ -104,7 +104,17 @@ impl Dialog {
 /// Things only the application shell can do.
 pub enum AppAction {
     OpenDialog,
+    /// Opens the repository in a new tab, or brings forward the tab that
+    /// already shows it.
     Open(PathBuf),
+    /// Shows the repository in the current tab, in place of the one there,
+    /// unless another tab has it already. Falls back to a new tab while the
+    /// current one has work that would be lost (a commit message being
+    /// written, a conflict being resolved, an operation running).
+    Switch(PathBuf),
+    /// Asks for a folder and adds it as a workspace (`crate::workspace`),
+    /// then opens the list it was asked from to show what is found.
+    AddWorkspace(crate::workspace::Opens),
     CloseTab(usize),
     Activate(usize),
     Clone { url: String, dest: PathBuf },
@@ -145,6 +155,8 @@ pub struct Settings {
     pub check_updates: bool,
     /// A version the user chose to skip: not offered again by itself.
     pub skipped_update: Option<String>,
+    /// Folders of repositories to pick from; see `crate::workspace`.
+    pub workspaces: Vec<crate::workspace::Workspace>,
 }
 
 impl Default for Settings {
@@ -167,6 +179,7 @@ impl Default for Settings {
             check_updates: true,
             skipped_update: None,
             hosting_servers: Default::default(),
+            workspaces: Vec::new(),
         }
     }
 }
@@ -225,6 +238,8 @@ pub struct Shared {
     pub toasts: Vec<Toast>,
     pub actions: Vec<AppAction>,
     pub updater: crate::update::Updater,
+    /// Workspace scans and repository summaries; see `crate::workspace`.
+    pub workspaces: crate::workspace::Workspaces,
 }
 
 impl Shared {
@@ -733,6 +748,16 @@ impl RepoTab {
 
     pub fn is_loading(&self) -> bool {
         self.snap.is_none() && self.error.is_none()
+    }
+
+    /// Whether the tab can show another repository without losing anything
+    /// the user has not finished: a commit message, an open overlay (the
+    /// conflict resolver may hold unsaved choices), an operation in flight.
+    pub fn can_switch(&self) -> bool {
+        self.summary.trim().is_empty()
+            && self.description.trim().is_empty()
+            && self.overlay.is_none()
+            && self.busy.iter().all(|op| op.quiet)
     }
 }
 

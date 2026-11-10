@@ -4,6 +4,7 @@
 //! ```text
 //! GITKRILL_SHOT=out.png        final screenshot; the app exits after writing it
 //! GITKRILL_SHOT_SIZE=1500x860  window size in points
+//! GITKRILL_SHOT_FOLDER=dir     what folder dialogs answer instead of asking
 //! GITKRILL_SHOT_ROW=3          select this graph row once the repository loads
 //! GITKRILL_SHOT_SCRIPT=...     semicolon-separated steps, run after loading:
 //!     click:x,y  rclick:x,y  dclick:x,y  move:x,y     (points, not pixels)
@@ -134,6 +135,13 @@ fn parse_script(script: &str) -> VecDeque<(bool, Step)> {
 }
 
 impl Shot {
+    /// The folder a scripted run picks in place of showing a folder dialog
+    /// (`GITKRILL_SHOT_FOLDER`), which a script could not click through.
+    pub fn picked_folder() -> Option<PathBuf> {
+        std::env::var_os("GITKRILL_SHOT")?;
+        std::env::var_os("GITKRILL_SHOT_FOLDER").map(PathBuf::from)
+    }
+
     pub fn from_env() -> Option<Self> {
         let path = std::env::var_os("GITKRILL_SHOT")?;
         Some(Shot {
