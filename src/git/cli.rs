@@ -1,13 +1,126 @@
 //! Thin wrapper around the `git` executable.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::RwLock;
+
+/// What a failed start of git tells the user.
+pub const NOT_FOUND: &str = "Could not find Git. Install it (the warning in the status bar offers to), then try again.";
+
+/// The git executable in use, once looked for.
+static PROGRAM: RwLock<Option<PathBuf>> = RwLock::new(None);
+
+/// The git executable commands run: looked for the first time it is needed
+/// (see [`locate`]), and again by [`relocate`]. When there is none, what
+/// was asked for, so that starting it fails the usual way.
+pub fn program() -> PathBuf {
+    if let Some(path) = PROGRAM.read().ok().and_then(|p| p.clone()) {
+        return path;
+    }
+    relocate().unwrap_or_else(fallback)
+}
+
+/// Looks for git again, after it was installed, and uses what is found.
+pub fn relocate() -> Option<PathBuf> {
+    let found = locate();
+    if let Ok(mut program) = PROGRAM.write() {
+        *program = Some(found.clone().unwrap_or_else(fallback));
+    }
+    found
+}
+
+/// `GITKRILL_GIT` when set (even to a file that is not there), else `git`.
+fn fallback() -> PathBuf {
+    std::env::var_os("GITKRILL_GIT").map_or_else(|| PathBuf::from("git"), PathBuf::from)
+}
+
+/// Where git is. `GITKRILL_GIT` names it outright (nothing else is tried
+/// then); otherwise the folders on `PATH`, then the places installers put
+/// it. The last ones matter when git was installed while GitKrill ran
+/// (the new `PATH` only reaches programs started afterwards), or with the
+/// "Git Bash only" option, or when a Mac app starts without the shell's
+/// `PATH`.
+pub fn locate() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("GITKRILL_GIT") {
+        let path = PathBuf::from(path);
+        return path.is_file().then_some(path);
+    }
+    let exe = if cfg!(windows) { "git.exe" } else { "git" };
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    if let Some(found) = std::env::split_paths(&paths).map(|dir| dir.join(exe)).find(|path| path.is_file()) {
+        return Some(found);
+    }
+    installed_locations().into_iter().find(|path| path.is_file())
+}
+
+/// Where Git for Windows installs itself: for the current user, for
+/// everyone, or wherever its registry entry says.
+#[cfg(windows)]
+fn installed_locations() -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    roots.push(user_programs().join("Git"));
+    for var in ["ProgramW6432", "ProgramFiles"] {
+        if let Some(dir) = std::env::var_os(var) {
+            roots.push(PathBuf::from(dir).join("Git"));
+        }
+    }
+    for key in [r"HKCU\Software\GitForWindows", r"HKLM\Software\GitForWindows"] {
+        let mut query = Command::new("reg");
+        query.args(["query", key, "/v", "InstallPath"]);
+        hide_window(&mut query);
+        if let Ok(out) = query.stdin(Stdio::null()).stderr(Stdio::null()).output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            // "    InstallPath    REG_SZ    C:\Program Files\Git"
+            if let Some((_, value)) = text.lines().find_map(|line| line.trim().split_once("REG_SZ")) {
+                roots.push(PathBuf::from(value.trim()));
+            }
+        }
+    }
+    roots.into_iter().map(|root| root.join("cmd").join("git.exe")).collect()
+}
+
+/// `%LOCALAPPDATA%\Programs`, where per-user installs go.
+#[cfg(windows)]
+pub fn user_programs() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(dirs::data_local_dir)
+        .unwrap_or_default()
+        .join("Programs")
+}
+
+#[cfg(not(windows))]
+fn installed_locations() -> Vec<PathBuf> {
+    // Homebrew on Apple silicon and Intel, then the system's.
+    ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"].into_iter().map(PathBuf::from).collect()
+}
+
+/// `git --version`'s answer ("git version 2.51.2.windows.1"), or why there
+/// is none.
+pub fn version() -> Result<String, String> {
+    let mut cmd = Command::new(program());
+    cmd.arg("--version").stdin(Stdio::null());
+    hide_window(&mut cmd);
+    let out = cmd.output().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => NOT_FOUND.to_owned(),
+        _ => format!("Failed to start git: {e}"),
+    })?;
+    let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    if out.status.success() && text.starts_with("git version") {
+        Ok(text)
+    } else {
+        // A Mac without the developer tools answers with an error (and
+        // offers to install them).
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        Err(if err.is_empty() { format!("git --version failed ({})", out.status) } else { err })
+    }
+}
 
 /// A `git` command rooted at `dir`, set up so it can never block on a prompt
 /// or flash a console window.
 pub fn command(dir: &Path) -> Command {
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(program());
     cmd.current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_EDITOR", "true")
@@ -66,7 +179,7 @@ pub fn run(dir: &Path, args: &[String], options: Options<'_>) -> Result<String, 
 
     let mut child = cmd.spawn().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
-            "Could not find `git`. Install Git and make sure it is on your PATH.".to_owned()
+            NOT_FOUND.to_owned()
         } else {
             format!("Failed to start git: {e}")
         }

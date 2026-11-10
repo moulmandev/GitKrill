@@ -45,6 +45,7 @@ impl App {
                 actions: Vec::new(),
                 updater: crate::update::Updater::new(),
                 workspaces: Default::default(),
+                git: crate::git_setup::GitSetup::new(),
             },
             cloning: None,
             saved_settings: String::new(),
@@ -490,6 +491,7 @@ impl App {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.label(dim(format!("v{}", env!("CARGO_PKG_VERSION"))));
                 ui::update::status_item(ui, &mut self.shared);
+                ui::git_setup::status_item(ui, &mut self.shared);
                 let zoom = (ui.ctx().zoom_factor() * 100.0).round();
                 if zoom != 100.0 {
                     ui.label(dim(format!("{zoom}%")));
@@ -572,6 +574,7 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
         ui::update::poll(&ctx, &mut self.shared);
+        ui::git_setup::poll(&ctx, &mut self.shared);
         self.shortcuts(&ctx);
 
         let title = match self.tabs.get(self.active) {

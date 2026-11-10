@@ -6,6 +6,7 @@
 mod app;
 mod avatars;
 mod git;
+mod git_setup;
 mod hosting;
 mod platform;
 mod shot;
@@ -32,7 +33,28 @@ fn main() -> eframe::Result {
             return Ok(());
         }
         Some("--help" | "-h") => {
-            println!("Usage: gitkrill [PATH]\n\nOpens the Git repository containing PATH.");
+            println!(
+                "Usage: gitkrill [PATH]\n\nOpens the Git repository containing PATH.\n\n  \
+                 --git       print which git GitKrill uses, and its version\n  \
+                 --version   print GitKrill's version"
+            );
+            return Ok(());
+        }
+        // Which git the app would run, for checking an installation.
+        Some("--git") => {
+            let found = git::cli::locate();
+            match &found {
+                Some(path) => println!("{}", path.display()),
+                None => println!("{}", git::cli::NOT_FOUND),
+            }
+            match found.map(|_| git::cli::version()) {
+                Some(Ok(version)) => println!("{version}"),
+                Some(Err(why)) => {
+                    println!("{why}");
+                    std::process::exit(1);
+                }
+                None => std::process::exit(1),
+            }
             return Ok(());
         }
         // Print what the backend sees, without starting the UI.

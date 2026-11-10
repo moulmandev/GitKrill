@@ -87,6 +87,8 @@ pub enum Dialog {
     ConnectServer { host: String, path: String, choice: Option<crate::hosting::ServerKind> },
     /// "Create pull request"; see `ui::new_pull`.
     NewPull(Box<crate::ui::new_pull::NewPullForm>),
+    /// Git is missing: the offer to get it; see `ui::git_setup`.
+    GitSetup,
 }
 
 impl Dialog {
@@ -240,6 +242,8 @@ pub struct Shared {
     pub updater: crate::update::Updater,
     /// Workspace scans and repository summaries; see `crate::workspace`.
     pub workspaces: crate::workspace::Workspaces,
+    /// Whether git is installed, and getting it; see `crate::git_setup`.
+    pub git: crate::git_setup::GitSetup,
 }
 
 impl Shared {

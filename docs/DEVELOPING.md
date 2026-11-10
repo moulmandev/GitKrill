@@ -151,6 +151,17 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   `<dir>` instead of asking. Workspaces can also be put straight into the
   run's `cfg/settings.json` (`"workspaces": [{"root": "<dir>", "repos": []}]`);
   they are scanned on start.
+- Git being missing: `GITKRILL_GIT=<path>` makes GitKrill use exactly that
+  git (point it at a file that does not exist), and `GITKRILL_GIT_FEED=
+  http://127.0.0.1:<port>` stands in for Git for Windows' releases like
+  `GITKRILL_UPDATE_FEED` does for GitKrill's. With `LOCALAPPDATA` pointed at
+  a scratch folder too, "Install Git" runs whatever installer the feed
+  serves with `/DIR=<LOCALAPPDATA>\Programs\Git`; a stand-in that writes a
+  `git.exe` answering `--version` there completes the flow. Never let a
+  test run the real Git installer on a development machine. CI runs the
+  real one, on a runner whose own Git is hidden (`/INSTALLGIT=1`).
+- Unknown command-line flags start the GUI. Set `GITKRILL_CONFIG_DIR` even
+  for one-off runs of the binary.
 - `tools/shot.sh` keeps settings in a `cfg` folder next to the output. Never
   run the app for testing without `GITKRILL_CONFIG_DIR` set, or the user's real
   tab list gets temp repositories in it.
