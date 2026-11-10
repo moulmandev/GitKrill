@@ -2,6 +2,8 @@
 //! so only the visible rows are laid out and painted.
 
 pub mod drag;
+mod ghost;
+pub mod reach;
 
 use std::sync::Arc;
 
@@ -13,7 +15,8 @@ use eframe::egui::{
 use crate::git::graph::SegKind;
 use crate::git::ops::{self, ResetMode};
 use crate::git::{CommitInfo, RefKind, RefLabel, RepoSnapshot, RowKind, short};
-use crate::state::{Dialog, RepoTab, Settings, Shared, format_time};
+use crate::prefs::graph::Description;
+use crate::state::{AppAction, Dialog, RepoTab, Settings, Shared, format_time};
 use crate::theme::{self, icons};
 use crate::ui::sidebar;
 use crate::ui::widgets::{self, elided, elided_pair, icon_button, menu_item};
@@ -28,17 +31,24 @@ const LINE_W: f32 = 2.0;
 /// Space between the graph column's left edge and the centre of lane 0.
 const LANE_PAD: f32 = 16.0;
 
+/// Where each column sits. Hidden columns (Preferences > Commit Graph) are
+/// `None`, or for the two on the left, empty ranges.
 pub struct Columns {
     refs: Rangef,
     graph: Rangef,
-    message: Rangef,
+    message: Option<Rangef>,
     author: Option<Rangef>,
     date: Option<Rangef>,
     sha: Option<Rangef>,
+    /// Branch and tag labels are shown.
+    show_refs: bool,
+    /// Lanes and commit nodes are shown.
+    show_tree: bool,
 }
 
 impl Columns {
     fn new(left: f32, right: f32, refs_w: f32, graph_w: f32, settings: &Settings) -> Self {
+        let prefs = &settings.graph;
         let mut end = right;
         let mut take = |on: bool, width: f32| {
             on.then(|| {
@@ -51,10 +61,18 @@ impl Columns {
         let date = take(settings.show_date, 136.0);
         let author = take(settings.show_author, 150.0);
 
-        let refs = Rangef::new(left, left + refs_w);
-        let graph = Rangef::new(refs.max, refs.max + graph_w);
-        let message = Rangef::new(graph.max, end.max(graph.max + 60.0));
-        Columns { refs, graph, message, author, date, sha }
+        let refs = Rangef::new(left, left + if prefs.show_refs { refs_w } else { 0.0 });
+        let graph = Rangef::new(refs.max, refs.max + if prefs.show_tree { graph_w } else { 0.0 });
+        let message = prefs.show_message.then(|| Rangef::new(graph.max, end.max(graph.max + 60.0)));
+        let mut cols = Columns { refs, graph, message, author, date, sha, show_refs: prefs.show_refs, show_tree: prefs.show_tree };
+        if message.is_none() {
+            // Without the message, the other columns follow the graph.
+            let shift = (end - graph.max).max(0.0);
+            for range in [&mut cols.author, &mut cols.date, &mut cols.sha].into_iter().flatten() {
+                *range = Rangef::new(range.min - shift, range.max - shift);
+            }
+        }
+        cols
     }
 }
 
@@ -73,6 +91,8 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
     };
     let history = snap.history.clone();
     let rows = history.commits.len();
+    let prefs = shared.settings.graph;
+    tab.set_initial_limit(prefs.limit());
 
     ui.spacing_mut().item_spacing.y = 0.0;
     if tab.search_open {
@@ -92,7 +112,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
 
     let header_rect = Rect::from_min_size(avail.min, vec2(avail.width(), HEADER_H));
     ui.allocate_rect(header_rect, Sense::hover());
-    header(ui, header_rect, &cols, &mut shared.settings, refs_w, graph_w);
+    header(ui, header_rect, &cols, shared, refs_w, graph_w);
 
     if rows == 0 {
         widgets::placeholder(ui, "No commits yet. Stage some files and make the first one.");
@@ -115,6 +135,8 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
     let query = !tab.search.trim().is_empty() && tab.search_open;
     let selected_row = tab.selected_row();
     let file_count = snap.status.file_count();
+    // A branch being dragged, from here or from the sidebar.
+    let session = drag::session(ui.ctx());
 
     ScrollArea::vertical().id_salt("commit-graph").auto_shrink([false, false]).show_viewport(
         ui,
@@ -145,20 +167,25 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
             let last = ((viewport.max.y / ROW_H).ceil() as usize + 1).min(rows);
             let painter = ui.painter().clone();
 
-            // A branch being dragged, from here or from the sidebar.
-            let session = drag::session(ui.ctx());
             if session.is_some() {
                 scroll_near_edges(ui);
             }
+
+            // The commits of the branch under the pointer, if one is: a label
+            // here (found before any row is painted) or a sidebar row.
+            let highlight = prefs.highlight_branch && session.is_none();
+            let label = if highlight { hovered_branch_label(ui, &painter, &snap, &cols, row_rect, first..last) } else { None };
+            let reach = tab.ref_hover.reached(ui.ctx(), &history, label, highlight);
 
             for i in first..last {
                 let commit = &history.commits[i];
                 let rect = row_rect(i);
                 let response = ui.interact(rect, ui.id().with(("row", commit.oid)), Sense::click());
 
-                let dim = query && tab.search_hits.binary_search(&(i as u32)).is_err();
+                let missed = query && tab.search_hits.binary_search(&(i as u32)).is_err();
+                let reached = reach.as_ref().map(|rows| rows.contains(i));
                 let labels: &[RefLabel] = match commit.kind {
-                    RowKind::Commit => snap.refs_by_oid.get(&commit.oid).map_or(&[], Vec::as_slice),
+                    RowKind::Commit if cols.show_refs => snap.refs_by_oid.get(&commit.oid).map_or(&[], Vec::as_slice),
                     _ => &[],
                 };
                 let pills = layout_pills(&painter, rect, &cols, labels);
@@ -204,6 +231,16 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                     }
                 }
 
+                // The faded "branch" and "tag" offers, on the row under the
+                // pointer and on the selected one.
+                let pointer_in = session.is_none() && ui.rect_contains_pointer(rect);
+                let selected = selected_row == Some(i);
+                let offer = prefs.ghost_refs && commit.kind == RowKind::Commit && session.is_none() && (selected || pointer_in);
+                let ghosts = if offer && cols.show_refs { ghost::layout(&painter, rect, &cols, &pills) } else { [None, None] };
+                let ghost_responses = ghosts.each_ref().map(|ghost| {
+                    ghost.as_ref().map(|ghost| ui.interact(ghost.rect, ui.id().with(("ghost", commit.oid, ghost.tag)), Sense::click()))
+                });
+
                 // Merge commits are drawn as a dot, without an avatar.
                 let picture = match commit.kind {
                     RowKind::Commit if commit.parents.len() <= 1 => {
@@ -212,17 +249,34 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                     _ => None,
                 };
                 let look = RowLook {
-                    selected: selected_row == Some(i),
+                    selected,
                     // Nothing but the landing place reacts during a drag.
                     hovered: session.is_none()
-                        && (response.hovered() || pill_responses.iter().any(Response::hovered)),
-                    dim,
+                        && (response.hovered()
+                            || pill_responses.iter().any(Response::hovered)
+                            || ghost_responses.iter().flatten().any(Response::hovered)),
+                    dim: missed || reached == Some(false),
+                    bright: reached == Some(true),
+                    description: prefs.shows_description(pointer_in),
                     file_count,
                     picture,
                     landing,
                     lifted,
                 };
                 paint_row(&painter, rect, &cols, &snap, i, &pills, &look);
+
+                let color = theme::lane_color(history.graph.row(i).color);
+                let ghost_hovered = ghost_responses.each_ref().map(|r| r.as_ref().is_some_and(Response::hovered));
+                ghost::paint(&painter, rect, &cols, &ghosts, ghost_hovered, color);
+                for (ghost, ghost_response) in ghosts.iter().flatten().zip(ghost_responses.into_iter().flatten()) {
+                    let what = if ghost.tag { "tag" } else { "branch" };
+                    let ghost_response = ghost_response
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text(format!("Create a {what} at {}", short(commit.oid)));
+                    if ghost_response.clicked() {
+                        shared.show(ghost::dialog(commit.oid, ghost.tag));
+                    }
+                }
 
                 if response.double_clicked() {
                     checkout_row(tab, &snap, commit);
@@ -244,7 +298,6 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
 
                 // A label acts for its own ref: double-click checks it out,
                 // right-click opens its menu, dragging carries the branch.
-                let color = theme::lane_color(history.graph.row(i).color);
                 for (pill, pill_response) in pills.shown.iter().zip(pill_responses) {
                     let label = &labels[pill.label];
                     if pill_response.double_clicked() {
@@ -262,19 +315,61 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
 
             if history.has_more {
                 let rect = row_rect(rows);
-                painter.text(
-                    rect.center(),
-                    Align2::CENTER_CENTER,
-                    "Loading older commits…",
-                    theme::font(12.0),
-                    theme::text_faint(),
-                );
-                if last >= rows {
-                    tab.load_more();
+                if prefs.lazy_load || tab.loading_more() {
+                    painter.text(
+                        rect.center(),
+                        Align2::CENTER_CENTER,
+                        "Loading older commits…",
+                        theme::font(12.0),
+                        theme::text_faint(),
+                    );
+                    if prefs.lazy_load && last >= rows {
+                        tab.load_more();
+                    }
+                } else {
+                    // Lazy loading is off: more history only when asked.
+                    let response = ui
+                        .interact(rect, ui.id().with("load-more"), Sense::click())
+                        .on_hover_cursor(CursorIcon::PointingHand);
+                    let color = if response.hovered() { theme::text_bright() } else { theme::accent() };
+                    let text = format!("{}  Load more commits", icons::ARROW_DOWN);
+                    painter.text(rect.center(), Align2::CENTER_CENTER, text, theme::font(12.5), color);
+                    if response.clicked() {
+                        tab.load_more();
+                    }
                 }
             }
         },
     );
+}
+
+/// The commit whose branch label (local or remote) is under the pointer,
+/// among the visible rows. Only the row under the pointer has its labels laid
+/// out, an extra time.
+fn hovered_branch_label(
+    ui: &Ui,
+    painter: &Painter,
+    snap: &RepoSnapshot,
+    cols: &Columns,
+    row_rect: impl Fn(usize) -> Rect,
+    visible: std::ops::Range<usize>,
+) -> Option<crate::git::Oid> {
+    if !cols.show_refs {
+        return None;
+    }
+    let pos = ui.ctx().pointer_hover_pos().filter(|pos| cols.refs.contains(pos.x))?;
+    let top = row_rect(0).top();
+    let row = ((pos.y - top) / ROW_H).floor();
+    let row = (row >= 0.0).then_some(row as usize).filter(|row| visible.contains(row))?;
+    let commit = &snap.history.commits[row];
+    let labels = snap.refs_by_oid.get(&commit.oid).filter(|_| commit.kind == RowKind::Commit)?;
+    let pills = layout_pills(painter, row_rect(row), cols, labels);
+    let on_branch = pills.shown.iter().any(|pill| {
+        matches!(labels[pill.label].kind, RefKind::Local | RefKind::Remote)
+            && ui.rect_contains_pointer(pill.rect.intersect(Rect::from_x_y_ranges(cols.refs, pill.rect.y_range())))
+    });
+    // The label sits on its branch's tip.
+    on_branch.then_some(commit.oid)
 }
 
 /// The tooltip for a row whose labels do not all fit.
@@ -310,7 +405,7 @@ fn scroll_near_edges(ui: &Ui) {
     ui.ctx().request_repaint();
 }
 
-fn header(ui: &mut Ui, rect: Rect, cols: &Columns, settings: &mut Settings, refs_w: f32, graph_w: f32) {
+fn header(ui: &mut Ui, rect: Rect, cols: &Columns, shared: &mut Shared, refs_w: f32, graph_w: f32) {
     let painter = ui.painter().clone();
     painter.rect_filled(rect, 0.0, theme::bg_header());
     painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::border()));
@@ -318,9 +413,15 @@ fn header(ui: &mut Ui, rect: Rect, cols: &Columns, settings: &mut Settings, refs
     let label = |x: f32, text: &str| {
         painter.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, text, theme::font(10.5), theme::text_dim());
     };
-    label(cols.refs.min + 10.0, "BRANCH  /  TAG");
-    label(cols.graph.min + 8.0, "GRAPH");
-    label(cols.message.min + 12.0, "COMMIT MESSAGE");
+    if cols.show_refs {
+        label(cols.refs.min + 10.0, "BRANCH  /  TAG");
+    }
+    if cols.show_tree {
+        label(cols.graph.min + 8.0, "GRAPH");
+    }
+    if let Some(range) = cols.message {
+        label(range.min + 12.0, "COMMIT MESSAGE");
+    }
     if let Some(range) = cols.author {
         label(range.min + 8.0, "AUTHOR");
     }
@@ -332,7 +433,9 @@ fn header(ui: &mut Ui, rect: Rect, cols: &Columns, settings: &mut Settings, refs
     }
 
     // Draggable column edges. Double-click the graph edge to auto-size again.
-    for (x, is_graph) in [(cols.refs.max, false), (cols.graph.max, true)] {
+    let settings = &mut shared.settings;
+    let edges = [(cols.refs.max, false), (cols.graph.max, true)];
+    for (x, is_graph) in edges.into_iter().filter(|(_, is_graph)| if *is_graph { cols.show_tree } else { cols.show_refs }) {
         let handle = Rect::from_center_size(pos2(x, rect.center().y), vec2(9.0, rect.height()));
         let response = ui
             .interact(handle, ui.id().with(("column-edge", is_graph)), Sense::click_and_drag())
@@ -367,14 +470,31 @@ fn header(ui: &mut Ui, rect: Rect, cols: &Columns, settings: &mut Settings, refs
     );
     Popup::menu(&response).close_behavior(PopupCloseBehavior::CloseOnClickOutside).show(|ui| {
         ui.set_min_width(170.0);
-        ui.label(egui::RichText::new("Columns").color(theme::text_dim()).size(11.0));
+        let caption = |ui: &mut Ui, text: &str| ui.label(egui::RichText::new(text).color(theme::text_dim()).size(11.0));
+        caption(ui, "Columns");
+        ui.checkbox(&mut settings.graph.show_refs, "Branch / Tag");
+        ui.checkbox(&mut settings.graph.show_tree, "Graph");
+        ui.checkbox(&mut settings.graph.show_message, "Commit message");
         ui.checkbox(&mut settings.show_author, "Author");
         ui.checkbox(&mut settings.show_date, "Date");
         ui.checkbox(&mut settings.show_sha, "SHA");
         ui.separator();
+        caption(ui, "Description");
+        ui.add_enabled_ui(settings.graph.show_message, |ui| {
+            ui.horizontal(|ui| {
+                for (value, text) in Description::CHOICES {
+                    ui.selectable_value(&mut settings.graph.description, value, text);
+                }
+            });
+        });
+        ui.separator();
         if ui.button("Reset column widths").clicked() {
             settings.graph_width = None;
             settings.refs_width = Settings::default().refs_width;
+        }
+        if ui.button("Commit graph preferences…").clicked() {
+            shared.actions.push(AppAction::OpenPreferences(crate::ui::prefs::Section::Graph));
+            ui.close();
         }
     });
 }
@@ -393,8 +513,13 @@ enum Landing {
 struct RowLook {
     selected: bool,
     hovered: bool,
-    /// Faded: not a match of the current search.
+    /// Faded: not a match of the current search, or not on the branch the
+    /// pointer is on.
     dim: bool,
+    /// On the branch the pointer is on.
+    bright: bool,
+    /// The commit's description follows its summary.
+    description: bool,
     /// Changed files, for the WIP row.
     file_count: usize,
     /// The author's picture, once it is loaded.
@@ -402,6 +527,54 @@ struct RowLook {
     landing: Landing,
     /// The shown label that is being dragged away.
     lifted: Option<usize>,
+}
+
+/// The COMMIT MESSAGE column: the summary, then the description when the
+/// row shows it.
+fn paint_message(painter: &Painter, rect: Rect, cols: &Columns, commit: &CommitInfo, look: &RowLook, color: Color32) {
+    let Some(message) = cols.message else { return };
+    let cy = rect.center().y;
+    let x0 = message.min;
+    painter.rect_filled(
+        Rect::from_min_max(pos2(x0, rect.top() + 2.0), pos2(x0 + 2.0, rect.bottom() - 2.0)),
+        0.0,
+        color,
+    );
+    let text_x = x0 + 12.0;
+    let max_w = message.max - text_x - 8.0;
+    let mp = painter.with_clip_rect(
+        Rect::from_x_y_ranges(message, rect.y_range()).intersect(painter.clip_rect()),
+    );
+
+    match commit.kind {
+        RowKind::Wip => {
+            let galley = mp.layout_no_wrap("// WIP".to_owned(), theme::font(13.0), theme::text_dim());
+            let field = Rect::from_min_size(
+                pos2(text_x - 4.0, cy - 10.0),
+                vec2((galley.size().x + 60.0).min(max_w), 20.0),
+            );
+            mp.rect_filled(field, 3.0, theme::well());
+            widgets::galley_left(&mp, rect, text_x + 4.0, galley);
+            let x = field.right() + 12.0;
+            let w = widgets::text_left(&mp, rect, x, icons::PENCIL_SIMPLE, theme::font(14.0), theme::yellow());
+            widgets::text_left(&mp, rect, x + w + 5.0, &look.file_count.to_string(), theme::font(13.0), theme::text());
+        }
+        RowKind::Stash => {
+            let galley = elided(&mp, &commit.summary, theme::font(13.0), theme::text_dim(), max_w);
+            widgets::galley_left(&mp, rect, text_x, galley);
+        }
+        RowKind::Commit => {
+            let summary_color = if look.selected || look.bright { theme::text_bright() } else { theme::text() };
+            let body = if look.description { commit.body_preview.as_str() } else { "" };
+            let galley = elided_pair(
+                &mp,
+                (&commit.summary, theme::font(13.0), summary_color),
+                (body, theme::font(13.0), theme::text_faint()),
+                max_w,
+            );
+            widgets::galley_left(&mp, rect, text_x, galley);
+        }
+    }
 }
 
 fn paint_row(
@@ -413,7 +586,7 @@ fn paint_row(
     pills: &Pills,
     look: &RowLook,
 ) {
-    let RowLook { selected, hovered, dim, file_count, picture, landing, lifted } = *look;
+    let RowLook { selected, hovered, dim, picture, landing, lifted, .. } = *look;
     let history = &snap.history;
     let commit = &history.commits[index];
     let row = history.graph.row(index);
@@ -443,7 +616,7 @@ fn paint_row(
 
     let label_end =
         (!pills.shown.is_empty()).then(|| paint_pills(&painter, rect, cols, pills, color, landing, lifted));
-    if let Some(end) = label_end {
+    if let Some(end) = label_end.filter(|_| cols.show_tree) {
         // Connector from the label to its node, underneath the lanes.
         painter
             .with_clip_rect(
@@ -493,47 +666,7 @@ fn paint_row(
         }
     }
 
-    // ---- message column ----
-    let x0 = cols.message.min;
-    painter.rect_filled(
-        Rect::from_min_max(pos2(x0, rect.top() + 2.0), pos2(x0 + 2.0, rect.bottom() - 2.0)),
-        0.0,
-        color,
-    );
-    let text_x = x0 + 12.0;
-    let max_w = cols.message.max - text_x - 8.0;
-    let mp = painter.with_clip_rect(
-        Rect::from_x_y_ranges(cols.message, rect.y_range()).intersect(painter.clip_rect()),
-    );
-
-    match commit.kind {
-        RowKind::Wip => {
-            let galley = mp.layout_no_wrap("// WIP".to_owned(), theme::font(13.0), theme::text_dim());
-            let field = Rect::from_min_size(
-                pos2(text_x - 4.0, cy - 10.0),
-                vec2((galley.size().x + 60.0).min(max_w), 20.0),
-            );
-            mp.rect_filled(field, 3.0, theme::well());
-            widgets::galley_left(&mp, rect, text_x + 4.0, galley);
-            let x = field.right() + 12.0;
-            let w = widgets::text_left(&mp, rect, x, icons::PENCIL_SIMPLE, theme::font(14.0), theme::yellow());
-            widgets::text_left(&mp, rect, x + w + 5.0, &file_count.to_string(), theme::font(13.0), theme::text());
-        }
-        RowKind::Stash => {
-            let galley = elided(&mp, &commit.summary, theme::font(13.0), theme::text_dim(), max_w);
-            widgets::galley_left(&mp, rect, text_x, galley);
-        }
-        RowKind::Commit => {
-            let summary_color = if selected { theme::text_bright() } else { theme::text() };
-            let galley = elided_pair(
-                &mp,
-                (&commit.summary, theme::font(13.0), summary_color),
-                (&commit.body_preview, theme::font(13.0), theme::text_faint()),
-                max_w,
-            );
-            widgets::galley_left(&mp, rect, text_x, galley);
-        }
-    }
+    paint_message(&painter, rect, cols, commit, look, color);
 
     // ---- optional columns ----
     if commit.kind != RowKind::Wip {

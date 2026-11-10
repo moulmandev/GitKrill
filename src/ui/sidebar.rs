@@ -356,6 +356,9 @@ fn local_row(
 
     // Branch rows can also be dragged; a click is still a click.
     let response = leaf(ui, depth, branch.is_head, icon, name, color, &trailing).interact(Sense::drag());
+    if response.hovered() && let Some(oid) = branch.oid {
+        tab.ref_hover.hover(ui.ctx(), oid);
+    }
     if response.double_clicked() && !branch.is_head {
         tab.run(ops::checkout(&branch.name));
     } else if response.clicked()
@@ -445,6 +448,9 @@ fn remote_row(
     depth: usize,
 ) -> Response {
     let response = leaf(ui, depth, false, icons::GIT_BRANCH, name, theme::text(), "").interact(Sense::drag());
+    if response.hovered() {
+        tab.ref_hover.hover(ui.ctx(), branch.oid);
+    }
     if response.double_clicked() {
         tab.run(checkout_remote(snap, branch));
     } else if response.clicked() {

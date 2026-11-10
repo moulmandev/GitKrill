@@ -77,9 +77,14 @@ be installed.
   outlined (a local branch and its in-sync remote share one label)
 - Author pictures from Gravatar and GitHub, cached on disk, initials otherwise
 - WIP row for uncommitted changes, stashes shown in place
-- Loads history in pages as you scroll; arrow keys walk the graph
+- Loads history in pages as you scroll, or on request, or all at once
+  (Preferences > Commit Graph); arrow keys walk the graph
 - Search by message, author or SHA (`Ctrl+F`, `Enter` / `Shift+Enter` to step)
-- Optional Author / Date / SHA columns (gear icon), resizable columns
+- Every column can be hidden or shown (gear icon), resizable columns;
+  commit descriptions after the summary always, on hover or never
+- Hovering a branch, in the graph or the sidebar, dims the commits it does
+  not contain; faded branch and tag labels on the hovered or selected commit
+  create one there
 - Drag a branch onto another branch, a remote or a commit to merge, rebase,
   fast-forward, push or reset
 
@@ -230,7 +235,8 @@ src/
     picture.rs   decoding images for the image preview
     cli.rs       running git
   ui/
-    graph.rs     commit graph (graph/drag.rs: dragging branches)
+    graph.rs     commit graph (graph/drag.rs: dragging branches,
+                 reach.rs: hovered-branch highlight, ghost.rs: ghost labels)
     sidebar.rs   refs sidebar        hosting.rs  hosting sections
     new_pull.rs  creating a pull or merge request
     panel.rs     staging / details   files.rs    changed-file lists

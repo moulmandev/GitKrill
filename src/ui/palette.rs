@@ -511,6 +511,30 @@ fn app_actions(list: &mut Vec<Entry>, has_tab: bool, settings: &Settings) {
         |s| s.show_sidebar = !s.show_sidebar,
     ));
     list.push(toggle(
+        "column-refs",
+        icons::COLUMNS,
+        settings.graph.show_refs,
+        ("Hide Branch / Tag column", "Show Branch / Tag column"),
+        "graph columns view labels branches tags refs",
+        |s| s.graph.show_refs = !s.graph.show_refs,
+    ));
+    list.push(toggle(
+        "column-graph",
+        icons::COLUMNS,
+        settings.graph.show_tree,
+        ("Hide Graph column", "Show Graph column"),
+        "graph columns view commit tree lanes",
+        |s| s.graph.show_tree = !s.graph.show_tree,
+    ));
+    list.push(toggle(
+        "column-message",
+        icons::COLUMNS,
+        settings.graph.show_message,
+        ("Hide Commit message column", "Show Commit message column"),
+        "graph columns view summary",
+        |s| s.graph.show_message = !s.graph.show_message,
+    ));
+    list.push(toggle(
         "column-author",
         icons::COLUMNS,
         settings.show_author,
@@ -534,6 +558,20 @@ fn app_actions(list: &mut Vec<Entry>, has_tab: bool, settings: &Settings) {
         "graph columns view hash",
         |s| s.show_sha = !s.show_sha,
     ));
+    if settings.graph.show_message {
+        use crate::prefs::graph::Description;
+        list.push(toggle(
+            "column-description",
+            icons::COLUMNS,
+            settings.graph.description == Description::Always,
+            ("Hide commit descriptions in the graph", "Show commit descriptions in the graph"),
+            "graph columns view body message",
+            |s| {
+                let always = s.graph.description == Description::Always;
+                s.graph.description = if always { Description::Never } else { Description::Always };
+            },
+        ));
+    }
     list.push(toggle(
         "tree-view",
         if settings.tree_view { icons::LIST } else { icons::TREE_VIEW },
