@@ -40,9 +40,10 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Show a preference | Its section's page in `src/ui/prefs/<section>.rs` (see "Preferences" below). |
 | Read or change git's configuration | `crate::prefs::gitconfig`: `page.global` / `page.repo` on a preferences page (`get`, `get_bool`, `set`, `set_bool`; read in the background, written through `git config`); `gitconfig::read` / `write` / `effective` from background code. |
 | Hand a file or folder to the user's merge tool, diff tool, editor or terminal | `crate::external`: `merge(tools, file)` gives a `GitCmd` for `tab.run`; `diff`, `edit` and `terminal` start the program on a short-lived thread. Pass `&shared.settings.tools`. Failures come back as toasts; a `GITKRILL_SHOT` run prints the command instead. To support another tool, add it to `KNOWN` (where to look, its command lines). |
-| Give every git command an environment variable | `git::cli::set_session_env` (the SSH key and author of the profile in use). |
+| Give every git command an environment variable | `git::cli::set_session_env` (the SSH key and author of the profile in use). It replaces the whole set and `prefs::identity::apply` owns it: add what you need to `identity::session_env` rather than calling it from elsewhere. |
 | Change what the commit button does | `src/ui/commit_button.rs`: the split button (`show`), what runs once a commit succeeded (`follow_up`), the commit template in the message fields (`prefill`). |
 | Ask a hosting account something (who is signed in, its SSH keys) | `hosting::account::AccountSession::start(account, ctx)`, polled from the UI; `account::local_keys`, `parse_public_key` and `fingerprint` read `.pub` files. A host in `settings.hosting_disconnected` is never signed in to. |
+| Know who commits | `prefs::identity`: `settings.identity.current()` is the profile in use; `identity::generation()` changes whenever the identity git commands get may have changed (ask git again then, as `ui::prefs::profiles::commit_author` does). |
 | Do network or other non-repository background work | Spawn your own thread, send results over a channel, call `ctx.request_repaint()` when something arrives, and poll the channel from your UI code. Never block in UI code. |
 
 Fetch commands start from `ops::fetch(&[...])`, which adds `--prune`
@@ -232,6 +233,15 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   really replaces the executable it runs as: point `BIN` at a copy.
 - `GITKRILL_SHOT_NO_LFS=1` makes a scripted run behave as if git-lfs were
   not installed (Preferences > LFS).
+- To try commit signing, give the run a throwaway GnuPG home: `export
+  MSYS2_ENV_CONV_EXCL=GNUPGHOME GNUPGHOME=/c/Users/<you>/AppData/Local/Temp/<area>/gnupg`
+  (Git for Windows' gpg only reads the `/c/...` form, and Git Bash would
+  rewrite it to `C:/...` for the app without the first variable). Start
+  its agent first, detached (`gpgconf --launch gpg-agent </dev/null
+  >/dev/null 2>&1`): one started by the app inherits the run's output pipe
+  and keeps a `| tail` waiting. Stop it afterwards with `gpgconf --kill
+  gpg-agent`. SSH keys made from Preferences > SSH go to
+  `<GITKRILL_CONFIG_DIR>/ssh` during runs, never `~/.ssh`.
 - Folder dialogs cannot be clicked through by a script: with
   `GITKRILL_SHOT_FOLDER=<dir>` set, "Add a folder of repositories" picks
   `<dir>` instead of asking. Workspaces can also be put straight into the

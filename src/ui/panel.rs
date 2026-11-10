@@ -194,6 +194,7 @@ fn commit_box(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSn
             .desired_rows(4)
             .desired_width(f32::INFINITY),
     );
+    crate::ui::prefs::profiles::commit_author(ui, tab, &shared.settings);
 
     let focused = summary.has_focus() || description.has_focus();
     let shortcut = focused && ui.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::Enter));

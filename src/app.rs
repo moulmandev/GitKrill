@@ -437,8 +437,10 @@ impl App {
         painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::border()));
 
         let count = self.tabs.len().max(1) as f32;
-        // Room at the right end for "+" and the preferences gear.
-        let max_w = ((rect.width() - 44.0 - GEAR_ROOM) / count).clamp(70.0, 220.0);
+        // Room at the right end for "+", the profile switcher and the
+        // preferences gear.
+        let profile_room = ui::prefs::profiles::switcher_width(&painter, &self.shared.settings);
+        let max_w = ((rect.width() - 44.0 - GEAR_ROOM - profile_room) / count).clamp(70.0, 220.0);
         let mut x = rect.left();
 
         for (i, tab) in self.tabs.iter().enumerate() {
@@ -527,6 +529,9 @@ impl App {
         if response.on_hover_text(if open { "Close preferences (Ctrl+,)" } else { "Preferences (Ctrl+,)" }).clicked() {
             self.shared.actions.push(if open { AppAction::ClosePreferences } else { AppAction::OpenPreferences(Section::General) });
         }
+
+        let switcher = Rect::from_min_max(pos2(rect.right() - GEAR_ROOM - profile_room, rect.top()), pos2(rect.right() - GEAR_ROOM, rect.bottom()));
+        ui::prefs::profiles::switcher(ui, switcher, &mut self.shared);
     }
 
     fn status_bar(&mut self, ui: &mut Ui) {

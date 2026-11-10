@@ -675,6 +675,13 @@ fn app_actions(list: &mut Vec<Entry>, has_tab: bool, settings: &Settings) {
         });
         list.push(entry.detail(if section.is_repo() { "this repository" } else { "" }).keywords(section.keywords()));
     }
+    for (index, name) in crate::ui::prefs::profiles::switchable(settings) {
+        let label = format!("Switch to profile {name}");
+        let entry = Entry::new(Kind::Action, format!("profile-{name}"), icons::USER_SWITCH, label, move |env: &mut Env<'_>| {
+            crate::ui::prefs::profiles::switch(env.shared, index)
+        });
+        list.push(entry.keywords("identity author email account work personal"));
+    }
 }
 
 fn branches_and_tags(list: &mut Vec<Entry>, snap: &RepoSnapshot) {
