@@ -13,9 +13,6 @@
 //! `<config dir>/gitconfig` (`tools/shot.sh` sets `GIT_CONFIG_GLOBAL` to that
 //! same file, so the git commands of the run read what the pages wrote).
 
-// Helpers for every page; not every page uses all of them yet.
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 
@@ -32,6 +29,7 @@ pub enum Scope {
     /// directory.
     Repo(PathBuf),
     /// A file named outright (`git config --file`): for tests.
+    #[cfg_attr(not(test), allow(dead_code))]
     File(PathBuf),
 }
 
@@ -221,20 +219,9 @@ impl ConfigFile {
         self.entries.as_ref()?.iter().rev().find(|(k, _)| *k == key).map(|(_, v)| v.as_str())
     }
 
-    /// Every value of a key that can repeat (`remote.origin.fetch`).
-    pub fn get_all(&self, key: &str) -> Vec<&str> {
-        let key = normalize(key);
-        self.entries.iter().flatten().filter(|(k, _)| *k == key).map(|(_, v)| v.as_str()).collect()
-    }
-
     /// A boolean the way git reads one; `None` when unset or not a boolean.
     pub fn get_bool(&self, key: &str) -> Option<bool> {
         parse_bool(self.get(key)?)
-    }
-
-    /// Every entry, in file order, with normalised keys.
-    pub fn entries(&self) -> &[(String, String)] {
-        self.entries.as_deref().unwrap_or_default()
     }
 
     /// Sets `key` (`None` removes it). The value in memory changes now; the

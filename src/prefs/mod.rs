@@ -46,7 +46,6 @@ pub struct RepoPrefs {
 }
 
 /// The preferences of the repository at `workdir`, or the defaults.
-#[allow(dead_code)] // TODO(prefs scaffold): used by the Encoding and Commit pages.
 pub fn repo<'a>(settings: &'a Settings, workdir: &Path) -> std::borrow::Cow<'a, RepoPrefs> {
     match settings.repos.get(workdir) {
         Some(prefs) => std::borrow::Cow::Borrowed(prefs),
@@ -56,7 +55,6 @@ pub fn repo<'a>(settings: &'a Settings, workdir: &Path) -> std::borrow::Cow<'a, 
 
 /// The preferences of the repository at `workdir`, to change. Only call it
 /// to make a change: it adds an entry for the repository.
-#[allow(dead_code)] // TODO(prefs scaffold): used by the Encoding and Commit pages.
 pub fn repo_mut<'a>(settings: &'a mut Settings, workdir: &Path) -> &'a mut RepoPrefs {
     settings.repos.entry(workdir.to_path_buf()).or_default()
 }

@@ -13,9 +13,6 @@
 //! });
 //! ```
 
-// Helpers for every page; not every page uses all of them yet.
-#![allow(dead_code)]
-
 use std::path::PathBuf;
 
 use eframe::egui::{
@@ -154,6 +151,7 @@ pub fn button(ui: &mut Ui, text: &str, color: Color32) -> egui::Response {
 /// What a Browse button asks for.
 pub enum Pick {
     File,
+    #[allow(dead_code)] // Every page that asks for a folder has its own picker so far.
     Folder,
 }
 
@@ -192,11 +190,6 @@ pub fn loading(ui: &mut Ui) {
         ui.add(egui::Spinner::new().size(13.0).color(theme::accent()));
         ui.label(RichText::new("Loading…").color(theme::text_dim()));
     });
-}
-
-/// Placeholder for a page that has nothing yet.
-pub fn todo(ui: &mut Ui) {
-    ui.label(RichText::new("Nothing to set here yet.").color(theme::text_faint()));
 }
 
 /// A checkbox bound to a git boolean in `file` (`default` when unset).

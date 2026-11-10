@@ -10,7 +10,6 @@ use std::sync::RwLock;
 static SESSION_ENV: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
 
 /// Replaces the environment [`command`] adds to every git command.
-#[allow(dead_code)] // TODO(prefs scaffold): used by Profiles and SSH.
 pub fn set_session_env(env: Vec<(String, String)>) {
     if let Ok(mut current) = SESSION_ENV.write() {
         *current = env;

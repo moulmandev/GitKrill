@@ -194,7 +194,6 @@ impl PrefsView {
 }
 
 /// What a section's `show` works with.
-#[allow(dead_code)] // TODO(prefs scaffold): drop once the pages use every field.
 pub struct Page<'a> {
     pub ctx: &'a egui::Context,
     /// Settings (`shared.settings`), toasts, dialogs.
