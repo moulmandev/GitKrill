@@ -37,6 +37,7 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Show a preference | Its section's page in `src/ui/prefs/<section>.rs` (see "Preferences" below). |
 | Read or change git's configuration | `crate::prefs::gitconfig`: `page.global` / `page.repo` on a preferences page (`get`, `get_bool`, `set`, `set_bool`; read in the background, written through `git config`); `gitconfig::read` / `write` / `effective` from background code. |
 | Give every git command an environment variable | `git::cli::set_session_env` (the SSH key and author of the profile in use). |
+| Change what the commit button does | `src/ui/commit_button.rs`: the split button (`show`), what runs once a commit succeeded (`follow_up`), the commit template in the message fields (`prefill`). |
 | Do network or other non-repository background work | Spawn your own thread, send results over a channel, call `ctx.request_repaint()` when something arrives, and poll the channel from your UI code. Never block in UI code. |
 
 `tab.jump_to(oid)` selects a commit and scrolls the graph to it.
@@ -119,6 +120,11 @@ front, and the global and repository git configuration files.
   `Loader::walk` for how the history page stays O(page size).
 - `GIT_LITERAL_PATHSPECS` breaks `git stash push --include-untracked`; it is
   therefore set per step (`Step::with_paths`), not globally.
+- **git-lfs sets itself up** in a repository on most commands, even ones
+  that only list (`git lfs track`, `git lfs ls-files`): it installs its
+  hooks and writes `lfs.repositoryformatversion` to `.git/config`. Ask
+  `git::lfs::status` whether a repository uses LFS (it looks without
+  git-lfs) before running anything else of it.
 
 ## Checking your work
 
@@ -182,6 +188,8 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   installed|portable|browser` to pick the flow. Screenshot runs only check
   against such a feed, and print instead of restarting. A portable run
   really replaces the executable it runs as: point `BIN` at a copy.
+- `GITKRILL_SHOT_NO_LFS=1` makes a scripted run behave as if git-lfs were
+  not installed (Preferences > LFS).
 - Folder dialogs cannot be clicked through by a script: with
   `GITKRILL_SHOT_FOLDER=<dir>` set, "Add a folder of repositories" picks
   `<dir>` instead of asking. Workspaces can also be put straight into the

@@ -94,7 +94,15 @@ be installed.
   a word, triple-click a line, Shift+click to extend. Copies leave out line
   numbers and +/- markers and keep tabs as tabs; picking lines to stage is
   done in the line-number gutter
-- Commit, amend, and "stage all and commit" in one click (`Ctrl+Enter`)
+- Commit, amend, and "stage all and commit" in one click (`Ctrl+Enter`); the
+  button's menu also commits and pushes, or commits and opens a pull request,
+  and Preferences > Commit picks which of these the button does
+- Commit templates: git's own `commit.template` fills an empty message (set
+  it in Preferences > Commit), a counter shows what is left of 72 characters
+  in the summary, and comment lines can be left out of the commit
+- Git LFS (Preferences > LFS): set it up in a repository, add and remove
+  tracked patterns (or "Track *.psd with LFS" from a file's menu), fetch and
+  pull LFS objects
 - Changes made outside the app (editor, terminal) appear on their own
 
 **Conflicts**
@@ -267,7 +275,8 @@ build.rs         the Windows executable's icon and version details
 - Syntax grammars are syntect's bundled set: TypeScript is coloured as
   JavaScript, and Kotlin, Swift, Dart and PowerShell stay plain
 - SSH keys with a passphrase need an agent; there is no passphrase prompt
-- Submodule management, worktrees, Git LFS controls; SVG changes show as text
+- Submodule management, worktrees, Git LFS file locking; SVG changes show
+  as text
 
 ## License
 
