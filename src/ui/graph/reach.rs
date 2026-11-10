@@ -248,7 +248,7 @@ mod tests {
             for _ in 0..3 {
                 let mut loader = crate::git::repo::Loader::open(std::path::Path::new(&dir)).unwrap();
                 let started = Instant::now();
-                let snap = loader.snapshot(limit).unwrap();
+                let snap = loader.snapshot(limit, &Default::default()).unwrap();
                 let took = started.elapsed();
                 best = Some(best.map_or(took, |best: std::time::Duration| best.min(took)));
                 last = Some((loader, snap));

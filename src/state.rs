@@ -1,7 +1,7 @@
 //! Application state shared by the UI modules.
 
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use serde::{Deserialize, Serialize};
 
+use crate::git::hidden::Hidden;
 use crate::git::ops::{GitCmd, UndoEntry, UndoKind};
 use crate::git::{
     CommitDetails, DiffSource, DiffTarget, FileDiff, Oid, RepoSnapshot, RowKind,
@@ -181,6 +182,9 @@ pub struct Settings {
     /// Hosts whose sign-in GitKrill does not use (Preferences > Integrations
     /// > Disconnect); see `crate::hosting::Disconnected`.
     pub hosting_disconnected: crate::hosting::Disconnected,
+    /// Branches, folders, remotes and tags left out of each repository's
+    /// graph, by the path its tab opened (`crate::git::hidden`).
+    pub hidden_refs: BTreeMap<PathBuf, Hidden>,
 }
 
 impl Default for Settings {
@@ -212,6 +216,7 @@ impl Default for Settings {
             editor: Default::default(),
             repos: Default::default(),
             hosting_disconnected: Default::default(),
+            hidden_refs: BTreeMap::new(),
         }
     }
 }
@@ -361,6 +366,8 @@ pub struct RepoTab {
     pub search_stamp: (String, usize),
     /// Collapsed sidebar sections, branch folders and file tree folders.
     pub collapsed: HashSet<String>,
+    /// Refs left out of the graph; change them with [`RepoTab::set_hidden`].
+    pub hidden: Hidden,
 
     last_fs_refresh: Instant,
     /// When the next automatic fetch is due.
@@ -405,6 +412,7 @@ impl RepoTab {
             search_hits: Vec::new(),
             search_stamp: (String::new(), 0),
             collapsed: HashSet::new(),
+            hidden: Hidden::default(),
             last_fs_refresh: Instant::now(),
             next_auto_fetch: Instant::now() + FIRST_AUTO_FETCH,
         }
@@ -471,9 +479,11 @@ impl RepoTab {
     }
 
     /// Starts the background threads the first time the tab is shown.
-    pub fn start(&mut self, ctx: &egui::Context) {
+    pub fn start(&mut self, ctx: &egui::Context, settings: &Settings) {
         if self.handle.is_none() && self.error.is_none() {
+            self.hidden = settings.hidden_refs.get(&self.path).cloned().unwrap_or_default();
             let handle = RepoHandle::spawn(self.path.clone(), ctx.clone(), self.limit);
+            handle.set_hidden(self.hidden.clone());
             handle.refresh();
             self.handle = Some(handle);
         }
@@ -484,6 +494,22 @@ impl RepoTab {
             handle.refresh();
             self.last_fs_refresh = Instant::now();
         }
+    }
+
+    /// Hides or shows the ref or folder `path` in the graph (see
+    /// `crate::git::hidden`), remembers it for this repository, and redraws
+    /// the graph without it.
+    pub fn set_hidden(&mut self, settings: &mut Settings, path: &str, hide: bool) {
+        self.hidden.set(path, hide);
+        if self.hidden.is_empty() {
+            settings.hidden_refs.remove(&self.path);
+        } else {
+            settings.hidden_refs.insert(self.path.clone(), self.hidden.clone());
+        }
+        if let Some(handle) = &self.handle {
+            handle.set_hidden(self.hidden.clone());
+        }
+        self.refresh();
     }
 
     pub fn run(&mut self, cmd: GitCmd) {

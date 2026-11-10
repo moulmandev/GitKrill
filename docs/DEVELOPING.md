@@ -59,6 +59,9 @@ date" is on and the repository has a `.gitmodules` file.
 `tab.ref_hover.hover(ui.ctx(), tip)`, called on each frame the pointer is on
 something that stands for a branch (sidebar rows and graph labels do), makes
 the graph dim the loaded commits that `tip` does not reach.
+`tab.hidden` says which refs the graph leaves out (`src/git/hidden.rs`;
+the snapshot still lists them) and `tab.set_hidden(settings, path, hide)`
+changes that for a ref or a folder.
 `tab.is_running("Label prefix")` tells whether an operation is in flight, and
 `tab.take_outcome(label, since)` how one you started ended (its failure is
 already shown to the user as a toast).

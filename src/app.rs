@@ -686,13 +686,13 @@ impl eframe::App for App {
 
         if self.shared.prefs.is_some() {
             if let Some(tab) = self.tabs.get_mut(self.active) {
-                tab.start(&ctx);
+                tab.start(&ctx, &self.shared.settings);
             }
             ui::prefs::show(ui, &mut self.shared, self.tabs.get_mut(self.active));
         } else if self.active < self.tabs.len() {
             let App { tabs, active, shared, .. } = self;
             let tab = &mut tabs[*active];
-            tab.start(&ctx);
+            tab.start(&ctx, &shared.settings);
 
             bar("toolbar", ui::toolbar::height(&shared.settings), theme::bg_toolbar()).show(ui, |ui| {
                 ui::toolbar::show(ui, tab, shared);

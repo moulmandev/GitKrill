@@ -962,6 +962,12 @@ fn tag_menu(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSnap
             ops::delete_tag(name),
         ));
     }
+    ui.separator();
+    let path = crate::git::hidden::tag(name);
+    let is_hidden = tab.hidden.hides(&path);
+    if sidebar::hide_item(ui, is_hidden, "in graph") {
+        tab.set_hidden(&mut shared.settings, &path, !is_hidden);
+    }
 }
 
 fn row_menu(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<RepoSnapshot>, index: usize) {

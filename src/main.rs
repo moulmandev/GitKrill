@@ -112,7 +112,7 @@ fn dump(path: PathBuf, limit: usize) {
             return;
         }
     };
-    let snap = match loader.snapshot(limit) {
+    let snap = match loader.snapshot(limit, &Default::default()) {
         Ok(snap) => snap,
         Err(e) => {
             eprintln!("{e}");

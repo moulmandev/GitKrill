@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use eframe::egui::{self, Align2, Rect, Response, ScrollArea, Sense, TextEdit, Ui, pos2, vec2};
 
+use crate::git::hidden::{self, HEADS, REMOTES, TAGS};
 use crate::git::{BranchInfo, RemoteBranch, RepoSnapshot, ops};
 use crate::state::{Dialog, RepoTab, Shared};
 use crate::theme::{self, icons};
@@ -43,30 +44,42 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
             .filter(|(_, b)| matches(&b.name))
             .map(|(i, b)| (b.name.clone(), i))
             .collect();
-        if section(ui, tab, "LOCAL", icons::LAPTOP, locals.len(), snap.branches.len()) {
-            tree(ui, tab, "local", &locals, 0, !filter.is_empty(), &mut |ui, tab, index, name, depth| {
+        let (open, header) = section_header(ui, tab, "LOCAL", icons::LAPTOP, locals.len(), snap.branches.len());
+        show_all_menu(&header, tab, shared, HEADS, "Show all local branches in graph");
+        if open {
+            let change = tree(ui, tab, "local", HEADS, &locals, 0, !filter.is_empty(), &mut |ui, tab, index, name, depth| {
                 let branch = &snap.branches[index];
                 let response = local_row(ui, tab, shared, &snap, branch, name, depth);
                 drag::source(&response, || Some(Branch::local(&branch.name)), theme::accent());
                 landing(ui, tab, &snap, session, &response, || Target::Branch(Branch::local(&branch.name)));
             });
+            if let Some((path, hide)) = change {
+                tab.set_hidden(&mut shared.settings, &path, hide);
+            }
         }
 
         // ---- remotes ----
         let remote_total = snap.remote_branches.len();
         let remote_shown = snap.remote_branches.iter().filter(|b| matches(&b.full)).count();
-        if section(ui, tab, "REMOTE", icons::CLOUD, remote_shown, remote_total) {
+        let (open, header) = section_header(ui, tab, "REMOTE", icons::CLOUD, remote_shown, remote_total);
+        show_all_menu(&header, tab, shared, REMOTES, "Show all remote branches in graph");
+        if open {
             for remote in &snap.remotes {
                 let key = format!("remote:{}", remote.name);
                 let collapsed = tab.collapsed.contains(&key);
-                let response = row(ui, 0, false, |painter, rect, x| {
+                let path = hidden::folder(REMOTES, &remote.name);
+                let is_hidden = tab.hidden.hides(&path);
+                let color = if is_hidden { theme::text_faint() } else { theme::text() };
+                let (response, eye) = eye_row(ui, 0, false, Some(is_hidden), |painter, rect, x| {
                     let caret = if collapsed { icons::CARET_RIGHT } else { icons::CARET_DOWN };
                     painter.text(pos2(x, rect.center().y), Align2::LEFT_CENTER, caret, theme::font(11.0), theme::text_dim());
                     painter.text(pos2(x + 16.0, rect.center().y), Align2::LEFT_CENTER, icons::GLOBE, theme::font(14.0), theme::text_dim());
-                    let galley = elided(painter, &remote.name, theme::bold(13.0), theme::text(), rect.right() - x - 44.0);
-                    painter.galley(pos2(x + 36.0, rect.center().y - galley.size().y / 2.0), galley, theme::text());
+                    let galley = elided(painter, &remote.name, theme::bold(13.0), color, rect.right() - x - 44.0);
+                    painter.galley(pos2(x + 36.0, rect.center().y - galley.size().y / 2.0), galley, color);
                 });
-                if response.clicked() {
+                if eye {
+                    tab.set_hidden(&mut shared.settings, &path, !is_hidden);
+                } else if response.clicked() {
                     toggle(tab, &key);
                 }
                 // Dropping a local branch on a remote pushes it there.
@@ -83,6 +96,10 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                         ui.ctx().copy_text(remote.url.clone());
                     }
                     crate::ui::hosting::remote_menu(ui, shared, remote);
+                    ui.separator();
+                    if hide_item(ui, is_hidden, &format!("{} in graph", remote.name)) {
+                        tab.set_hidden(&mut shared.settings, &path, !is_hidden);
+                    }
                 });
                 if collapsed && filter.is_empty() {
                     continue;
@@ -95,12 +112,15 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                     .filter(|(_, b)| b.remote == remote.name && matches(&b.full))
                     .map(|(i, b)| (b.name.clone(), i))
                     .collect();
-                tree(ui, tab, &key, &items, 1, !filter.is_empty(), &mut |ui, tab, index, name, depth| {
+                let change = tree(ui, tab, &key, &path, &items, 1, !filter.is_empty(), &mut |ui, tab, index, name, depth| {
                     let branch = &snap.remote_branches[index];
                     let response = remote_row(ui, tab, shared, &snap, branch, name, depth);
                     drag::source(&response, || Some(Branch::remote(branch)), theme::accent());
                     landing(ui, tab, &snap, session, &response, || Target::Branch(Branch::remote(branch)));
                 });
+                if let Some((path, hide)) = change {
+                    tab.set_hidden(&mut shared.settings, &path, hide);
+                }
             }
         }
 
@@ -118,10 +138,25 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
 
         // ---- tags ----
         let tags: Vec<_> = snap.tags.iter().filter(|t| matches(&t.name)).collect();
-        if section(ui, tab, "TAGS", icons::TAG, tags.len(), snap.tags.len()) {
+        let (open, header) = section_header(ui, tab, "TAGS", icons::TAG, tags.len(), snap.tags.len());
+        header.context_menu(|ui| {
+            ui.set_min_width(200.0);
+            let all_hidden = tab.hidden.hides(TAGS);
+            if hide_item(ui, all_hidden, "all tags in graph") {
+                tab.set_hidden(&mut shared.settings, TAGS, !all_hidden);
+            }
+        });
+        if open {
             for tag in tags {
-                let response = leaf(ui, 0, false, icons::TAG, &tag.name, theme::text(), "");
-                if response.clicked() {
+                let path = hidden::tag(&tag.name);
+                let is_hidden = tab.hidden.hides(&path);
+                let color = if is_hidden { theme::text_faint() } else { theme::text() };
+                let (response, eye) = eye_row(ui, 0, false, Some(is_hidden), |painter, rect, x| {
+                    paint_leaf(painter, rect, x, false, icons::TAG, &tag.name, color, "");
+                });
+                if eye {
+                    tab.set_hidden(&mut shared.settings, &path, !is_hidden);
+                } else if response.clicked() {
                     tab.jump_to(tag.oid);
                 }
                 response.context_menu(|ui| {
@@ -143,6 +178,9 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                         ));
                     }
                     ui.separator();
+                    if hide_item(ui, is_hidden, "in graph") {
+                        tab.set_hidden(&mut shared.settings, &path, !is_hidden);
+                    }
                     if menu_item(ui, icons::COPY, "Copy tag name") {
                         ui.ctx().copy_text(tag.name.clone());
                     }
@@ -240,13 +278,95 @@ pub fn row(
     highlighted: bool,
     paint: impl FnOnce(&egui::Painter, Rect, f32),
 ) -> Response {
+    eye_row(ui, depth, highlighted, None, paint).0
+}
+
+/// [`row`] for something that can be hidden from the graph, `hidden` saying
+/// whether it is (`None`: it cannot). An eye button at the right end shows
+/// while the pointer is on the row, and stays, crossed out, once hidden.
+/// `paint` gets the rect left of it. The bool is true when the eye was
+/// clicked; the row's own click is not reported then.
+fn eye_row(
+    ui: &mut Ui,
+    depth: usize,
+    highlighted: bool,
+    hidden: Option<bool>,
+    paint: impl FnOnce(&egui::Painter, Rect, f32),
+) -> (Response, bool) {
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::click());
+    // Not while a branch is being dragged over the row.
+    let pointer_on_row = ui.rect_contains_pointer(rect) && ui.ctx().dragged_id().is_none();
+    let eye = hidden.filter(|hidden| *hidden || pointer_on_row).map(|hidden| {
+        let eye_rect = Rect::from_center_size(pos2(rect.right() - 17.0, rect.center().y), vec2(24.0, ROW_H - 4.0));
+        let tip = if hidden { "Show in the graph" } else { "Hide from the graph" };
+        (eye_rect, hidden, ui.interact(eye_rect, response.id.with("eye"), Sense::click()).on_hover_text(tip))
+    });
+
     if ui.is_rect_visible(rect) {
         let painter = ui.painter();
-        crate::ui::widgets::row_background(painter, rect, highlighted, response.hovered());
-        paint(painter, rect, rect.left() + 12.0 + depth as f32 * INDENT);
+        // The eye covers part of the row; the row still looks hovered.
+        let hovered = response.hovered() || eye.as_ref().is_some_and(|(_, _, r)| r.hovered());
+        crate::ui::widgets::row_background(painter, rect, highlighted, hovered);
+        let mut content = rect;
+        if let Some((eye_rect, hidden, eye_response)) = &eye {
+            content.max.x = eye_rect.left();
+            if eye_response.hovered() {
+                painter.rect_filled(eye_rect.shrink(1.0), 4.0, theme::bg_pressed());
+            }
+            let (icon, color) = match (hidden, eye_response.hovered()) {
+                (_, true) => (if *hidden { icons::EYE } else { icons::EYE_SLASH }, theme::text_bright()),
+                (true, false) => (icons::EYE_SLASH, theme::text_faint()),
+                (false, false) => (icons::EYE, theme::text_dim()),
+            };
+            painter.text(eye_rect.center(), Align2::CENTER_CENTER, icon, theme::font(14.0), color);
+        }
+        paint(painter, content, rect.left() + 12.0 + depth as f32 * INDENT);
     }
-    response
+    let clicked = eye.is_some_and(|(_, _, r)| r.clicked());
+    (response, clicked)
+}
+
+/// A menu entry that hides `what` from the graph, or shows it again.
+pub fn hide_item(ui: &mut Ui, hidden: bool, what: &str) -> bool {
+    if hidden {
+        menu_item(ui, icons::EYE, &format!("Show {what}"))
+    } else {
+        menu_item(ui, icons::EYE_SLASH, &format!("Hide {what}"))
+    }
+}
+
+/// A section header's menu: show everything under `prefix` again, offered
+/// while something there is hidden.
+fn show_all_menu(header: &Response, tab: &mut RepoTab, shared: &mut Shared, prefix: &str, label: &str) {
+    if !tab.hidden.hides_any(prefix) {
+        return;
+    }
+    header.context_menu(|ui| {
+        ui.set_min_width(220.0);
+        if menu_item(ui, icons::EYE, label) {
+            tab.set_hidden(&mut shared.settings, prefix, false);
+        }
+    });
+}
+
+/// "Hide in graph" for a branch, and for the folder it is in, if any.
+/// `prefix` and `name` make its full ref name; `itself` is false for the
+/// checked out branch, which the graph always shows.
+fn hide_items(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, prefix: &str, name: &str, itself: bool) {
+    if itself {
+        let path = format!("{prefix}{name}");
+        let is_hidden = tab.hidden.hides(&path);
+        if hide_item(ui, is_hidden, "in graph") {
+            tab.set_hidden(&mut shared.settings, &path, !is_hidden);
+        }
+    }
+    if let Some((folder, _)) = name.rsplit_once('/') {
+        let path = hidden::folder(prefix, folder);
+        let is_hidden = tab.hidden.hides(&path);
+        if hide_item(ui, is_hidden, &format!("folder {folder} in graph")) {
+            tab.set_hidden(&mut shared.settings, &path, !is_hidden);
+        }
+    }
 }
 
 /// A plain icon + name row with optional right-aligned text.
@@ -259,31 +379,57 @@ pub fn leaf(
     color: egui::Color32,
     trailing: &str,
 ) -> Response {
-    row(ui, depth, highlighted, |painter, rect, x| {
-        let y = rect.center().y;
-        let icon_color = if highlighted { theme::text_bright() } else { theme::text_dim() };
-        painter.text(pos2(x, y), Align2::LEFT_CENTER, icon, theme::font(14.0), icon_color);
-        let mut right = rect.right() - 10.0;
-        if !trailing.is_empty() {
-            let used = painter.text(pos2(right, y), Align2::RIGHT_CENTER, trailing, theme::font(11.0), theme::text_dim());
-            right = used.left() - 6.0;
-        }
-        let font = if highlighted { theme::bold(13.0) } else { theme::font(13.0) };
-        let galley = elided(painter, name, font, color, right - (x + 20.0));
-        painter.galley(pos2(x + 20.0, (y - galley.size().y / 2.0).round()), galley, color);
-    })
+    row(ui, depth, highlighted, |painter, rect, x| paint_leaf(painter, rect, x, highlighted, icon, name, color, trailing))
+}
+
+/// What [`leaf`] draws, for rows made some other way.
+#[allow(clippy::too_many_arguments)]
+fn paint_leaf(
+    painter: &egui::Painter,
+    rect: Rect,
+    x: f32,
+    highlighted: bool,
+    icon: &str,
+    name: &str,
+    color: egui::Color32,
+    trailing: &str,
+) {
+    let y = rect.center().y;
+    // Rows hidden from the graph are faint, icon included.
+    let icon_color = if highlighted {
+        theme::text_bright()
+    } else if color == theme::text_faint() {
+        color
+    } else {
+        theme::text_dim()
+    };
+    painter.text(pos2(x, y), Align2::LEFT_CENTER, icon, theme::font(14.0), icon_color);
+    let mut right = rect.right() - 10.0;
+    if !trailing.is_empty() {
+        let used = painter.text(pos2(right, y), Align2::RIGHT_CENTER, trailing, theme::font(11.0), theme::text_dim());
+        right = used.left() - 6.0;
+    }
+    let font = if highlighted { theme::bold(13.0) } else { theme::font(13.0) };
+    let galley = elided(painter, name, font, color, right - (x + 20.0));
+    painter.galley(pos2(x + 20.0, (y - galley.size().y / 2.0).round()), galley, color);
 }
 
 /// Renders `items` (slash-separated path, payload index) as a folder tree.
+/// `ref_prefix` followed by an item's path is its full ref name; folders can
+/// be hidden from the graph, and the change asked for (folder, hide) is
+/// returned for the caller to make.
+#[allow(clippy::too_many_arguments)]
 fn tree(
     ui: &mut Ui,
     tab: &mut RepoTab,
     key_prefix: &str,
+    ref_prefix: &str,
     items: &[(String, usize)],
     base_depth: usize,
     force_open: bool,
     leaf_ui: &mut dyn FnMut(&mut Ui, &mut RepoTab, usize, &str, usize),
-) {
+) -> Option<(String, bool)> {
+    let mut change = None;
     let mut sorted: Vec<&(String, usize)> = items.iter().collect();
     sorted.sort_by_key(|a| a.0.to_lowercase());
 
@@ -308,16 +454,31 @@ fn tree(
             }
             let key = format!("{key_prefix}/{}", stack.join("/"));
             let collapsed = !force_open && tab.collapsed.contains(&key);
-            let response = row(ui, base_depth + depth, false, |painter, rect, x| {
+            let folder = hidden::folder(ref_prefix, &stack.join("/"));
+            let is_hidden = tab.hidden.hides(&folder);
+            let color = if is_hidden { theme::text_faint() } else { theme::text_dim() };
+            let (response, eye) = eye_row(ui, base_depth + depth, false, Some(is_hidden), |painter, rect, x| {
                 let y = rect.center().y;
                 let icon = if collapsed { icons::FOLDER } else { icons::FOLDER_OPEN };
-                painter.text(pos2(x, y), Align2::LEFT_CENTER, icon, theme::font(14.0), theme::text_dim());
-                let galley = elided(painter, part, theme::font(13.0), theme::text_dim(), rect.right() - x - 30.0);
-                painter.galley(pos2(x + 20.0, (y - galley.size().y / 2.0).round()), galley, theme::text_dim());
+                painter.text(pos2(x, y), Align2::LEFT_CENTER, icon, theme::font(14.0), color);
+                let galley = elided(painter, part, theme::font(13.0), color, rect.right() - x - 30.0);
+                painter.galley(pos2(x + 20.0, (y - galley.size().y / 2.0).round()), galley, color);
             });
-            if response.clicked() {
+            if eye {
+                change = Some((folder.clone(), !is_hidden));
+            } else if response.clicked() {
                 toggle(tab, &key);
             }
+            response.context_menu(|ui| {
+                ui.set_min_width(200.0);
+                if hide_item(ui, is_hidden, "in graph") {
+                    change = Some((folder.clone(), !is_hidden));
+                }
+                let (icon, label) = if collapsed { (icons::FOLDER_OPEN, "Expand") } else { (icons::FOLDER, "Collapse") };
+                if !force_open && menu_item(ui, icon, label) {
+                    toggle(tab, &key);
+                }
+            });
             if collapsed {
                 hidden_from = Some(depth);
             }
@@ -327,6 +488,7 @@ fn tree(
             leaf_ui(ui, tab, *index, name, base_depth + parts.len());
         }
     }
+    change
 }
 
 fn local_row(
@@ -348,18 +510,28 @@ fn local_row(
         }
         trailing.push_str(&format!("{}{}", branch.behind, icons::ARROW_DOWN));
     }
+    // The graph always shows the checked out branch, so it has no eye.
+    let is_hidden = !branch.is_head && tab.hidden.hides_local(&branch.name);
     let (icon, color) = if branch.is_head {
         (icons::CHECK, theme::text_bright())
+    } else if is_hidden {
+        (icons::GIT_BRANCH, theme::text_faint())
     } else {
         (icons::GIT_BRANCH, theme::text())
     };
 
+    let eye = (!branch.is_head).then_some(is_hidden);
+    let (response, eye) = eye_row(ui, depth, branch.is_head, eye, |painter, rect, x| {
+        paint_leaf(painter, rect, x, branch.is_head, icon, name, color, &trailing);
+    });
     // Branch rows can also be dragged; a click is still a click.
-    let response = leaf(ui, depth, branch.is_head, icon, name, color, &trailing).interact(Sense::drag());
+    let response = response.interact(Sense::drag());
     if response.hovered() && let Some(oid) = branch.oid {
         tab.ref_hover.hover(ui.ctx(), oid);
     }
-    if response.double_clicked() && !branch.is_head {
+    if eye {
+        tab.set_hidden(&mut shared.settings, &hidden::local(&branch.name), !is_hidden);
+    } else if response.double_clicked() && !branch.is_head {
         tab.run(ops::checkout(&branch.name));
     } else if response.clicked()
         && let Some(oid) = branch.oid {
@@ -434,6 +606,7 @@ pub fn local_branch_menu(
     }
     crate::ui::gitflow::branch_menu(ui, tab, shared, snap, branch);
     ui.separator();
+    hide_items(ui, tab, shared, HEADS, &branch.name, !branch.is_head);
     if menu_item(ui, icons::COPY, "Copy branch name") {
         ui.ctx().copy_text(branch.name.clone());
     }
@@ -448,11 +621,18 @@ fn remote_row(
     name: &str,
     depth: usize,
 ) -> Response {
-    let response = leaf(ui, depth, false, icons::GIT_BRANCH, name, theme::text(), "").interact(Sense::drag());
+    let is_hidden = tab.hidden.hides_remote(&branch.full);
+    let color = if is_hidden { theme::text_faint() } else { theme::text() };
+    let (response, eye) = eye_row(ui, depth, false, Some(is_hidden), |painter, rect, x| {
+        paint_leaf(painter, rect, x, false, icons::GIT_BRANCH, name, color, "");
+    });
+    let response = response.interact(Sense::drag());
     if response.hovered() {
         tab.ref_hover.hover(ui.ctx(), branch.oid);
     }
-    if response.double_clicked() {
+    if eye {
+        tab.set_hidden(&mut shared.settings, &hidden::remote(&branch.full), !is_hidden);
+    } else if response.double_clicked() {
         tab.run(checkout_remote(snap, branch));
     } else if response.clicked() {
         tab.jump_to(branch.oid);
@@ -511,6 +691,7 @@ pub fn remote_branch_menu(
         ));
     }
     ui.separator();
+    hide_items(ui, tab, shared, &hidden::folder(REMOTES, &branch.remote), &branch.name, true);
     if menu_item(ui, icons::COPY, "Copy branch name") {
         ui.ctx().copy_text(branch.full.clone());
     }
