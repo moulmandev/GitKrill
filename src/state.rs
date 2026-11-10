@@ -87,6 +87,10 @@ pub enum Dialog {
     ConnectServer { host: String, path: String, choice: Option<crate::hosting::ServerKind> },
     /// "Create pull request"; see `ui::new_pull`.
     NewPull(Box<crate::ui::new_pull::NewPullForm>),
+    /// Gitflow: start a feature, release or hotfix; see `ui::gitflow`.
+    GitflowStart(crate::ui::gitflow::StartForm),
+    /// Gitflow: finish one; see `ui::gitflow`.
+    GitflowFinish(Box<crate::ui::gitflow::FinishForm>),
 }
 
 impl Dialog {
@@ -754,11 +758,12 @@ impl RepoTab {
                 if rejected {
                     shared.show(Dialog::PushRejected);
                 } else if conflicts {
+                    let note = cmd.conflict_note.as_deref().map(|note| format!(" {note}")).unwrap_or_default();
                     shared.toast(
                         ToastKind::Error,
                         format!("{} stopped on conflicts", cmd.label),
                         format!(
-                            "Resolve the conflicted files in the list on the right, then press Continue.\n{}",
+                            "Resolve the conflicted files in the list on the right, then press Continue.{note}\n{}",
                             conflict_lines(&message)
                         ),
                     );

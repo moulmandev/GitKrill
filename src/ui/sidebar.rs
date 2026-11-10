@@ -429,6 +429,7 @@ pub fn local_branch_menu(
             ops::delete_branch(&branch.name, true),
         ));
     }
+    crate::ui::gitflow::branch_menu(ui, tab, shared, snap, branch);
     ui.separator();
     if menu_item(ui, icons::COPY, "Copy branch name") {
         ui.ctx().copy_text(branch.name.clone());

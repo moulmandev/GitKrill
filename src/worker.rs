@@ -205,7 +205,7 @@ fn operator(
     req_tx: Sender<Request>,
     ctx: &egui::Context,
 ) {
-    while let Ok((cmd, origin)) = op_rx.recv() {
+    while let Ok((mut cmd, origin)) = op_rx.recv() {
         let wants_undo = matches!(origin, Origin::User) && !matches!(cmd.undo, UndoKind::None);
 
         let (before, deleted_at) = if wants_undo {
@@ -215,6 +215,7 @@ fn operator(
                         UndoKind::BranchDelete(name) => branch_oid(&repo, name),
                         _ => None,
                     };
+                    note_refs(&repo, &mut cmd.undo, false);
                     (Some(read_head(&repo)), deleted_at)
                 }
                 Err(_) => (None, None),
@@ -263,9 +264,10 @@ fn operator(
         }
 
         let undo = match (&result, before) {
-            (Ok(()), Some(before)) => git2::Repository::open(workdir)
-                .ok()
-                .and_then(|repo| build_undo(&cmd, &before, &read_head(&repo), deleted_at)),
+            (Ok(()), Some(before)) => git2::Repository::open(workdir).ok().and_then(|repo| {
+                note_refs(&repo, &mut cmd.undo, true);
+                build_undo(&cmd, &before, &read_head(&repo), deleted_at)
+            }),
             _ => None,
         };
 
@@ -275,6 +277,17 @@ fn operator(
         }
         let _ = req_tx.send(Request::Refresh);
         ctx.request_repaint();
+    }
+}
+
+/// Records where the refs of an [`UndoKind::Refs`] command point, before
+/// (`after` false) or after it ran.
+fn note_refs(repo: &git2::Repository, undo: &mut UndoKind, after: bool) {
+    if let UndoKind::Refs(moves) = undo {
+        for m in moves {
+            let oid = repo.refname_to_id(&m.name).ok();
+            if after { m.after = oid } else { m.before = oid }
+        }
     }
 }
 

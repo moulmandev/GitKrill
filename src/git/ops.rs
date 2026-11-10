@@ -42,6 +42,27 @@ pub enum UndoKind {
     Checkout,
     BranchCreate { name: String, checkout: bool },
     BranchDelete(String),
+    /// Several branches and tags change at once (a Gitflow finish merges
+    /// into two branches, tags and deletes one): the operation thread notes
+    /// where each of these refs pointed before and after, and undo puts
+    /// every one of them back, HEAD included.
+    Refs(Vec<RefMove>),
+}
+
+/// One ref of [`UndoKind::Refs`].
+#[derive(Clone, Debug)]
+pub struct RefMove {
+    /// Full name (`refs/heads/develop`, `refs/tags/1.2`).
+    pub name: String,
+    /// Filled in by the operation thread; `None` when the ref does not exist.
+    pub before: Option<Oid>,
+    pub after: Option<Oid>,
+}
+
+impl RefMove {
+    pub fn new(name: impl Into<String>) -> Self {
+        RefMove { name: name.into(), before: None, after: None }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +81,9 @@ pub struct GitCmd {
     /// Started by the app rather than the user (auto-fetch): never raises a
     /// toast or a credential prompt, whatever the outcome.
     pub background: bool,
+    /// Said after "resolve, then Continue" when the command stops on merge
+    /// conflicts: what is left to do once the merge is committed.
+    pub conflict_note: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +107,7 @@ impl GitCmd {
             expect_head: None,
             success: None,
             background: false,
+            conflict_note: None,
         }
     }
 
@@ -96,12 +121,20 @@ impl GitCmd {
             expect_head: None,
             success: None,
             background: false,
+            conflict_note: None,
         }
     }
 
     /// Sets the success toast title.
     pub fn done(mut self, message: impl Into<String>) -> Self {
         self.success = Some(message.into());
+        self
+    }
+
+    /// What is left to do if the command stops on merge conflicts; see
+    /// [`GitCmd::conflict_note`].
+    pub fn after_conflict(mut self, note: impl Into<String>) -> Self {
+        self.conflict_note = Some(note.into());
         self
     }
 
@@ -588,5 +621,59 @@ pub fn build_undo(
                 plain(format!("Redo {label}"), &["branch", "-D", name]),
             )
         }
+
+        UndoKind::Refs(moves) => {
+            if before == after && moves.iter().all(|m| m.before == m.after) {
+                return None;
+            }
+            let back: Vec<(&str, Option<Oid>, Option<Oid>)> =
+                moves.iter().map(|m| (m.name.as_str(), m.after, m.before)).collect();
+            let forth: Vec<(&str, Option<Oid>, Option<Oid>)> =
+                moves.iter().map(|m| (m.name.as_str(), m.before, m.after)).collect();
+            entry(
+                restore_refs(format!("Undo {label}"), &back, after, before)?,
+                restore_refs(format!("Redo {label}"), &forth, before, after)?,
+            )
+        }
     }
+}
+
+/// Moves every ref in `refs` (name, where it points now, where it should
+/// point; `None` is "does not exist") and HEAD from `now` to `goal`. The
+/// branch HEAD ends up on moves with the working tree (`reset --keep`,
+/// which refuses to clobber local changes); every other ref is moved with
+/// `update-ref`, which checks it still points where it did.
+fn restore_refs(label: String, refs: &[(&str, Option<Oid>, Option<Oid>)], now: &Head, goal: &Head) -> Option<GitCmd> {
+    let absent = Oid::ZERO_SHA1.to_string();
+    let goal_ref = goal.branch.as_ref().map(|b| format!("refs/heads/{b}"));
+    let goal_move = refs.iter().find(|(name, _, _)| Some(*name) == goal_ref.as_deref());
+    let mut cmd = GitCmd::empty(label);
+
+    // The branch to end up on must exist before it can be checked out.
+    if let (Some(goal_ref), Some((_, None, Some(want)))) = (&goal_ref, goal_move) {
+        cmd = cmd.step(&["update-ref", goal_ref, &want.to_string(), &absent]);
+    }
+    if now.branch != goal.branch || now.detached != goal.detached {
+        cmd = match &goal.branch {
+            Some(branch) => cmd.step(&["checkout", branch]),
+            None => cmd.step(&["checkout", "--detach", &goal.oid?.to_string()]),
+        };
+    }
+    if let Some((_, Some(current), Some(want))) = goal_move
+        && current != want
+    {
+        cmd = cmd.step(&["reset", "--keep", &want.to_string()]);
+    }
+    for (name, current, want) in refs {
+        if Some(*name) == goal_ref.as_deref() || current == want {
+            continue;
+        }
+        cmd = match (current, want) {
+            (Some(current), None) => cmd.step(&["update-ref", "-d", name, &current.to_string()]),
+            (None, Some(want)) => cmd.step(&["update-ref", name, &want.to_string(), &absent]),
+            (Some(current), Some(want)) => cmd.step(&["update-ref", name, &want.to_string(), &current.to_string()]),
+            (None, None) => cmd,
+        };
+    }
+    Some(cmd)
 }
