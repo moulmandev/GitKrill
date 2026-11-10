@@ -10,6 +10,8 @@
 //!     press:x,y  release:x,y  left button down / up, for drags:
 //!                             press:60,200;move:80,220;move:300,400;release:300,400
 //!     type:some text         key:Enter  key:ctrl+F
+//!     hold:shift  hold:none  keep modifiers down for the steps in between:
+//!                             hold:shift;click:300,400;hold:none
 //!     scroll:-40             wheel lines at the pointer (negative = down)
 //!     wait:30                pause, in 16 ms units (so 30 is about half a second)
 //!     sleep:800              pause, in milliseconds
@@ -44,6 +46,7 @@ enum Step {
     Button(Pos2, bool),
     Type(String),
     Key(Modifiers, Key),
+    Hold(Modifiers),
     Sleep(Duration),
     /// Wheel notches at the current pointer position; negative scrolls down.
     Scroll(f32),
@@ -106,6 +109,11 @@ fn parse_script(script: &str) -> VecDeque<(bool, Step)> {
                 "press" => Step::Button(parse_pos(arg)?, true),
                 "release" => Step::Button(parse_pos(arg)?, false),
                 "type" => Step::Type(arg.to_owned()),
+                "hold" => Step::Hold(match arg.trim() {
+                    "none" | "" => Modifiers::NONE,
+                    // A key name is needed to parse; only its modifiers count.
+                    held => parse_key(&format!("{held}+A"))?.0,
+                }),
                 "key" => {
                     let (modifiers, key) = parse_key(arg)?;
                     Step::Key(modifiers, key)
@@ -181,6 +189,7 @@ impl Shot {
                 }]);
             }
             Step::Type(text) => self.pending.push_back(vec![Event::Text(text)]),
+            Step::Hold(modifiers) => self.pending.push_back(vec![Event::ModifiersChanged(modifiers)]),
             Step::Key(modifiers, key) => {
                 let event = |pressed| Event::Key {
                     key,

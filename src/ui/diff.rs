@@ -1,5 +1,7 @@
 //! The diff view that replaces the graph while a file is open.
 
+use std::borrow::Cow;
+use std::cell::OnceCell;
 use std::collections::BTreeSet;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, Weak};
@@ -14,6 +16,7 @@ use crate::git::{ChangeKind, DiffSource, DiffTarget, FileChange, FileDiff, ops, 
 use crate::state::{Dialog, RepoTab, Shared, ToastKind};
 use crate::theme::{self, icons};
 use crate::ui::highlight;
+use crate::ui::textsel::{self, Lines, Pos};
 use crate::ui::widgets::{self, icon_button, kind_icon, tint_button};
 
 const LINE_H: f32 = 19.0;
@@ -188,12 +191,7 @@ impl LineSelection {
         if std::ptr::eq(self.diff.as_ptr(), Arc::as_ptr(diff)) && self.source == Some(target.source) {
             return;
         }
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (target.source, &target.path).hash(&mut hasher);
-        for hunk in &diff.hunks {
-            hunk.raw.hash(&mut hasher);
-        }
-        let fingerprint = hasher.finish();
+        let fingerprint = fingerprint(target, diff);
         if fingerprint != self.fingerprint {
             self.clear();
         }
@@ -238,6 +236,86 @@ impl LineSelection {
                 self.anchor = Some(at);
             }
         }
+    }
+}
+
+/// What a diff shows, to tell a reload that changed nothing from another diff.
+fn fingerprint(target: &DiffTarget, diff: &FileDiff) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (target.source, &target.path).hash(&mut hasher);
+    for hunk in &diff.hunks {
+        hunk.raw.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// The lines of a diff one after the other, hunk after hunk, for selecting
+/// and copying text. Hunk headers are not part of it.
+struct DiffText<'a> {
+    diff: &'a FileDiff,
+    /// Where each hunk's first line is among all of them.
+    starts: Vec<usize>,
+    total: usize,
+    /// Each hunk's lines as in the file, read back from the patch when first
+    /// asked for, which is when copying.
+    sources: OnceCell<Vec<Option<Vec<Cow<'a, str>>>>>,
+}
+
+impl<'a> DiffText<'a> {
+    fn new(diff: &'a FileDiff) -> Self {
+        let mut starts = Vec::with_capacity(diff.hunks.len());
+        let mut total = 0;
+        for hunk in &diff.hunks {
+            starts.push(total);
+            total += hunk.lines.len();
+        }
+        DiffText { diff, starts, total, sources: OnceCell::new() }
+    }
+
+    /// Hunk, and line in that hunk, of a line of the text.
+    fn locate(&self, line: usize) -> (usize, usize) {
+        // The last hunk starting at or before the line: an empty hunk shares
+        // its start with the next one.
+        let hunk = self.starts.partition_point(|start| *start <= line).saturating_sub(1);
+        (hunk, line - self.starts[hunk])
+    }
+
+    /// The text position nearest to height `y` of the diff (from the top of
+    /// its content) and, when that is not "wherever x points", its column:
+    /// a point on a hunk header is at the start of the hunk's first line,
+    /// one below the last line at the end of it (`usize::MAX`).
+    fn line_at(&self, tops: &[f32], y: f32) -> (usize, Option<usize>) {
+        let Some(last) = self.total.checked_sub(1) else { return (0, Some(0)) };
+        let Some(hunk) = tops.partition_point(|top| *top <= y).checked_sub(1) else {
+            return (0, Some(0));
+        };
+        let offset = y - tops[hunk] - HUNK_H;
+        if offset < 0.0 {
+            return (self.starts[hunk].min(last), Some(0));
+        }
+        let index = (offset / LINE_H) as usize;
+        let len = self.diff.hunks[hunk].lines.len();
+        if index >= len {
+            return ((self.starts[hunk] + len).saturating_sub(1).min(last), Some(usize::MAX));
+        }
+        (self.starts[hunk] + index, None)
+    }
+}
+
+impl Lines for DiffText<'_> {
+    fn count(&self) -> usize {
+        self.total
+    }
+
+    fn shown(&self, line: usize) -> &str {
+        let (hunk, index) = self.locate(line);
+        &self.diff.hunks[hunk].lines[index].text
+    }
+
+    fn source(&self, line: usize) -> Option<&str> {
+        let (hunk, index) = self.locate(line);
+        let sources = self.sources.get_or_init(|| self.diff.hunks.iter().map(|hunk| hunk.sources()).collect());
+        sources.get(hunk)?.as_ref()?.get(index).map(|text| text.as_ref())
     }
 }
 
@@ -288,15 +366,56 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
         selection.follow(target, diff, ui.ctx().cumulative_frame_nr());
     }
 
+    // Selected text, kept per place a diff is shown in (this view, the file
+    // history).
+    let text = DiffText::new(diff);
+    let text_id = ui.id().with("diff-text-selection");
+    let text_selection =
+        ui.data_mut(|data| data.get_temp_mut_or_default::<Arc<Mutex<textsel::Selection>>>(text_id).clone());
+    let mut text_selection = text_selection.lock().unwrap_or_else(|e| e.into_inner());
+    text_selection.follow(diff, ui.ctx().cumulative_frame_nr(), || fingerprint(target, diff));
+    let view = ui.available_rect_before_wrap();
+
     ScrollArea::both().id_salt("diff-body").auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
         let size = vec2(text_w.max(ui.available_width()), height.max(ui.available_height()));
         let sense = if stageable { Sense::click() } else { Sense::hover() };
         let (content, response) = ui.allocate_exact_size(size, sense);
         let painter = ui.painter().clone();
 
-        // The changed line under a point, if any. Hunk headers, context
-        // lines and the space below the diff give `None`.
+        // Gutter and hunk controls stay put while the text scrolls sideways.
+        let left = content.left() + viewport.min.x;
+        let right = content.left() + viewport.max.x;
+        // Where every line's text starts, scrolled sideways.
+        let text_left = content.left() + gutter;
+
+        // The code, right of the gutter, is for selecting text; the gutter
+        // for picking lines to stage.
+        let text_rect = Rect::from_min_max(
+            pos2(left + gutter, content.top() + viewport.min.y),
+            pos2(right, content.top() + viewport.max.y),
+        );
+        let hit = |pos: Pos2| {
+            let (line, col) = text.line_at(&tops, pos.y - content.top());
+            let shown = text.shown(line);
+            let col = match col {
+                Some(usize::MAX) => shown.chars().count(),
+                Some(col) => col,
+                None => {
+                    let galley = painter.layout_no_wrap(shown.to_owned(), font.clone(), theme::text());
+                    textsel::column_at(&galley, pos.x - text_left)
+                }
+            };
+            Pos::new(line, col)
+        };
+        let text_response = text_selection.interact(ui, ui.id().with("text"), text_rect, view, &text, hit);
+        text_response.context_menu(|ui| text_selection.menu(ui, &text));
+
+        // The changed line under a point in the gutter, if any. Hunk
+        // headers, context lines and the space below the diff give `None`.
         let line_at = |pos: Pos2| -> Option<LineRef> {
+            if pos.x >= left + gutter {
+                return None;
+            }
             let y = pos.y - content.top();
             let h = tops.partition_point(|top| *top <= y).checked_sub(1)?;
             let offset = y - tops[h] - HUNK_H;
@@ -319,9 +438,6 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
             }
         }
 
-        // Gutter and hunk controls stay put while the text scrolls sideways.
-        let left = content.left() + viewport.min.x;
-        let right = content.left() + viewport.max.x;
         let text_clip = Rect::from_min_max(pos2(left + gutter, painter.clip_rect().top()), painter.clip_rect().max);
         let text_painter = painter.with_clip_rect(text_clip.intersect(painter.clip_rect()));
         let numbers_right = left + NUM_W * 2.0 - 1.0;
@@ -395,7 +511,7 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
 
                 let spans = styled.as_ref().map_or(&[][..], |s| s.spans(i));
                 let galley = text_painter.layout_job(highlight::layout(&line.text, spans, &font));
-                let origin = pos2(content.left() + gutter, cy - galley.size().y / 2.0);
+                let origin = pos2(text_left, cy - galley.size().y / 2.0);
                 // The part of the line that differs from its counterpart,
                 // behind the text. Positions come from the laid-out glyphs,
                 // as wide characters do not keep to the monospace grid.
@@ -414,6 +530,7 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
                         text_painter.rect_filled(mark, 2.0, highlight::emphasis_color(line.origin));
                     }
                 }
+                text_selection.paint(&text_painter, text.starts[h] + i, &galley, origin.x, row, char_w);
                 text_painter.galley(origin, galley, theme::text());
             }
         }
@@ -660,6 +777,54 @@ mod tests {
         // The view was closed for a few frames and the same file reopened.
         selection.follow(&unstaged, &shown, 12);
         assert!(selection.lines.is_empty() && selection.anchor.is_none());
+    }
+
+    #[test]
+    fn the_text_runs_through_the_hunks_and_copies_what_is_in_the_file() {
+        // A hunk made the way the loader makes them: the patch bytes, and the
+        // lines prepared for display.
+        let hunk = |header: &str, lines: &[(char, &str)]| {
+            let mut raw = format!("{header}\n").into_bytes();
+            for (origin, text) in lines {
+                raw.push(*origin as u8);
+                raw.extend_from_slice(text.as_bytes());
+                raw.push(b'\n');
+            }
+            let lines = lines
+                .iter()
+                .map(|(origin, text)| DiffLine {
+                    origin: *origin,
+                    old_no: None,
+                    new_no: None,
+                    text: crate::git::text::display_text(text.as_bytes()),
+                })
+                .collect();
+            Hunk { header: header.to_owned(), raw, lines }
+        };
+        let diff = FileDiff {
+            hunks: vec![
+                hunk("@@ -1,2 +1,2 @@", &[(' ', "fn main() {"), ('-', "\told();"), ('+', "\tnew();\r")]),
+                hunk("@@ -9 +9 @@", &[(' ', "}")]),
+            ],
+            ..Default::default()
+        };
+        let text = DiffText::new(&diff);
+        assert_eq!(text.count(), 4);
+        assert_eq!(text.shown(2), "    new();");
+        assert_eq!(text.locate(3), (1, 0));
+
+        // Where points fall: hunk headers lead to the first line after them.
+        let tops = [0.0, HUNK_H + 3.0 * LINE_H];
+        assert_eq!(text.line_at(&tops, -3.0), (0, Some(0)));
+        assert_eq!(text.line_at(&tops, 5.0), (0, Some(0)));
+        assert_eq!(text.line_at(&tops, HUNK_H + LINE_H * 1.5), (1, None));
+        assert_eq!(text.line_at(&tops, tops[1] + 4.0), (3, Some(0)));
+        assert_eq!(text.line_at(&tops, tops[1] + HUNK_H + LINE_H * 5.0), (3, Some(usize::MAX)));
+
+        // Copied: no headers, no markers, tabs as tabs, LF line endings.
+        let mut selection = textsel::Selection::default();
+        selection.select_all(&text);
+        assert_eq!(selection.text(&text).as_deref(), Some("fn main() {\n\told();\n\tnew();\n}"));
     }
 
     #[test]

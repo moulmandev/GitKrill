@@ -52,6 +52,8 @@ pub struct Palette {
     pub diff_add_bg: Color32,
     pub diff_del_bg: Color32,
     pub diff_hunk_bg: Color32,
+    /// Behind selected text in the code views (diff, blame).
+    pub text_selection: Color32,
 
     /// Branch line colours. Neighbours in this list are deliberately far
     /// apart in hue, because consecutive entries end up side by side in the
@@ -92,6 +94,7 @@ pub const DARK: Palette = Palette {
     diff_add_bg: rgb(0x1d3324),
     diff_del_bg: rgb(0x3a1f22),
     diff_hunk_bg: rgb(0x242a36),
+    text_selection: rgb(0x1d5c7d),
 
     lanes: [
         rgb(0x18a8c9), // cyan
@@ -161,6 +164,7 @@ accessors! {
     diff_add_bg,
     diff_del_bg,
     diff_hunk_bg,
+    text_selection,
 }
 
 pub fn lanes() -> [Color32; crate::git::graph::COLORS as usize] {

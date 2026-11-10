@@ -28,7 +28,7 @@
 //! look past it, which is what "Blame before this commit" follows.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Child, Stdio};
@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 use git2::{Commit, Delta, DiffFindOptions, Repository, Tree};
 
 use super::repo::lossy;
+use super::text::{shown, source_text};
 use super::{ChangeKind, Oid, cli, short};
 
 fn err(e: git2::Error) -> String {
@@ -266,8 +267,6 @@ fn renamed_from(repo: &Repository, old: &Tree<'_>, new: &Tree<'_>, path: &str) -
 
 /// Files larger than this are not blamed.
 const MAX_BLAME_BYTES: u64 = 32 * 1024 * 1024;
-/// Longer lines are cut for display, as in diffs.
-const MAX_LINE_CHARS: usize = 2_000;
 /// How much of a file is inspected to decide whether it is text (git's rule).
 const BINARY_SNIFF_BYTES: usize = 8_000;
 
@@ -312,6 +311,9 @@ pub struct Blame {
     pub blocks: Vec<BlameBlock>,
     /// The file's lines, prepared for display (tabs expanded, no line ends).
     pub lines: Vec<String>,
+    /// The file's own text of the lines that `lines` shows differently
+    /// (tabs, control characters, cut lines), by index: what copying gives.
+    pub originals: BTreeMap<usize, String>,
     /// Longest line in characters, for sizing the horizontal scroll area.
     pub max_chars: usize,
     /// The commit whose version was blamed; `None` for the working tree.
@@ -593,7 +595,11 @@ fn parse_porcelain(out: &[u8]) -> Result<Blame, String> {
             Some(block) if block.commit == commit => block.len += 1,
             _ => blame.blocks.push(BlameBlock { start: line, len: 1, commit }),
         }
-        let text = display_text(content);
+        let source = source_text(content);
+        let text = shown(&source);
+        if text != source {
+            blame.originals.insert(line, source.into_owned());
+        }
         blame.max_chars = blame.max_chars.max(text.chars().count());
         blame.lines.push(text);
     }
@@ -638,37 +644,6 @@ fn unquote(raw: &[u8]) -> String {
         }
     }
     lossy(&out)
-}
-
-/// A line of the file as it is shown: no line ending, tabs expanded, control
-/// characters made visible, very long lines cut.
-fn display_text(content: &[u8]) -> String {
-    let text = String::from_utf8_lossy(content);
-    let text = text.trim_end_matches(['\n', '\r']);
-    let mut out = String::with_capacity(text.len());
-    let mut col = 0usize;
-    for ch in text.chars() {
-        if col >= MAX_LINE_CHARS {
-            out.push('…');
-            break;
-        }
-        match ch {
-            '\t' => {
-                let pad = 4 - (col % 4);
-                out.extend(std::iter::repeat_n(' ', pad));
-                col += pad;
-            }
-            c if c.is_control() => {
-                out.push('·');
-                col += 1;
-            }
-            c => {
-                out.push(c);
-                col += 1;
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1055,6 +1030,9 @@ mod tests {
         );
         let blame = parse_porcelain(out.as_bytes()).unwrap();
         assert_eq!(blame.lines, ["fn main() {", "    indented", "", "last"]);
+        // The tab is kept for copying; lines shown as they are need nothing.
+        let originals: Vec<(usize, &str)> = blame.originals.iter().map(|(line, text)| (*line, text.as_str())).collect();
+        assert_eq!(originals, [(1, "\tindented")]);
         assert_eq!(blame.max_chars, 12);
         let blocks: Vec<(usize, usize, usize)> =
             blame.blocks.iter().map(|b| (b.start, b.len, b.commit)).collect();
