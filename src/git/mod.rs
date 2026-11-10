@@ -13,6 +13,7 @@ pub mod graph;
 pub mod ops;
 pub mod rebase;
 pub mod repo;
+pub mod text;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

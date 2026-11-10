@@ -15,14 +15,15 @@
 //! of its own: it can take many seconds on a long history, nothing else
 //! should wait behind it, and it has to be stoppable when the view closes.
 
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align, Align2, Color32, CursorIcon, Key, Layout, Painter, Rect, ScrollArea, Sense, Shape,
+    self, Align, Align2, Color32, CursorIcon, Key, Layout, Painter, Pos2, Rect, ScrollArea, Sense, Shape,
     Stroke, Ui, UiBuilder, pos2, vec2,
 };
 
@@ -30,6 +31,7 @@ use crate::git::blame::{Blame, BlameCommit, BlameError, Cancel, FileCommit, Hist
 use crate::git::{ChangeKind, DiffSource, DiffTarget, FileChange, FileDiff, Oid, RepoSnapshot, short};
 use crate::state::{RepoTab, Selection, Shared, ToastKind, format_time, relative_time};
 use crate::theme::{self, icons};
+use crate::ui::textsel::{self, Lines, Pos};
 use crate::ui::widgets::{self, elided, galley_left, menu_item, tint_button};
 
 /// Commits asked for at a time; more are fetched as the list is scrolled.
@@ -1101,7 +1103,7 @@ fn blame_strip(ui: &mut Ui, blame: &Blame, selected: Option<usize>, action: &mut
             + 24.0;
         let hint = elided(
             &painter,
-            "Click a block to select its commit. Hover for the full summary.",
+            "Click a commit to select its lines. Hover it for the full summary.",
             theme::font(12.0),
             theme::text_dim(),
             x - left,
@@ -1178,7 +1180,52 @@ fn blame_strip(ui: &mut Ui, blame: &Blame, selected: Option<usize>, action: &mut
     galley_left(&painter, rect, x, line);
 }
 
-fn blame_body(ui: &mut Ui, blame: &Blame, heat: &[f32], selected: Option<usize>, action: &mut Option<Action>) {
+/// The blamed file as numbered lines, for selecting and copying text.
+struct BlameText<'a>(&'a Blame);
+
+impl Lines for BlameText<'_> {
+    fn count(&self) -> usize {
+        self.0.lines.len()
+    }
+
+    fn shown(&self, line: usize) -> &str {
+        &self.0.lines[line]
+    }
+
+    fn source(&self, line: usize) -> Option<&str> {
+        self.0.originals.get(&line).map(String::as_str)
+    }
+}
+
+/// Text selected in the blame, kept from frame to frame.
+#[derive(Default)]
+struct BlameSelection {
+    text: textsel::Selection,
+    /// The line the text's context menu was opened on.
+    menu_line: Option<usize>,
+}
+
+/// What can be done with the commit of a block, as context menu entries.
+fn commit_menu(ui: &mut Ui, commit: &BlameCommit, action: &mut Option<Action>) {
+    if !commit.is_uncommitted() && menu_item(ui, icons::GIT_COMMIT, "Show in graph") {
+        *action = Some(Action::ShowInGraph(commit.oid));
+    }
+    if let Some((parent, path)) = &commit.previous {
+        let label = if commit.is_uncommitted() {
+            "Blame without uncommitted changes"
+        } else {
+            "Blame before this commit"
+        };
+        if menu_item(ui, icons::ARROW_BEND_UP_LEFT, label) {
+            *action = Some(Action::BlameAt(*parent, path.clone()));
+        }
+    }
+    if !commit.is_uncommitted() && menu_item(ui, icons::COPY, "Copy SHA") {
+        ui.ctx().copy_text(commit.oid.to_string());
+    }
+}
+
+fn blame_body(ui: &mut Ui, blame: &Arc<Blame>, heat: &[f32], selected: Option<usize>, action: &mut Option<Action>) {
     let font = theme::mono(12.5);
     let small = theme::mono(11.5);
     let (char_w, digit_w) = ui.painter().fonts_mut(|f| (f.glyph_width(&font, 'm'), f.glyph_width(&small, '0')));
@@ -1191,6 +1238,20 @@ fn blame_body(ui: &mut Ui, blame: &Blame, heat: &[f32], selected: Option<usize>,
     let gutter = annot_w + number_w;
     let text_w = gutter + 10.0 + blame.max_chars as f32 * char_w + 40.0;
     let height = lines as f32 * LINE_H;
+
+    // Selected text. It is dropped when another blame is shown, but not when
+    // the same file is blamed again with the same result.
+    let text = BlameText(blame);
+    let state_id = ui.id().with("blame-text-selection");
+    let state = ui.data_mut(|data| data.get_temp_mut_or_default::<Arc<Mutex<BlameSelection>>>(state_id).clone());
+    let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+    let state = &mut *state;
+    state.text.follow(blame, ui.ctx().cumulative_frame_nr(), || {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (blame.rev, &blame.lines).hash(&mut hasher);
+        hasher.finish()
+    });
+    let view = ui.available_rect_before_wrap();
 
     ScrollArea::both().id_salt("blame-body").auto_shrink([false, false]).show_viewport(ui, |ui, viewport| {
         // Exactly the size of the file, not stretched to fill the view: a
@@ -1206,6 +1267,8 @@ fn blame_body(ui: &mut Ui, blame: &Blame, heat: &[f32], selected: Option<usize>,
         let left = content.left() + viewport.min.x;
         let right = content.left() + viewport.max.x;
         let (view_top, view_bottom) = (content.top() + viewport.min.y, content.top() + viewport.max.y);
+        // Where every line's text starts, scrolled sideways.
+        let text_left = content.left() + gutter + 10.0;
         let text_painter =
             painter.with_clip_rect(Rect::from_min_max(pos2(left + gutter, clip.top()), clip.max).intersect(clip));
         painter.rect_filled(
@@ -1213,6 +1276,37 @@ fn blame_body(ui: &mut Ui, blame: &Blame, heat: &[f32], selected: Option<usize>,
             0.0,
             theme::bg_panel(),
         );
+
+        // The code is for selecting text; the commit column for the commit.
+        let text_rect = Rect::from_min_max(pos2(left + gutter, view_top), pos2(right, view_bottom));
+        let hit = |pos: Pos2| {
+            let y = pos.y - content.top();
+            if y < 0.0 {
+                return Pos::new(0, 0);
+            }
+            let line = (y / LINE_H) as usize;
+            if line >= lines {
+                return Pos::new(lines - 1, blame.lines[lines - 1].chars().count());
+            }
+            let galley = painter.layout_no_wrap(blame.lines[line].clone(), font.clone(), theme::text());
+            Pos::new(line, textsel::column_at(&galley, pos.x - text_left))
+        };
+        let text_response = state.text.interact(ui, ui.id().with("text"), text_rect, view, &text, hit);
+        if text_response.secondary_clicked() {
+            state.menu_line = text_response.interact_pointer_pos().map(|pos| hit(pos).line);
+        }
+        text_response.context_menu(|ui| {
+            ui.set_min_width(210.0);
+            state.text.menu(ui, &text);
+            // And what the line's commit offers, as on the commit column.
+            let block = state.menu_line.and_then(|line| blame.block_of(line));
+            if let Some(commit) = block.map(|block| &blame.commits[blame.blocks[block].commit])
+                && (!commit.is_uncommitted() || commit.previous.is_some())
+            {
+                ui.separator();
+                commit_menu(ui, commit, action);
+            }
+        });
 
         let first = (viewport.min.y / LINE_H).floor().max(0.0) as usize;
         let last = ((viewport.max.y / LINE_H).ceil().max(0.0) as usize).min(lines);
@@ -1229,7 +1323,8 @@ fn blame_body(ui: &mut Ui, blame: &Blame, heat: &[f32], selected: Option<usize>,
             let seen = Rect::from_min_max(pos2(left, top.max(view_top)), pos2(right, bottom.min(view_bottom)));
             let annot = Rect::from_min_max(seen.min, pos2(left + annot_w, seen.bottom()));
 
-            let response = ui.interact(seen, ui.id().with(("blame-block", index)), Sense::click());
+            let margin = Rect::from_min_max(seen.min, pos2(left + gutter, seen.bottom()));
+            let response = ui.interact(margin, ui.id().with(("blame-block", index)), Sense::click());
             let is_selected = selected == Some(block.commit);
             let strength = if commit.is_uncommitted() { 0.16 } else { 0.05 + 0.13 * warmth };
             let mut fill = theme::mix(theme::bg_panel(), color, strength);
@@ -1277,22 +1372,7 @@ fn blame_body(ui: &mut Ui, blame: &Blame, heat: &[f32], selected: Option<usize>,
             }
             response.context_menu(|ui| {
                 ui.set_min_width(210.0);
-                if !commit.is_uncommitted() && menu_item(ui, icons::GIT_COMMIT, "Show in graph") {
-                    *action = Some(Action::ShowInGraph(commit.oid));
-                }
-                if let Some((parent, path)) = &commit.previous {
-                    let label = if commit.is_uncommitted() {
-                        "Blame without uncommitted changes"
-                    } else {
-                        "Blame before this commit"
-                    };
-                    if menu_item(ui, icons::ARROW_BEND_UP_LEFT, label) {
-                        *action = Some(Action::BlameAt(*parent, path.clone()));
-                    }
-                }
-                if !commit.is_uncommitted() && menu_item(ui, icons::COPY, "Copy SHA") {
-                    ui.ctx().copy_text(commit.oid.to_string());
-                }
+                commit_menu(ui, commit, action);
             });
             response.on_hover_ui_at_pointer(|ui| {
                 ui.set_max_width(460.0);
@@ -1319,9 +1399,10 @@ fn blame_body(ui: &mut Ui, blame: &Blame, heat: &[f32], selected: Option<usize>,
             index += 1;
         }
 
-        // Then the file itself.
+        // Then the file itself, over the highlight of selected text.
         for (i, line) in blame.lines.iter().enumerate().take(last).skip(first) {
-            let y = content.top() + (i as f32 + 0.5) * LINE_H;
+            let top = content.top() + i as f32 * LINE_H;
+            let y = top + 0.5 * LINE_H;
             painter.text(
                 pos2(left + gutter - 10.0, y),
                 Align2::RIGHT_CENTER,
@@ -1329,13 +1410,11 @@ fn blame_body(ui: &mut Ui, blame: &Blame, heat: &[f32], selected: Option<usize>,
                 small.clone(),
                 theme::text_faint(),
             );
-            text_painter.text(
-                pos2(content.left() + gutter + 10.0, y),
-                Align2::LEFT_CENTER,
-                line,
-                font.clone(),
-                theme::text(),
-            );
+            let galley = text_painter.layout_no_wrap(line.clone(), font.clone(), theme::text());
+            let origin = pos2(text_left, y - galley.size().y / 2.0);
+            let row = Rect::from_min_max(pos2(left + gutter, top), pos2(right, top + LINE_H));
+            state.text.paint(&text_painter, i, &galley, origin.x, row, char_w);
+            text_painter.galley(origin, galley, theme::text());
         }
 
         painter.vline(left + annot_w, clip.y_range(), Stroke::new(1.0, theme::border()));

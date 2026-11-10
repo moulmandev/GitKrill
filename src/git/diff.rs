@@ -4,12 +4,11 @@
 use git2::{DiffFindOptions, DiffFormat, DiffOptions};
 
 use super::repo::{Loader, delta_kind, lossy};
+use super::text::{display_text, source_text};
 use super::{DiffLine, DiffSource, DiffTarget, FileDiff, Hunk};
 
 /// Beyond this many lines the rest of the diff is not shown.
 const MAX_LINES: usize = 50_000;
-/// Longer lines are cut for display (minified bundles and the like).
-const MAX_LINE_CHARS: usize = 2_000;
 
 impl Loader {
     pub fn diff(&self, target: &DiffTarget) -> Result<FileDiff, String> {
@@ -208,6 +207,16 @@ fn split_hunk(raw: &[u8]) -> Option<(&[u8], Vec<RawLine<'_>>)> {
         }
     }
     Some((header, lines))
+}
+
+impl Hunk {
+    /// Each line's text as it is in the file (see `text::source_text`), in
+    /// the order of `lines`: what copying gives back. `None` if the patch
+    /// cannot be read back into lines.
+    pub fn sources(&self) -> Option<Vec<std::borrow::Cow<'_, str>>> {
+        let (_, lines) = split_hunk(&self.raw)?;
+        Some(lines.iter().map(|line| source_text(line.body)).collect())
+    }
 }
 
 /// `(old start, new start)` from a `@@ -a,b +c,d @@` line.
@@ -412,36 +421,6 @@ impl FileDiff {
         patch.extend_from_slice(&body);
         Some(patch)
     }
-}
-
-fn display_text(content: &[u8]) -> String {
-    let text = String::from_utf8_lossy(content);
-    let text = text.trim_end_matches(['\n', '\r']);
-    let mut out = String::with_capacity(text.len());
-    let mut col = 0usize;
-    for ch in text.chars() {
-        if col >= MAX_LINE_CHARS {
-            out.push('…');
-            break;
-        }
-        match ch {
-            '\t' => {
-                let pad = 4 - (col % 4);
-                out.extend(std::iter::repeat_n(' ', pad));
-                col += pad;
-            }
-            // Control characters have no glyph and confuse text layout.
-            c if c.is_control() => {
-                out.push('·');
-                col += 1;
-            }
-            c => {
-                out.push(c);
-                col += 1;
-            }
-        }
-    }
-    out
 }
 
 #[cfg(test)]

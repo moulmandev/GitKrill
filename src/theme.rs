@@ -349,6 +349,7 @@ accessors! {
     shadow,
     well,
     picture_bg,
+    text_selection,
 }
 
 pub fn lanes() -> [Color32; crate::git::graph::COLORS as usize] {

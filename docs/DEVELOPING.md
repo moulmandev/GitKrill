@@ -57,6 +57,10 @@ already shown to the user as a toast).
 - Custom-painted rows use `ui.interact(rect, id, Sense::click())` for input and
   a `Painter` for drawing; `widgets.rs` has the shared pieces (`row_background`,
   `elided`, `tint_button`, `icon_button`, `spinner`, `menu_item`, ...).
+- Custom-painted text gets editor-style selection and copying from
+  `ui/textsel.rs` (diff and blame use it): describe the text as `Lines`, call
+  `Selection::interact` with a function from screen point to text position,
+  and `Selection::paint` behind each row's text.
 - Comments say what the code does or why, for a reader who was not there when
   it was written.
 - Strings from git may not be UTF-8: use the `*_bytes()` accessors with

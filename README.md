@@ -66,6 +66,10 @@ Wayland; nothing else has to be installed.
 - Unstaged / staged lists as paths or a folder tree
 - Stage, unstage and discard files, folders, hunks or individual lines
 - Syntax-highlighted diffs with word-level emphasis of what changed
+- Select and copy text in diffs and blame as in an editor: drag, double-click
+  a word, triple-click a line, Shift+click to extend. Copies leave out line
+  numbers and +/- markers and keep tabs as tabs; picking lines to stage is
+  done in the line-number gutter
 - Commit, amend, and "stage all and commit" in one click (`Ctrl+Enter`)
 - Changes made outside the app (editor, terminal) appear on their own
 
@@ -123,6 +127,7 @@ Three features talk to the network on their own. Each has a switch in the
 | `Ctrl+Tab` | Next tab |
 | `Ctrl+F` | Search commits |
 | `Ctrl+Enter` | Commit (from the message fields); start an interactive rebase |
+| `Ctrl+A` / `Ctrl+C` | Select all / copy the text of a diff or blame |
 | `Up` / `Down` | Previous / next commit |
 | `F5` | Refresh |
 | `Esc` | Close the command palette, the current view, then the diff, then the search bar |
@@ -188,8 +193,8 @@ tools/           demo repository and screenshot scripts
   and other hosts
 - Interactive rebase refuses ranges that contain merge commits
 - File history and blame always start from HEAD
-- No ancestor pane or syntax colours in the conflict resolver; no text
-  selection in diffs and blame
+- No ancestor pane or syntax colours in the conflict resolver, and text in
+  its two side panes cannot be selected (the result can, in its editor)
 - Syntax grammars are syntect's bundled set: TypeScript is coloured as
   JavaScript, and Kotlin, Swift, Dart and PowerShell stay plain
 - SSH keys with a passphrase need an agent; there is no passphrase prompt

@@ -12,6 +12,7 @@ pub mod palette;
 pub mod panel;
 pub mod rebase;
 pub mod sidebar;
+pub mod textsel;
 pub mod toolbar;
 pub mod widgets;
 
