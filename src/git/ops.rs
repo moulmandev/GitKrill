@@ -141,6 +141,18 @@ impl GitCmd {
         self.undo = undo;
         self
     }
+
+    /// Makes the `git commit` step leave out lines starting with git's
+    /// comment character (`--cleanup=strip`), as when a message is written
+    /// in git's editor. Without it git keeps a message given on stdin as is.
+    pub fn strip_comments(mut self) -> Self {
+        for step in &mut self.steps {
+            if step.args.first().is_some_and(|arg| arg == "commit") {
+                step.args.insert(1, "--cleanup=strip".to_owned());
+            }
+        }
+        self
+    }
 }
 
 fn label_for(verb: &str, paths: &[String]) -> String {
