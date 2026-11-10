@@ -77,6 +77,8 @@ pub enum Dialog {
     PushRejected,
     Clone { url: String, dest: String },
     About,
+    /// What runs on a self-hosted server (`crate::ui::hosting::connect_body`).
+    ConnectServer { host: String, path: String, choice: Option<crate::hosting::ServerKind> },
 }
 
 impl Dialog {
@@ -122,8 +124,13 @@ pub struct Settings {
     /// only and no network requests for avatars.
     pub fetch_avatars: bool,
     /// Show pull requests, issues and CI runs from the hosting service
-    /// (GitHub) in the sidebar. Off means no request is ever made.
+    /// (GitHub, GitLab) in the sidebar. Off means no request is ever made.
     pub hosting_integration: bool,
+    /// Self-hosted servers and what the user said runs on each (GitHub
+    /// Enterprise, GitLab, or neither). Other than github.com and
+    /// gitlab.com, only servers listed here are ever contacted.
+    #[serde(default)]
+    pub hosting_servers: crate::hosting::Servers,
 }
 
 impl Default for Settings {
@@ -142,6 +149,7 @@ impl Default for Settings {
             graph_width: None,
             fetch_avatars: true,
             hosting_integration: true,
+            hosting_servers: Default::default(),
         }
     }
 }

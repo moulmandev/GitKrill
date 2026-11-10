@@ -283,7 +283,7 @@ impl App {
                     shared.settings.auto_fetch_minutes = if auto_fetch { 5 } else { 0 };
                 }
                 ui.checkbox(&mut shared.settings.fetch_avatars, "Author pictures from Gravatar and GitHub");
-                ui.checkbox(&mut shared.settings.hosting_integration, "Show GitHub pull requests, issues and Actions");
+                ui.checkbox(&mut shared.settings.hosting_integration, "Pull requests, issues and CI from GitHub and GitLab");
                 if let Some(tab) = tabs.get_mut(*active) {
                     if ui.add(egui::Button::new("Search Commits").shortcut_text("Ctrl+F")).clicked() {
                         tab.search_open = true;

@@ -1,23 +1,33 @@
-//! Hosting-service integration: pull requests, issues and CI runs for the
-//! repository a remote points at.
+//! Hosting-service integration: pull requests (merge requests on GitLab),
+//! issues and CI runs for the repository a remote points at.
 //!
 //! * The model ([`PullRequest`], [`Issue`], [`Run`], [`Feed`], [`Problem`]),
-//!   the rate-limit bookkeeping ([`Limiter`]) and the per-tab
-//!   [`HostingState`] know nothing about a particular service.
-//! * [`github`] holds everything GitHub-specific: recognising remote URLs,
-//!   finding a token, the REST endpoints and their JSON. Another service is a
-//!   sibling module implementing [`Backend`], plus a [`Service`] variant.
+//!   the rate-limit bookkeeping ([`Limiter`]), finding a token
+//!   ([`find_token`]), the network ([`Wire`]) and the per-tab
+//!   [`HostingState`] are shared by every service.
+//! * [`github`] (github.com and GitHub Enterprise) and [`gitlab`]
+//!   (gitlab.com and self-managed GitLab) hold the REST endpoints and their
+//!   JSON, each behind the [`Backend`] trait.
+//!
+//! Which service a remote is on comes from its host. github.com and
+//! gitlab.com are known; any other host is contacted only once the user has
+//! said what runs there ([`Servers`], kept in the settings). Until then the
+//! sidebar merely offers to connect it ([`offers`]).
 //!
 //! All network and process work happens on one background thread per tab
 //! (`worker`); the UI thread only sends it orders and drains its events.
-//! Nothing in this module logs or writes to disk, and a token is only ever
-//! attached to a request by `github::Wire`.
+//! Nothing in this module logs or writes to disk. A token is only ever
+//! attached to a request by [`Wire`], and only to one below the API address
+//! of the host the token was looked up for.
 //!
 //! Development aid: with `GITKRILL_HOSTING_FIXTURE=<dir>` set, answers come
-//! from `<dir>/pulls.json`, `issues.json` and `runs.json` instead of the
-//! network (see `Canned`) and no token is looked for, so screenshots of
-//! every state can be taken offline.
+//! from files in `<dir>` named after the endpoint (`pulls.json`,
+//! `issues.json` and `runs.json` for GitHub; `merge_requests.json`,
+//! `issues.json` and `pipelines.json` for GitLab) instead of the network
+//! (see `Canned`) and no token is looked for, so screenshots of every state
+//! can be taken offline.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -29,6 +39,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 
 use crate::git::RemoteInfo;
 use crate::git::ops::{GitCmd, UndoKind};
@@ -36,94 +47,357 @@ use crate::git::ops::{GitCmd, UndoKind};
 // ---- what is hosted where -------------------------------------------------
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(clippy::enum_variant_names, reason = "they are the services' own names")]
 pub enum Service {
+    /// github.com.
     GitHub,
+    /// GitHub Enterprise Server, or Enterprise Cloud on `*.ghe.com`, on a
+    /// host the user named.
+    GitHubEnterprise,
+    /// gitlab.com, or a self-managed GitLab on a host the user named.
+    GitLab,
 }
 
 impl Service {
     pub fn name(self) -> &'static str {
         match self {
             Service::GitHub => "GitHub",
+            Service::GitHubEnterprise => "GitHub Enterprise",
+            Service::GitLab => "GitLab",
         }
+    }
+
+    /// GitLab has its own words: merge requests, `!12`, pipelines, projects.
+    pub fn is_gitlab(self) -> bool {
+        matches!(self, Service::GitLab)
+    }
+
+    /// "pull request", or "merge request" on GitLab.
+    pub fn pull_word(self) -> &'static str {
+        if self.is_gitlab() { "merge request" } else { "pull request" }
+    }
+
+    /// Sidebar title of the pull / merge request section.
+    pub fn pulls_title(self) -> &'static str {
+        if self.is_gitlab() { "MERGE REQUESTS" } else { "PULL REQUESTS" }
     }
 
     /// Sidebar title of the CI section.
     pub fn ci_title(self) -> &'static str {
-        match self {
-            Service::GitHub => "GITHUB ACTIONS",
-        }
+        if self.is_gitlab() { "PIPELINES" } else { "GITHUB ACTIONS" }
     }
 
-    fn web(self) -> &'static str {
-        match self {
-            Service::GitHub => "https://github.com",
-        }
+    /// A pull request's number as the service writes it: `#12`, or `!12`
+    /// for a GitLab merge request.
+    pub fn pull_number(self, number: u64) -> String {
+        if self.is_gitlab() { format!("!{number}") } else { format!("#{number}") }
+    }
+
+    /// "repository", or "project" on GitLab.
+    pub fn repo_word(self) -> &'static str {
+        if self.is_gitlab() { "project" } else { "repository" }
     }
 
     /// The ref on the remote that follows a pull request's head commit.
     fn pull_ref(self, number: u64) -> String {
         match self {
-            Service::GitHub => format!("pull/{number}/head"),
+            Service::GitHub | Service::GitHubEnterprise => format!("pull/{number}/head"),
+            Service::GitLab => format!("merge-requests/{number}/head"),
         }
     }
 }
 
+/// What the user said a self-hosted server is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "String", into = "&'static str")]
+pub enum ServerKind {
+    GitHubEnterprise,
+    GitLab,
+    /// Neither: never contacted, and not offered again. An entry this
+    /// version does not understand reads as this too.
+    Ignored,
+}
+
+impl ServerKind {
+    pub fn service(self) -> Option<Service> {
+        match self {
+            ServerKind::GitHubEnterprise => Some(Service::GitHubEnterprise),
+            ServerKind::GitLab => Some(Service::GitLab),
+            ServerKind::Ignored => None,
+        }
+    }
+}
+
+impl From<String> for ServerKind {
+    fn from(text: String) -> Self {
+        match text.as_str() {
+            "github-enterprise" => ServerKind::GitHubEnterprise,
+            "gitlab" => ServerKind::GitLab,
+            _ => ServerKind::Ignored,
+        }
+    }
+}
+
+impl From<ServerKind> for &'static str {
+    fn from(kind: ServerKind) -> Self {
+        match kind {
+            ServerKind::GitHubEnterprise => "github-enterprise",
+            ServerKind::GitLab => "gitlab",
+            ServerKind::Ignored => "ignored",
+        }
+    }
+}
+
+/// Self-hosted servers by host (written as [`RepoId::host`] is) and what
+/// the user said each one is. Kept in the settings; a host that is not in
+/// here, and is not github.com or gitlab.com, is never sent anything.
+pub type Servers = BTreeMap<String, ServerKind>;
+
 /// A repository on a hosting service, as named by a remote URL.
 ///
-/// `owner` and `name` only ever contain letters, digits, `.`, `_` and `-`
-/// (the parsers reject everything else), so the links built here are safe to
-/// hand to the operating system as they are.
+/// `host` only ever contains lower-case letters, digits, `.` and `-`, and a
+/// `:port`; `owner` and `name` only letters, digits, `.`, `_` and `-`, with
+/// `/` between the groups of a GitLab path. The parsers reject everything
+/// else, so the links built here are safe to hand to the operating system
+/// as they are, and `host` is safe in a credential-helper query.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoId {
     pub service: Service,
+    /// `github.com`, `gitlab.com`, or the self-hosted server's name, with
+    /// `:port` when an HTTPS remote names a port other than 443.
+    pub host: String,
+    /// The account or organisation; on GitLab the whole group path, which
+    /// may have subgroups (`group/subgroup`).
     pub owner: String,
     pub name: String,
 }
 
 impl RepoId {
-    /// `owner/name`
+    /// `owner/name`: the full path on GitLab.
     pub fn slug(&self) -> String {
         format!("{}/{}", self.owner, self.name)
     }
 
-    fn web_url(&self) -> String {
-        format!("{}/{}/{}", self.service.web(), self.owner, self.name)
+    /// On a server the user named, rather than github.com or gitlab.com.
+    pub fn self_hosted(&self) -> bool {
+        self.host != "github.com" && self.host != "gitlab.com"
+    }
+
+    /// What to call where the repository is: "GitHub", "GitLab", or the
+    /// server's name when it is self-hosted.
+    pub fn site(&self) -> String {
+        if self.self_hosted() { self.host.clone() } else { self.service.name().to_owned() }
+    }
+
+    /// Where the REST API lives. A token is only ever sent below this.
+    pub fn api_base(&self) -> String {
+        api_base(self.service, &self.host)
+    }
+
+    /// A page of the repository's web site. GitLab keeps them under `/-/`.
+    fn page(&self, path: &str) -> String {
+        let separator = if self.service.is_gitlab() { "/-/" } else { "/" };
+        format!("https://{}/{}{separator}{path}", self.host, self.slug())
     }
 
     pub fn pulls_url(&self) -> String {
-        format!("{}/pulls", self.web_url())
+        self.page(if self.service.is_gitlab() { "merge_requests" } else { "pulls" })
     }
 
     pub fn pull_url(&self, number: u64) -> String {
-        format!("{}/pull/{number}", self.web_url())
+        match self.service.is_gitlab() {
+            true => self.page(&format!("merge_requests/{number}")),
+            false => self.page(&format!("pull/{number}")),
+        }
     }
 
     pub fn issues_url(&self) -> String {
-        format!("{}/issues", self.web_url())
+        self.page("issues")
     }
 
     pub fn issue_url(&self, number: u64) -> String {
-        format!("{}/issues/{number}", self.web_url())
+        self.page(&format!("issues/{number}"))
     }
 
     pub fn runs_url(&self) -> String {
-        format!("{}/actions", self.web_url())
+        self.page(if self.service.is_gitlab() { "pipelines" } else { "actions" })
     }
 
     pub fn run_url(&self, id: u64) -> String {
-        format!("{}/actions/runs/{id}", self.web_url())
+        match self.service.is_gitlab() {
+            true => self.page(&format!("pipelines/{id}")),
+            false => self.page(&format!("actions/runs/{id}")),
+        }
     }
 }
 
-/// The hosted repository a remote URL points at, if it is on a service we know.
-pub fn parse_remote(url: &str) -> Option<RepoId> {
-    github::parse_remote(url)
+/// Where `service`'s REST API lives for a repository on `host`.
+pub fn api_base(service: Service, host: &str) -> String {
+    match service {
+        Service::GitHub => github::API.to_owned(),
+        // Enterprise Cloud with data residency has an API host of its own.
+        Service::GitHubEnterprise if host.ends_with(".ghe.com") => format!("https://api.{host}"),
+        Service::GitHubEnterprise => format!("https://{host}/api/v3"),
+        Service::GitLab => format!("https://{host}/api/v4"),
+    }
+}
+
+/// A remote URL taken apart, when it names a repository on a network host.
+#[derive(Debug, PartialEq, Eq)]
+struct Address {
+    /// Lower-case host name, without a port.
+    name: String,
+    /// The port of an `https://` URL, unless it is 443. Other schemes'
+    /// ports (SSH's) say nothing about where the web server listens.
+    port: Option<u16>,
+    /// The path's parts with `.git` taken off the last: at least two, each
+    /// made only of letters, digits, `.`, `_` and `-`.
+    path: Vec<String>,
+}
+
+impl Address {
+    /// The host as [`RepoId::host`] and the settings write it.
+    fn host(&self) -> String {
+        match self.port {
+            Some(port) => format!("{}:{port}", self.name),
+            None => self.name.clone(),
+        }
+    }
+}
+
+/// Understands `https://host/a/b(.git)`, `git@host:a/b.git`,
+/// `ssh://git@host:22/a/b` and their variations (user names, ports,
+/// trailing slashes). Local paths, `file://` and other schemes, and paths
+/// with characters a hosted repository's cannot have are `None`.
+fn address(url: &str) -> Option<Address> {
+    let url = url.trim();
+    let (https, host, path) = match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let scheme = scheme.to_ascii_lowercase();
+            let known = ["https", "http", "ssh", "git", "git+ssh", "ssh+git"];
+            if !known.contains(&scheme.as_str()) {
+                return None;
+            }
+            let (authority, path) = rest.split_once('/')?;
+            (scheme == "https", authority.rsplit_once('@').map_or(authority, |(_, host)| host), path)
+        }
+        // scp-like: [user@]host:path. A slash before the colon means a
+        // local path, and a one-letter "host" is a drive (`C:/x`), which
+        // `valid_host` turns down.
+        None => {
+            let (left, path) = url.split_once(':')?;
+            if left.contains('/') || left.contains('\\') {
+                return None;
+            }
+            (false, left.rsplit_once('@').map_or(left, |(_, host)| host), path)
+        }
+    };
+    let (name, port) = match host.split_once(':') {
+        Some((name, "")) => (name, None),
+        Some((name, port)) => (name, Some(port.parse::<u16>().ok()?)),
+        None => (host, None),
+    };
+    let name = name.to_ascii_lowercase();
+    if !valid_host(&name) {
+        return None;
+    }
+
+    let mut path: Vec<String> = path.trim_matches('/').split('/').map(str::to_owned).collect();
+    if let Some(last) = path.last_mut()
+        && let Some(stripped) = last.strip_suffix(".git")
+    {
+        *last = stripped.to_owned();
+    }
+    let valid = |part: &String| {
+        !part.is_empty()
+            && part != "."
+            && part != ".."
+            && part.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    };
+    if !(2..=32).contains(&path.len()) || !path.iter().all(valid) {
+        return None;
+    }
+    let port = port.filter(|port| https && *port != 443);
+    Some(Address { name, port, path })
+}
+
+/// A plausible DNS name, already lower-case.
+fn valid_host(name: &str) -> bool {
+    (2..=253).contains(&name.len())
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'-'))
+        && !name.starts_with(['.', '-'])
+        && !name.ends_with(['.', '-'])
+        && !name.contains("..")
+}
+
+/// github.com and gitlab.com, under every name their remotes use.
+fn public(name: &str) -> Option<(Service, &'static str)> {
+    match name {
+        "github.com" | "www.github.com" | "ssh.github.com" => Some((Service::GitHub, "github.com")),
+        "gitlab.com" | "www.gitlab.com" | "altssh.gitlab.com" => Some((Service::GitLab, "gitlab.com")),
+        _ => None,
+    }
+}
+
+/// Well-known hosts that are neither GitHub nor GitLab, and subdomains of
+/// the public services that are not servers of their own (gists): not worth
+/// offering to connect.
+fn unsupported(name: &str) -> bool {
+    let others = [
+        "bitbucket.org",
+        "codeberg.org",
+        "git.sr.ht",
+        "dev.azure.com",
+        "ssh.dev.azure.com",
+        "gitee.com",
+        "huggingface.co",
+        "source.developers.google.com",
+    ];
+    others.contains(&name) || [".visualstudio.com", ".github.com", ".gitlab.com"].iter().any(|end| name.ends_with(end))
+}
+
+/// What a server's name suggests it runs. Never more than a pre-selection.
+fn guess(name: &str) -> Option<ServerKind> {
+    let first = name.split('.').next().unwrap_or_default();
+    if first.starts_with("gitlab") || name.contains(".gitlab.") {
+        Some(ServerKind::GitLab)
+    } else if first.starts_with("github") || first == "ghe" || name.ends_with(".ghe.com") {
+        Some(ServerKind::GitHubEnterprise)
+    } else {
+        None
+    }
+}
+
+/// The hosted repository a remote URL points at: on github.com or
+/// gitlab.com, or on a server listed in `servers` as GitHub Enterprise or
+/// GitLab. Anything else, including hosts whose name merely looks like one
+/// of those, is `None`.
+pub fn parse_remote(url: &str, servers: &Servers) -> Option<RepoId> {
+    let address = address(url)?;
+    let (service, host) = match public(&address.name) {
+        Some((service, host)) => (service, host.to_owned()),
+        None => {
+            let host = address.host();
+            (servers.get(&host)?.service()?, host)
+        }
+    };
+    let fits = match service {
+        Service::GitHub | Service::GitHubEnterprise => address.path.len() == 2,
+        // GitLab paths never start with `-`, which also keeps the `/-/` of
+        // its web addresses from passing for a group.
+        Service::GitLab => address.path.iter().all(|part| !part.starts_with('-')),
+    };
+    if !fits {
+        return None;
+    }
+    let (name, owner) = address.path.split_last()?;
+    Some(RepoId { service, host, owner: owner.join("/"), name: name.clone() })
 }
 
 /// Picks the remote to show: `origin` when it is hosted, else the first
 /// remote that is. Returns the remote's name with the repository.
-pub fn detect(remotes: &[RemoteInfo]) -> Option<(String, RepoId)> {
-    let hosted = |remote: &RemoteInfo| Some((remote.name.clone(), parse_remote(&remote.url)?));
+pub fn detect(remotes: &[RemoteInfo], servers: &Servers) -> Option<(String, RepoId)> {
+    let hosted = |remote: &RemoteInfo| Some((remote.name.clone(), parse_remote(&remote.url, servers)?));
     remotes
         .iter()
         .find(|remote| remote.name == "origin")
@@ -131,10 +405,60 @@ pub fn detect(remotes: &[RemoteInfo]) -> Option<(String, RepoId)> {
         .or_else(|| remotes.iter().find_map(hosted))
 }
 
+/// A remote on a server that may run GitHub Enterprise or GitLab.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Offer {
+    /// The server, as the settings name it.
+    pub host: String,
+    /// The repository's path there.
+    pub path: String,
+    /// The remote it was seen on.
+    pub remote: String,
+    /// What the server's name suggests: a pre-selection, nothing more.
+    pub guess: Option<ServerKind>,
+}
+
+/// The self-hosted server `remote` points at, whether or not the user has
+/// said what it is. `None` for github.com, gitlab.com, services we cannot
+/// talk to, and anything that is not a network repository.
+pub fn offer_for(remote: &RemoteInfo) -> Option<Offer> {
+    let address = address(&remote.url)?;
+    if public(&address.name).is_some() || unsupported(&address.name) {
+        return None;
+    }
+    Some(Offer {
+        host: address.host(),
+        path: address.path.join("/"),
+        remote: remote.name.clone(),
+        guess: guess(&address.name),
+    })
+}
+
+/// Servers the sidebar offers to connect: `origin`'s when the user has not
+/// said what it is; otherwise, while no remote is on a service we can show,
+/// every such server the remotes point at. Asking sends nothing anywhere.
+pub fn offers(remotes: &[RemoteInfo], servers: &Servers) -> Vec<Offer> {
+    let unknown = |remote: &RemoteInfo| offer_for(remote).filter(|offer| !servers.contains_key(&offer.host));
+    if let Some(offer) = remotes.iter().find(|remote| remote.name == "origin").and_then(unknown) {
+        return vec![offer];
+    }
+    if detect(remotes, servers).is_some() {
+        return Vec::new();
+    }
+    let mut offers: Vec<Offer> = Vec::new();
+    for offer in remotes.iter().filter_map(unknown) {
+        if !offers.iter().any(|seen| seen.host == offer.host) {
+            offers.push(offer);
+        }
+    }
+    offers
+}
+
 // ---- model ----------------------------------------------------------------
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PullRequest {
+    /// The number the service shows: a GitLab merge request's `iid`.
     pub number: u64,
     pub title: String,
     pub author: String,
@@ -143,7 +467,8 @@ pub struct PullRequest {
     pub head_ref: String,
     pub head_sha: String,
     /// `owner/name` of the repository the head branch lives in. `None` when
-    /// the fork it came from has been deleted.
+    /// the fork it came from has been deleted, and for a GitLab merge
+    /// request from a fork (its list does not name the fork).
     pub head_repo: Option<String>,
     pub base_ref: String,
     /// Seconds since the epoch; 0 when unknown.
@@ -246,10 +571,11 @@ impl Problem {
     /// The one-line summary.
     pub fn line(&self, service: Service) -> String {
         let host = service.name();
+        let repository = service.repo_word();
         match self {
             Problem::RateLimited { until } => format!("Rate limited until {}", clock(*until)),
-            Problem::NotSignedIn => "Not signed in: private repository".to_owned(),
-            Problem::SignInRejected => "Sign-in refused: private repository".to_owned(),
+            Problem::NotSignedIn => format!("Not signed in: private {repository}"),
+            Problem::SignInRejected => format!("Sign-in refused: private {repository}"),
             Problem::NoAccess => "No access with this sign-in".to_owned(),
             Problem::Refused(message) => format!("{host} refused: {message}"),
             Problem::Unreachable(message) => format!("{host} unreachable: {message}"),
@@ -275,23 +601,23 @@ impl Problem {
     /// The summary plus what to do about it, for a tooltip.
     pub fn detail(&self, service: Service) -> String {
         let host = service.name();
-        let sign_in = "Set GITHUB_TOKEN, run `gh auth login`, or sign in through Git's \
-                       credential manager (any HTTPS fetch or push does it), then refresh.";
+        let repository = service.repo_word();
+        let sign_in = sign_in_advice(service);
         let advice = match self {
             Problem::RateLimited { .. } => format!(
                 "{host} asked us to slow down. What is shown is the last good answer; \
                  refreshing resumes by itself. Signing in raises the limit."
             ),
             Problem::NotSignedIn => format!(
-                "{host} only shows public repositories without a sign-in, and it does not \
+                "{host} only shows public {repository}s without a sign-in, and it does not \
                  show this one. {sign_in}"
             ),
             Problem::SignInRejected => format!(
                 "{host} refused the saved sign-in (expired or revoked?), and does not show \
-                 this repository without one. {sign_in}"
+                 this {repository} without one. {sign_in}"
             ),
             Problem::NoAccess => format!(
-                "{host} answered \"not found\": the repository is gone, or the signed-in \
+                "{host} answered \"not found\": the {repository} is gone, or the signed-in \
                  account is not allowed to see it."
             ),
             Problem::Refused(_) | Problem::Unreachable(_) | Problem::Failed(_) => {
@@ -312,6 +638,26 @@ impl Problem {
             Problem::Unreachable(text) => Problem::Unreachable(clean(text)),
             Problem::Failed(text) => Problem::Failed(clean(text)),
             other => other,
+        }
+    }
+}
+
+/// How to sign in to `service`, in one or two sentences.
+pub fn sign_in_advice(service: Service) -> &'static str {
+    match service {
+        Service::GitHub => {
+            "Set GITHUB_TOKEN, run `gh auth login`, or sign in through Git's credential \
+             manager (any HTTPS fetch or push does it), then refresh."
+        }
+        Service::GitHubEnterprise => {
+            "Set GH_ENTERPRISE_TOKEN, run `gh auth login --hostname` with this server's \
+             name, or sign in through Git's credential manager (any HTTPS fetch or push \
+             does it), then refresh."
+        }
+        Service::GitLab => {
+            "Set GITLAB_TOKEN (and GITLAB_HOST for your own server), run `glab auth login`, \
+             or sign in through Git's credential manager (any HTTPS fetch or push does it), \
+             then refresh."
         }
     }
 }
@@ -389,16 +735,20 @@ pub enum Auth {
 }
 
 impl Auth {
-    pub fn describe(self) -> String {
+    pub fn describe(self, service: Service) -> String {
+        let repositories = format!("public {}s only", service.repo_word());
         match self {
             Auth::Unknown => String::new(),
-            Auth::Anonymous => "Not signed in: public repositories only".to_owned(),
+            Auth::Anonymous => format!("Not signed in: {repositories}"),
             Auth::SignedIn(TokenSource::Env(name)) => format!("Signed in with ${name}"),
-            Auth::SignedIn(TokenSource::Cli) => "Signed in through the GitHub CLI".to_owned(),
+            Auth::SignedIn(TokenSource::Cli) => match service {
+                Service::GitLab => "Signed in through the GitLab CLI".to_owned(),
+                _ => "Signed in through the GitHub CLI".to_owned(),
+            },
             Auth::SignedIn(TokenSource::CredentialHelper) => {
                 "Signed in through Git's credential helper".to_owned()
             }
-            Auth::Rejected => "The saved sign-in was refused: public repositories only".to_owned(),
+            Auth::Rejected => format!("The saved sign-in was refused: {repositories}"),
         }
     }
 }
@@ -488,32 +838,71 @@ impl fmt::Debug for Token {
     }
 }
 
-/// The places a token can come from. A trait so the lookup order can be
-/// tested without touching the real environment.
+/// The places a token can come from. A trait so the lookup order and which
+/// host each source is asked about can be tested without touching the real
+/// environment.
 pub trait Secrets: Send {
     fn env(&self, name: &str) -> Option<String>;
-    /// The service's own command line tool, when installed and signed in.
-    fn cli(&self) -> Option<String>;
-    /// Git's credential helper, asked in a way that can never prompt.
-    fn credential_helper(&self) -> Option<String>;
+    /// The service's own command line tool (`gh`, `glab`): the token it
+    /// keeps for exactly `host`, when installed and signed in there.
+    fn cli(&self, service: Service, host: &str) -> Option<String>;
+    /// Git's credential helper's password for `https://<host>`, asked in a
+    /// way that can never prompt.
+    fn credential_helper(&self, host: &str) -> Option<String>;
 }
 
-/// Looks for a token, cheapest and most explicit source first. Tokens in
-/// `rejected` (already refused by the service) are passed over, so a stale
-/// environment variable does not hide a working sign-in further down.
-pub fn find_token(secrets: &dyn Secrets, rejected: &[Token]) -> Option<(Token, TokenSource)> {
+/// The environment variables that may hold a token for `repo`'s host, in
+/// the order they are tried.
+///
+/// A variable is only used for the host it belongs to. `GITHUB_TOKEN` and
+/// `GH_TOKEN` are github.com's (as `gh` has it) and never go to an
+/// Enterprise server. `GH_ENTERPRISE_TOKEN` is for Enterprise servers, but
+/// not one other than the server `GH_HOST` names when that is set.
+/// `GITLAB_TOKEN` belongs to the server `GITLAB_HOST` names, gitlab.com
+/// when that is not set (as `glab` has it).
+fn env_names(secrets: &dyn Secrets, repo: &RepoId) -> &'static [&'static str] {
+    let names = |variable: &str| secrets.env(variable).map(|value| same_host(&value, &repo.host));
+    match repo.service {
+        Service::GitHub => &["GITHUB_TOKEN", "GH_TOKEN"],
+        Service::GitHubEnterprise => match names("GH_HOST") {
+            Some(false) => &[],
+            Some(true) | None => &["GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"],
+        },
+        Service::GitLab => match names("GITLAB_HOST") {
+            Some(true) => &["GITLAB_TOKEN"],
+            None if repo.host == "gitlab.com" => &["GITLAB_TOKEN"],
+            _ => &[],
+        },
+    }
+}
+
+/// Whether a `GH_HOST` / `GITLAB_HOST` value (`git.example.com`, or a URL
+/// such as `https://git.example.com/`) names `host`.
+fn same_host(value: &str, host: &str) -> bool {
+    let value = value.trim();
+    let value = value.strip_prefix("https://").or_else(|| value.strip_prefix("http://")).unwrap_or(value);
+    let value = value.trim_end_matches('/').to_ascii_lowercase();
+    !value.is_empty() && (value == host || value.strip_suffix(":443") == Some(host))
+}
+
+/// Looks for a token for `repo`'s host, cheapest and most explicit source
+/// first. Each source is asked about that host only, so a token found here
+/// is one that belongs to it. Tokens in `rejected` (already refused by the
+/// service) are passed over, so a stale environment variable does not hide
+/// a working sign-in further down.
+pub fn find_token(secrets: &dyn Secrets, repo: &RepoId, rejected: &[Token]) -> Option<(Token, TokenSource)> {
     let usable = |raw: Option<String>| {
         raw.and_then(|raw| Token::new(&raw)).filter(|token| !rejected.contains(token))
     };
-    for name in ["GITHUB_TOKEN", "GH_TOKEN"] {
+    for &name in env_names(secrets, repo) {
         if let Some(token) = usable(secrets.env(name)) {
             return Some((token, TokenSource::Env(name)));
         }
     }
-    if let Some(token) = usable(secrets.cli()) {
+    if let Some(token) = usable(secrets.cli(repo.service, &repo.host)) {
         return Some((token, TokenSource::Cli));
     }
-    usable(secrets.credential_helper()).map(|token| (token, TokenSource::CredentialHelper))
+    usable(secrets.credential_helper(&repo.host)).map(|token| (token, TokenSource::CredentialHelper))
 }
 
 /// No token from anywhere: for the offline fixture.
@@ -523,12 +912,100 @@ impl Secrets for NoSecrets {
     fn env(&self, _name: &str) -> Option<String> {
         None
     }
-    fn cli(&self) -> Option<String> {
+    fn cli(&self, _service: Service, _host: &str) -> Option<String> {
         None
     }
-    fn credential_helper(&self) -> Option<String> {
+    fn credential_helper(&self, _host: &str) -> Option<String> {
         None
     }
+}
+
+/// The real environment: variables, `gh` / `glab`, and `git credential`.
+pub struct System {
+    workdir: PathBuf,
+}
+
+impl System {
+    pub fn new(workdir: &Path) -> Self {
+        System { workdir: workdir.to_path_buf() }
+    }
+}
+
+impl Secrets for System {
+    fn env(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
+
+    fn cli(&self, service: Service, host: &str) -> Option<String> {
+        capture(cli_command(service, host), b"", Duration::from_secs(10))
+    }
+
+    fn credential_helper(&self, host: &str) -> Option<String> {
+        let answer = capture(credential_command(&self.workdir), credential_query(host).as_bytes(), Duration::from_secs(15))?;
+        password_from(&answer)
+    }
+}
+
+/// Asks `gh` or `glab` for the token it keeps for `host`, without a prompt.
+///
+/// Both tools let a token variable win over what they keep, for any host
+/// (`glab config get token` returns `GITLAB_TOKEN` whatever `--host` says),
+/// so those variables are taken out of the tool's environment: the answer
+/// is then the token stored for exactly that host, or nothing. Update
+/// checks and glab's usage reports are switched off, so the tool contacts
+/// nothing on our behalf.
+fn cli_command(service: Service, host: &str) -> Command {
+    let mut cmd;
+    match service {
+        Service::GitHub | Service::GitHubEnterprise => {
+            cmd = Command::new("gh");
+            cmd.args(["auth", "token", "--hostname", host])
+                .env("GH_PROMPT_DISABLED", "1")
+                .env("GH_NO_UPDATE_NOTIFIER", "1");
+            for name in ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST"] {
+                cmd.env_remove(name);
+            }
+        }
+        Service::GitLab => {
+            cmd = Command::new("glab");
+            cmd.args(["config", "get", "token", "--host", host])
+                .env("GLAB_NO_PROMPT", "1")
+                .env("NO_PROMPT", "1")
+                .env("GLAB_CHECK_UPDATE", "false")
+                .env("GLAB_SEND_TELEMETRY", "false");
+            for name in ["GITLAB_TOKEN", "GITLAB_ACCESS_TOKEN", "OAUTH_TOKEN", "GITLAB_HOST", "GL_HOST"] {
+                cmd.env_remove(name);
+            }
+        }
+    }
+    cmd
+}
+
+/// `git credential fill`, asked so that nothing can open a window or wait
+/// for a keyboard: the credential manager is told not to interact, and
+/// every askpass fallback and the terminal prompt are disabled. With
+/// nothing stored, git simply fails.
+fn credential_command(workdir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(workdir)
+        .args(["-c", "core.askPass=", "credential", "fill"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GCM_INTERACTIVE", "Never")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "");
+    cmd
+}
+
+/// What `git credential fill` is asked: the HTTPS credential for `host`.
+/// [`RepoId::host`] cannot hold a line break, so nothing else can be
+/// smuggled into the query.
+fn credential_query(host: &str) -> String {
+    format!("protocol=https\nhost={host}\n\n")
+}
+
+/// The `password=` line of `git credential fill` output.
+pub fn password_from(answer: &str) -> Option<String> {
+    answer.lines().find_map(|line| line.strip_prefix("password=")).map(str::to_owned)
 }
 
 /// Runs a helper program to completion and returns its standard output, or
@@ -606,16 +1083,124 @@ impl HttpResponse {
     }
 }
 
-/// One HTTP GET. Any status is a response; `Err` means no answer at all.
+/// HTTP for the clients. Any status is a response; `Err` means no answer
+/// at all.
 pub trait Transport: Send {
     fn get(&mut self, request: &HttpRequest<'_>) -> Result<HttpResponse, String>;
+
+    /// A POST with a JSON body (`request.etag` is not used). Never retried
+    /// and never redirected, so nothing can be created twice.
+    #[cfg_attr(not(test), expect(dead_code, reason = "reached through Backend::create_pull, which nothing calls until the pull request dialog does"))]
+    fn post(&mut self, request: &HttpRequest<'_>, json: &str) -> Result<HttpResponse, String> {
+        let _ = (request, json);
+        Err("sending is not supported here".to_owned())
+    }
+}
+
+/// Whether `url` is below `base`: `https://host/api/v4/...` for the base
+/// `https://host/api/v4`, but not `https://host/api/v40` or
+/// `https://host/api/v4.evil.example`. Nothing a URL parser could read
+/// differently (a backslash, whitespace, control characters) may follow.
+pub fn within(base: &str, url: &str) -> bool {
+    url.strip_prefix(base)
+        .is_some_and(|rest| rest.starts_with('/') && rest.bytes().all(|b| b.is_ascii_graphic() && b != b'\\'))
+}
+
+/// The real network, through `ureq`, for one service's API.
+pub struct Wire {
+    agent: ureq::Agent,
+    /// The API's address (no trailing slash). Requests below it carry the
+    /// token; anything else is sent without one.
+    api: String,
+    /// Headers the service wants on every request.
+    headers: &'static [(&'static str, &'static str)],
+}
+
+impl Wire {
+    pub fn new(api: String, headers: &'static [(&'static str, &'static str)]) -> Self {
+        let config = ureq::Agent::config_builder()
+            .https_only(true)
+            // Statuses are data here (304, 403, 404 all mean something).
+            .http_status_as_error(false)
+            // Redirects come back to the client, which only follows
+            // them within the API.
+            .max_redirects(0)
+            .max_redirects_will_error(false)
+            .timeout_global(Some(Duration::from_secs(25)))
+            .user_agent(concat!("GitKrill/", env!("CARGO_PKG_VERSION")))
+            .build();
+        Wire { agent: config.into(), api, headers }
+    }
+
+    /// The `Authorization` header for `request`: the one place a token
+    /// leaves the process, and only towards this service's API over HTTPS
+    /// (`https_only` refuses anything else before it is sent).
+    fn authorization(&self, request: &HttpRequest<'_>) -> Option<String> {
+        let token = request.token?;
+        (self.api.starts_with("https://") && within(&self.api, request.url)).then(|| token.authorization())
+    }
+}
+
+impl Transport for Wire {
+    fn get(&mut self, request: &HttpRequest<'_>) -> Result<HttpResponse, String> {
+        let mut call = self.agent.get(request.url);
+        for (name, value) in self.headers {
+            call = call.header(*name, *value);
+        }
+        if let Some(etag) = request.etag {
+            call = call.header("If-None-Match", etag);
+        }
+        if let Some(authorization) = self.authorization(request) {
+            call = call.header("Authorization", authorization);
+        }
+        receive(call.call().map_err(explain)?)
+    }
+
+    fn post(&mut self, request: &HttpRequest<'_>, json: &str) -> Result<HttpResponse, String> {
+        let mut call = self.agent.post(request.url).header("Content-Type", "application/json");
+        for (name, value) in self.headers {
+            call = call.header(*name, *value);
+        }
+        if let Some(authorization) = self.authorization(request) {
+            call = call.header("Authorization", authorization);
+        }
+        receive(call.send(json).map_err(explain)?)
+    }
+}
+
+/// A `ureq` answer as an [`HttpResponse`], with a bounded body.
+fn receive(mut response: ureq::http::Response<ureq::Body>) -> Result<HttpResponse, String> {
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| Some((name.as_str().to_owned(), value.to_str().ok()?.to_owned())))
+        .collect();
+    let body = match status {
+        304 => String::new(),
+        _ => response.body_mut().with_config().limit(32 * 1024 * 1024).read_to_string().map_err(explain)?,
+    };
+    Ok(HttpResponse { status, headers, body })
+}
+
+/// A transport failure in a few plain words. Built from the kind of
+/// error, never from request contents.
+fn explain(error: ureq::Error) -> String {
+    match error {
+        ureq::Error::HostNotFound | ureq::Error::ConnectionFailed => "no connection".to_owned(),
+        ureq::Error::Timeout(_) => "timed out".to_owned(),
+        ureq::Error::Io(io) => format!("network error ({})", io.kind()),
+        other => other.to_string(),
+    }
 }
 
 /// Development stand-in for the network: answers from files in a folder.
 ///
-/// `<list>.json` is the body for `pulls`, `issues` and `runs`. An optional
-/// `<list>.head` gives a status code on its first line and `name: value`
-/// headers after it, which is how to stage a rate limit or an outage.
+/// A request is answered with `<endpoint>.json`, after the last part of its
+/// path: `pulls`, `issues` and `runs` on GitHub, `merge_requests`, `issues`
+/// and `pipelines` on GitLab. An optional `<endpoint>.head` gives a status
+/// code on its first line and `name: value` headers after it, which is how
+/// to stage a rate limit or an outage.
 struct Canned {
     dir: PathBuf,
 }
@@ -623,7 +1208,8 @@ struct Canned {
 impl Transport for Canned {
     fn get(&mut self, request: &HttpRequest<'_>) -> Result<HttpResponse, String> {
         let path = request.url.split('?').next().unwrap_or_default();
-        let list = ["pulls", "issues", "runs"].into_iter().find(|list| path.ends_with(list));
+        let endpoints = ["pulls", "issues", "runs", "merge_requests", "pipelines"];
+        let list = endpoints.into_iter().find(|list| path.rsplit('/').next() == Some(*list));
         let list = list.ok_or("no fixture for this address")?;
 
         let mut response = HttpResponse { status: 200, ..Default::default() };
@@ -658,11 +1244,12 @@ pub struct Rate {
 }
 
 impl Rate {
+    /// GitHub's `X-RateLimit-*` headers, or GitLab's `RateLimit-*`.
     pub fn of(response: &HttpResponse) -> Rate {
         let number = |name: &str| response.header(name).and_then(|v| v.trim().parse().ok());
         Rate {
-            remaining: number("x-ratelimit-remaining"),
-            reset: number("x-ratelimit-reset"),
+            remaining: number("x-ratelimit-remaining").or_else(|| number("ratelimit-remaining")),
+            reset: number("x-ratelimit-reset").or_else(|| number("ratelimit-reset")),
             retry_after: number("retry-after"),
         }
     }
@@ -780,24 +1367,30 @@ pub struct NewPull {
     pub draft: bool,
 }
 
+/// The backend for `repo`: its service's client, talking to that service's
+/// API with tokens looked up for its host.
 fn connect(repo: &RepoId, workdir: &Path) -> Box<dyn Backend> {
+    let (transport, secrets): (Box<dyn Transport>, Box<dyn Secrets>) =
+        match std::env::var_os("GITKRILL_HOSTING_FIXTURE") {
+            Some(dir) => (Box::new(Canned { dir: dir.into() }), Box::new(NoSecrets)),
+            None => {
+                let headers = match repo.service {
+                    Service::GitHub | Service::GitHubEnterprise => github::HEADERS,
+                    Service::GitLab => gitlab::HEADERS,
+                };
+                (Box::new(Wire::new(repo.api_base(), headers)), Box::new(System::new(workdir)))
+            }
+        };
     match repo.service {
-        Service::GitHub => match std::env::var_os("GITKRILL_HOSTING_FIXTURE") {
-            Some(dir) => Box::new(github::Client::new(
-                repo.clone(),
-                Box::new(Canned { dir: dir.into() }),
-                Box::new(NoSecrets),
-            )),
-            None => Box::new(github::Client::new(
-                repo.clone(),
-                Box::new(github::Wire::new()),
-                Box::new(github::System::new(workdir)),
-            )),
-        },
+        Service::GitHub | Service::GitHubEnterprise => {
+            Box::new(github::Client::new(repo.clone(), transport, secrets))
+        }
+        Service::GitLab => Box::new(gitlab::Client::new(repo.clone(), transport, secrets)),
     }
 }
 
 pub mod github;
+pub mod gitlab;
 
 // ---- the background thread ------------------------------------------------
 
@@ -1003,12 +1596,15 @@ impl HostingState {
     /// refresh when one is due.
     ///
     /// Returns `None`, having made no request, when the integration is
-    /// switched off or no remote points at a known service.
+    /// switched off or no remote points at a known service: github.com,
+    /// gitlab.com, or a server in `servers` the user said runs GitHub
+    /// Enterprise or GitLab.
     pub fn sync(
         &mut self,
         ctx: &egui::Context,
         workdir: &Path,
         remotes: &[RemoteInfo],
+        servers: &Servers,
         enabled: bool,
     ) -> Option<Shown> {
         let wake = {
@@ -1017,7 +1613,7 @@ impl HostingState {
         };
         // Only poll while someone is looking at the window.
         let attended = ctx.input(|input| input.focused);
-        let shown = self.sync_with(remotes, enabled, attended, |repo| connect(repo, workdir), wake);
+        let shown = self.sync_with(remotes, servers, enabled, attended, |repo| connect(repo, workdir), wake);
         if let Some(due) = self.session.as_ref().and_then(|session| session.next_auto)
             && attended
         {
@@ -1029,12 +1625,13 @@ impl HostingState {
     fn sync_with(
         &mut self,
         remotes: &[RemoteInfo],
+        servers: &Servers,
         enabled: bool,
         attended: bool,
         connect: impl FnOnce(&RepoId) -> Box<dyn Backend>,
         wake: impl Fn() + Send + 'static,
     ) -> Option<Shown> {
-        let target = if enabled { detect(remotes) } else { None };
+        let target = if enabled { detect(remotes, servers) } else { None };
         let Some((remote, repo)) = target else {
             // Dropping the session stops its thread.
             self.session = None;
@@ -1069,9 +1666,10 @@ impl HostingState {
 
 // ---- checking out a pull request ------------------------------------------
 
-/// The local branch a pull request is checked out as.
-pub fn pull_branch(number: u64) -> String {
-    format!("pr/{number}")
+/// The local branch a pull request is checked out as: `pr/12`, or `mr/12`
+/// for a GitLab merge request.
+pub fn pull_branch(service: Service, number: u64) -> String {
+    if service.is_gitlab() { format!("mr/{number}") } else { format!("pr/{number}") }
 }
 
 /// Fetches a pull request's head from `remote` into [`pull_branch`] and
@@ -1082,21 +1680,19 @@ pub fn pull_branch(number: u64) -> String {
 /// does not, git says so and nothing is lost. Only the pull request's
 /// commits are fetched, not the remote's tags.
 pub fn checkout_pull(remote: &str, service: Service, number: u64, on_branch: bool) -> GitCmd {
-    let branch = pull_branch(number);
+    let branch = pull_branch(service, number);
     let head = service.pull_ref(number);
+    let what = format!("{} {}", service.pull_word(), service.pull_number(number));
     if on_branch {
-        GitCmd::new(format!("Update pull request #{number}"), &["fetch", "--no-tags", remote, &head])
+        GitCmd::new(format!("Update {what}"), &["fetch", "--no-tags", remote, &head])
             .step(&["merge", "--ff-only", "FETCH_HEAD"])
             .undoable(UndoKind::HeadMove)
-            .done(format!("Updated {branch} to pull request #{number}"))
+            .done(format!("Updated {branch} to {what}"))
     } else {
-        GitCmd::new(
-            format!("Check out pull request #{number}"),
-            &["fetch", "--no-tags", remote, &format!("{head}:{branch}")],
-        )
-        .step(&["checkout", &branch])
-        .undoable(UndoKind::Checkout)
-        .done(format!("Checked out pull request #{number} as {branch}"))
+        GitCmd::new(format!("Check out {what}"), &["fetch", "--no-tags", remote, &format!("{head}:{branch}")])
+            .step(&["checkout", &branch])
+            .undoable(UndoKind::Checkout)
+            .done(format!("Checked out {what} as {branch}"))
     }
 }
 
@@ -1105,43 +1701,57 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::AtomicU32;
 
-    use super::github::{Client, is_api, parse_issues, parse_pulls, parse_runs, password_from, run_state};
+    use super::github::{API, Client, parse_issues, parse_pulls, parse_runs, run_state};
     use super::*;
 
-    const NOW: u64 = 1_800_000_000;
+    pub(super) const NOW: u64 = 1_800_000_000;
     /// Shaped like a real token; never a real one.
-    const SECRET: &str = "ghp_FAKEfakeFAKEfakeFAKEfake0123456789";
-    const OTHER: &str = "gho_ANOTHERfakeTOKENforTESTS9876543210";
+    pub(super) const SECRET: &str = "ghp_FAKEfakeFAKEfakeFAKEfake0123456789";
+    pub(super) const OTHER: &str = "gho_ANOTHERfakeTOKENforTESTS9876543210";
+    /// No self-hosted servers named.
+    pub(super) static NO_SERVERS: Servers = BTreeMap::new();
 
     // ---- fakes ----
 
     /// One request as the transport saw it.
-    struct Sent {
-        url: String,
-        etag: Option<String>,
-        token: Option<String>,
+    pub(super) struct Sent {
+        pub(super) url: String,
+        pub(super) etag: Option<String>,
+        pub(super) token: Option<String>,
+        /// The JSON of a POST; `None` for a GET.
+        pub(super) body: Option<String>,
     }
 
-    type Log = Arc<Mutex<Vec<Sent>>>;
+    pub(super) type Log = Arc<Mutex<Vec<Sent>>>;
 
     /// A transport that plays back scripted answers and records requests.
-    struct Script {
-        replies: VecDeque<Result<HttpResponse, String>>,
-        sent: Log,
+    pub(super) struct Script {
+        pub(super) replies: VecDeque<Result<HttpResponse, String>>,
+        pub(super) sent: Log,
     }
 
-    impl Transport for Script {
-        fn get(&mut self, request: &HttpRequest<'_>) -> Result<HttpResponse, String> {
+    impl Script {
+        fn answer(&mut self, request: &HttpRequest<'_>, body: Option<&str>) -> Result<HttpResponse, String> {
             self.sent.lock().unwrap().push(Sent {
                 url: request.url.to_owned(),
                 etag: request.etag.map(str::to_owned),
                 token: request.token.map(|token| token.0.clone()),
+                body: body.map(str::to_owned),
             });
             self.replies.pop_front().unwrap_or_else(|| Err("script exhausted".to_owned()))
         }
     }
 
-    fn reply(status: u16, headers: &[(&str, &str)], body: &str) -> Result<HttpResponse, String> {
+    impl Transport for Script {
+        fn get(&mut self, request: &HttpRequest<'_>) -> Result<HttpResponse, String> {
+            self.answer(request, None)
+        }
+        fn post(&mut self, request: &HttpRequest<'_>, json: &str) -> Result<HttpResponse, String> {
+            self.answer(request, Some(json))
+        }
+    }
+
+    pub(super) fn reply(status: u16, headers: &[(&str, &str)], body: &str) -> Result<HttpResponse, String> {
         Ok(HttpResponse {
             status,
             headers: headers.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
@@ -1149,17 +1759,20 @@ mod tests {
         })
     }
 
-    /// Token sources with fixed contents that record the order they are asked in.
+    /// Token sources with fixed contents that record what they are asked:
+    /// variable names, `gh <host>` / `glab <host>` and `git <host>`. The
+    /// tool and the helper answer `cli` and `helper` whatever the host, so
+    /// the record is what shows which host a token was looked up for.
     #[derive(Clone, Default)]
-    struct Fake {
-        env: Vec<(&'static str, &'static str)>,
-        cli: Option<&'static str>,
-        helper: Option<&'static str>,
-        asked: Arc<Mutex<Vec<String>>>,
+    pub(super) struct Fake {
+        pub(super) env: Vec<(&'static str, &'static str)>,
+        pub(super) cli: Option<&'static str>,
+        pub(super) helper: Option<&'static str>,
+        pub(super) asked: Arc<Mutex<Vec<String>>>,
     }
 
     impl Fake {
-        fn asked(&self) -> Vec<String> {
+        pub(super) fn asked(&self) -> Vec<String> {
             self.asked.lock().unwrap().clone()
         }
     }
@@ -1169,18 +1782,24 @@ mod tests {
             self.asked.lock().unwrap().push(name.to_owned());
             self.env.iter().find(|(key, _)| *key == name).map(|(_, value)| (*value).to_owned())
         }
-        fn cli(&self) -> Option<String> {
-            self.asked.lock().unwrap().push("gh".to_owned());
+        fn cli(&self, service: Service, host: &str) -> Option<String> {
+            let tool = if service.is_gitlab() { "glab" } else { "gh" };
+            self.asked.lock().unwrap().push(format!("{tool} {host}"));
             self.cli.map(str::to_owned)
         }
-        fn credential_helper(&self) -> Option<String> {
-            self.asked.lock().unwrap().push("git".to_owned());
+        fn credential_helper(&self, host: &str) -> Option<String> {
+            self.asked.lock().unwrap().push(format!("git {host}"));
             self.helper.map(str::to_owned)
         }
     }
 
     fn repo() -> RepoId {
-        RepoId { service: Service::GitHub, owner: "octo".to_owned(), name: "app".to_owned() }
+        RepoId {
+            service: Service::GitHub,
+            host: "github.com".to_owned(),
+            owner: "octo".to_owned(),
+            name: "app".to_owned(),
+        }
     }
 
     fn scripted(replies: Vec<Result<HttpResponse, String>>, secrets: Fake) -> (Client, Log) {
@@ -1268,10 +1887,10 @@ mod tests {
             "git+ssh://git@github.com/octo/app.git",
             "  https://github.com/octo/app.git\n",
         ] {
-            assert_eq!(parse_remote(url), Some(repo()), "{url}");
+            assert_eq!(parse_remote(url, &NO_SERVERS), Some(repo()), "{url}");
         }
 
-        let dotted = parse_remote("git@github.com:rust-lang/rust.vim.git").unwrap();
+        let dotted = parse_remote("git@github.com:rust-lang/rust.vim.git", &NO_SERVERS).unwrap();
         assert_eq!((dotted.owner.as_str(), dotted.name.as_str()), ("rust-lang", "rust.vim"));
         assert_eq!(dotted.slug(), "rust-lang/rust.vim");
     }
@@ -1280,7 +1899,7 @@ mod tests {
     fn other_hosts_and_malformed_urls_are_rejected() {
         for url in [
             "",
-            "https://gitlab.com/octo/app.git",
+            "https://bitbucket.org/octo/app.git",
             "git@bitbucket.org:octo/app.git",
             "https://github.com.evil.example/octo/app.git",
             "https://notgithub.com/octo/app.git",
@@ -1306,7 +1925,7 @@ mod tests {
             "../github.com/octo/app",
             "E:/demo-origin.git",
         ] {
-            assert_eq!(parse_remote(url), None, "{url}");
+            assert_eq!(parse_remote(url, &NO_SERVERS), None, "{url}");
         }
     }
 
@@ -1314,21 +1933,21 @@ mod tests {
     fn origin_is_preferred_and_other_remotes_are_a_fallback() {
         let fork = remote("fork", "git@github.com:ada/app.git");
         let origin = remote("origin", "https://github.com/octo/app.git");
-        let found = detect(&[fork.clone(), origin]).unwrap();
+        let found = detect(&[fork.clone(), origin], &NO_SERVERS).unwrap();
         assert_eq!((found.0.as_str(), found.1.slug().as_str()), ("origin", "octo/app"));
 
         // origin elsewhere: the first hosted remote stands in.
         let local = remote("origin", "E:/demo-origin.git");
-        let found = detect(&[local.clone(), fork]).unwrap();
+        let found = detect(&[local.clone(), fork], &NO_SERVERS).unwrap();
         assert_eq!((found.0.as_str(), found.1.slug().as_str()), ("fork", "ada/app"));
 
-        assert_eq!(detect(&[local, remote("lab", "https://gitlab.com/octo/app.git")]), None);
-        assert_eq!(detect(&[]), None);
+        assert_eq!(detect(&[local, remote("bb", "https://bitbucket.org/octo/app.git")], &NO_SERVERS), None);
+        assert_eq!(detect(&[], &NO_SERVERS), None);
     }
 
     #[test]
     fn links_are_built_only_from_validated_parts() {
-        let repo = parse_remote("git@github.com:rust-lang/rust.vim.git").unwrap();
+        let repo = parse_remote("git@github.com:rust-lang/rust.vim.git", &NO_SERVERS).unwrap();
         let links = [
             repo.pulls_url(),
             repo.pull_url(12),
@@ -1587,32 +2206,32 @@ mod tests {
             helper: Some("helper-token-123456"),
             ..Default::default()
         };
-        let (token, source) = find_token(&all, &[]).unwrap();
+        let (token, source) = find_token(&all, &repo(), &[]).unwrap();
         assert_eq!((token.0.as_str(), source), (SECRET, TokenSource::Env("GITHUB_TOKEN")));
         assert_eq!(all.asked(), ["GITHUB_TOKEN"]);
 
         // GH_TOKEN next.
         let fake = Fake { env: vec![("GH_TOKEN", OTHER)], cli: Some("gh-cli-token-123456"), ..Default::default() };
-        let (token, source) = find_token(&fake, &[]).unwrap();
+        let (token, source) = find_token(&fake, &repo(), &[]).unwrap();
         assert_eq!((token.0.as_str(), source), (OTHER, TokenSource::Env("GH_TOKEN")));
         assert_eq!(fake.asked(), ["GITHUB_TOKEN", "GH_TOKEN"]);
 
         // Then the GitHub CLI, before git is ever started.
         let fake = Fake { cli: Some("gh-cli-token-123456\n"), helper: Some("helper-token-123456"), ..Default::default() };
-        let (token, source) = find_token(&fake, &[]).unwrap();
+        let (token, source) = find_token(&fake, &repo(), &[]).unwrap();
         assert_eq!((token.0.as_str(), source), ("gh-cli-token-123456", TokenSource::Cli));
-        assert_eq!(fake.asked(), ["GITHUB_TOKEN", "GH_TOKEN", "gh"]);
+        assert_eq!(fake.asked(), ["GITHUB_TOKEN", "GH_TOKEN", "gh github.com"]);
 
         // Then git's credential helper.
         let fake = Fake { helper: Some("helper-token-123456"), ..Default::default() };
-        let (token, source) = find_token(&fake, &[]).unwrap();
+        let (token, source) = find_token(&fake, &repo(), &[]).unwrap();
         assert_eq!((token.0.as_str(), source), ("helper-token-123456", TokenSource::CredentialHelper));
-        assert_eq!(fake.asked(), ["GITHUB_TOKEN", "GH_TOKEN", "gh", "git"]);
+        assert_eq!(fake.asked(), ["GITHUB_TOKEN", "GH_TOKEN", "gh github.com", "git github.com"]);
 
         // Nothing anywhere: anonymous.
         let fake = Fake::default();
-        assert!(find_token(&fake, &[]).is_none());
-        assert_eq!(fake.asked(), ["GITHUB_TOKEN", "GH_TOKEN", "gh", "git"]);
+        assert!(find_token(&fake, &repo(), &[]).is_none());
+        assert_eq!(fake.asked(), ["GITHUB_TOKEN", "GH_TOKEN", "gh github.com", "git github.com"]);
     }
 
     #[test]
@@ -1624,15 +2243,15 @@ mod tests {
             helper: Some("helper-token-123456"),
             ..Default::default()
         };
-        let (token, source) = find_token(&fake, &[]).unwrap();
+        let (token, source) = find_token(&fake, &repo(), &[]).unwrap();
         assert_eq!((token.0.as_str(), source), ("helper-token-123456", TokenSource::CredentialHelper));
 
         // A token the service already refused does not hide the next source.
         let stale = Token::new(SECRET).unwrap();
         let fake = Fake { env: vec![("GITHUB_TOKEN", SECRET)], cli: Some(OTHER), ..Default::default() };
-        let (token, source) = find_token(&fake, std::slice::from_ref(&stale)).unwrap();
+        let (token, source) = find_token(&fake, &repo(), std::slice::from_ref(&stale)).unwrap();
         assert_eq!((token.0.as_str(), source), (OTHER, TokenSource::Cli));
-        assert!(find_token(&fake, &[stale, Token::new(OTHER).unwrap()]).is_none());
+        assert!(find_token(&fake, &repo(), &[stale, Token::new(OTHER).unwrap()]).is_none());
 
         assert!(Token::new("").is_none());
         assert!(Token::new("short").is_none());
@@ -1698,7 +2317,7 @@ mod tests {
             Auth::SignedIn(TokenSource::Cli),
             Auth::SignedIn(TokenSource::CredentialHelper),
         ] {
-            assert!(!auth.describe().contains("ghp_"));
+            assert!(!auth.describe(Service::GitHub).contains("ghp_"));
         }
     }
 
@@ -1706,7 +2325,7 @@ mod tests {
 
     #[test]
     fn requests_go_to_the_api_with_the_token_and_only_there() {
-        assert!(is_api("https://api.github.com/repos/octo/app/pulls"));
+        assert!(within(API, "https://api.github.com/repos/octo/app/pulls"));
         for url in [
             "http://api.github.com/repos/octo/app/pulls",
             "https://api.github.com.evil.example/repos/octo/app/pulls",
@@ -1716,7 +2335,7 @@ mod tests {
             "https://github.com/octo/app",
             "https://evil.example/https://api.github.com/",
         ] {
-            assert!(!is_api(url), "{url}");
+            assert!(!within(API, url), "{url}");
         }
 
         let (mut client, sent) = scripted(
@@ -1740,7 +2359,7 @@ mod tests {
                 "https://api.github.com/repos/octo/app/actions/runs?per_page=20&exclude_pull_requests=true",
             ]
         );
-        assert!(sent.iter().all(|request| is_api(&request.url)));
+        assert!(sent.iter().all(|request| within(API, &request.url)));
         assert!(sent.iter().all(|request| request.token.as_deref() == Some(SECRET)));
     }
 
@@ -1767,7 +2386,7 @@ mod tests {
             assert_eq!(problem, Problem::Failed("GitHub sent an unexpected redirect".to_owned()));
             let sent = sent.lock().unwrap();
             assert_eq!(sent.len(), 1, "{target}");
-            assert!(is_api(&sent[0].url));
+            assert!(within(API, &sent[0].url));
         }
 
         // Nor is an endless chain.
@@ -1998,11 +2617,11 @@ mod tests {
             fn env(&self, name: &str) -> Option<String> {
                 (self.1.load(Ordering::Relaxed) && name == "GITHUB_TOKEN").then(|| SECRET.to_owned())
             }
-            fn cli(&self) -> Option<String> {
-                self.0.cli()
+            fn cli(&self, service: Service, host: &str) -> Option<String> {
+                self.0.cli(service, host)
             }
-            fn credential_helper(&self) -> Option<String> {
-                self.0.credential_helper()
+            fn credential_helper(&self, host: &str) -> Option<String> {
+                self.0.credential_helper(host)
             }
         }
         let signed_in = Arc::new(AtomicBool::new(false));
@@ -2087,7 +2706,7 @@ mod tests {
                     problem.brief(Service::GitHub),
                     problem.detail(Service::GitHub),
                     format!("{problem:?}"),
-                    client.auth().describe(),
+                    client.auth().describe(Service::GitHub),
                     format!("{:?}", client.auth()),
                 ];
                 for text in shown {
@@ -2220,7 +2839,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let connect = |_: &RepoId| -> Box<dyn Backend> { panic!("already connected") };
-            let shown = state.sync_with(remotes, true, false, connect, || {}).expect("still hosted");
+            let shown = state.sync_with(remotes, &NO_SERVERS, true, false, connect, || {}).expect("still hosted");
             if !shown.view.busy {
                 return shown;
             }
@@ -2234,12 +2853,12 @@ mod tests {
         let mut state = HostingState::default();
         let never = |_: &RepoId| -> Box<dyn Backend> { panic!("must not connect") };
         // The setting is off: a GitHub remote changes nothing.
-        assert!(state.sync_with(&hosted(), false, true, never, || {}).is_none());
+        assert!(state.sync_with(&hosted(), &NO_SERVERS, false, true, never, || {}).is_none());
         assert!(state.session.is_none());
         // On, but the remotes are elsewhere.
-        let elsewhere = [remote("origin", "E:/demo-origin.git"), remote("lab", "https://gitlab.com/octo/app.git")];
-        assert!(state.sync_with(&elsewhere, true, true, never, || {}).is_none());
-        assert!(state.sync_with(&[], true, true, never, || {}).is_none());
+        let elsewhere = [remote("origin", "E:/demo-origin.git"), remote("bb", "https://bitbucket.org/octo/app.git")];
+        assert!(state.sync_with(&elsewhere, &NO_SERVERS, true, true, never, || {}).is_none());
+        assert!(state.sync_with(&[], &NO_SERVERS, true, true, never, || {}).is_none());
         assert!(state.session.is_none());
         // A manual refresh with nothing running is a no-op too.
         state.refresh();
@@ -2255,7 +2874,7 @@ mod tests {
             let wake = move || {
                 woken.fetch_add(1, Ordering::SeqCst);
             };
-            state.sync_with(&hosted(), true, false, move |_| Box::new(stub), wake).unwrap()
+            state.sync_with(&hosted(), &NO_SERVERS, true, false, move |_| Box::new(stub), wake).unwrap()
         };
         // Returned at once, before any answer: nothing blocks the frame.
         assert_eq!((shown.remote.as_str(), shown.repo.slug().as_str()), ("origin", "octo/app"));
@@ -2290,7 +2909,7 @@ mod tests {
         let mut state = HostingState::default();
         {
             let stub = stub.clone();
-            state.sync_with(&hosted(), true, true, move |_| Box::new(stub), || {});
+            state.sync_with(&hosted(), &NO_SERVERS, true, true, move |_| Box::new(stub), || {});
         }
         settle(&mut state, &hosted());
         let rounds = || stub.rounds.load(Ordering::SeqCst);
@@ -2299,15 +2918,15 @@ mod tests {
         // Not due yet: syncing every frame asks for nothing.
         let connect = |_: &RepoId| -> Box<dyn Backend> { panic!("already connected") };
         for _ in 0..50 {
-            assert!(!state.sync_with(&hosted(), true, true, connect, || {}).unwrap().view.busy);
+            assert!(!state.sync_with(&hosted(), &NO_SERVERS, true, true, connect, || {}).unwrap().view.busy);
         }
         assert_eq!(rounds(), 1);
 
         // Due, but nobody is looking at the window: still nothing.
         state.session.as_mut().unwrap().next_auto = Some(Instant::now());
-        assert!(!state.sync_with(&hosted(), true, false, connect, || {}).unwrap().view.busy);
+        assert!(!state.sync_with(&hosted(), &NO_SERVERS, true, false, connect, || {}).unwrap().view.busy);
         // Due and attended: one automatic round, without a new sign-in search.
-        assert!(state.sync_with(&hosted(), true, true, connect, || {}).unwrap().view.busy);
+        assert!(state.sync_with(&hosted(), &NO_SERVERS, true, true, connect, || {}).unwrap().view.busy);
         settle(&mut state, &hosted());
         assert_eq!((rounds(), stub.looked_again.load(Ordering::SeqCst)), (2, 0));
 
@@ -2325,7 +2944,7 @@ mod tests {
         let mut state = HostingState::default();
         {
             let stub = stub.clone();
-            state.sync_with(&hosted(), true, true, move |_| Box::new(stub), || {});
+            state.sync_with(&hosted(), &NO_SERVERS, true, true, move |_| Box::new(stub), || {});
         }
         settle(&mut state, &hosted());
 
@@ -2383,7 +3002,7 @@ mod tests {
         let mut state = HostingState::default();
         {
             let alive = alive.clone();
-            state.sync_with(&hosted(), true, true, move |_| Box::new(Tracked(Stub::default(), alive)), || {});
+            state.sync_with(&hosted(), &NO_SERVERS, true, true, move |_| Box::new(Tracked(Stub::default(), alive)), || {});
         }
         settle(&mut state, &hosted());
 
@@ -2394,7 +3013,7 @@ mod tests {
         let shown = {
             let second = second.clone();
             let connect = move |_: &RepoId| -> Box<dyn Backend> { Box::new(Tracked(Stub::default(), second)) };
-            state.sync_with(&moved, true, true, connect, || {}).unwrap()
+            state.sync_with(&moved, &NO_SERVERS, true, true, connect, || {}).unwrap()
         };
         assert_eq!(shown.repo.slug(), "octo/other");
         assert!(shown.view.pulls.items.is_empty() && !shown.view.pulls.loaded);
@@ -2402,7 +3021,7 @@ mod tests {
 
         // Switched off: the session and its thread go away.
         let never = |_: &RepoId| -> Box<dyn Backend> { panic!("must not connect") };
-        assert!(state.sync_with(&moved, false, true, never, || {}).is_none());
+        assert!(state.sync_with(&moved, &NO_SERVERS, false, true, never, || {}).is_none());
         assert!(state.session.is_none());
         wait_until_alone(&second);
     }
@@ -2429,7 +3048,7 @@ mod tests {
             }
         }
         let mut state = HostingState::default();
-        state.sync_with(&hosted(), true, true, |_| Box::new(Broken), || {});
+        state.sync_with(&hosted(), &NO_SERVERS, true, true, |_| Box::new(Broken), || {});
         let shown = settle(&mut state, &hosted());
         let stopped = Some(Problem::Failed("The background worker stopped".to_owned()));
         assert_eq!(shown.view.pulls.problem, stopped);
@@ -2518,6 +3137,581 @@ mod tests {
         let missing = fx.run_as(checkout_pull("origin", Service::GitHub, 99, false), crate::worker::Origin::User);
         assert!(missing.result.is_err());
         assert!(!missing.snap.branches.iter().any(|branch| branch.name == "pr/99"));
+
+        drop(fx);
+        let _ = std::fs::remove_dir_all(&origin);
+    }
+
+    // ---- more services: GitLab, GitHub Enterprise, self-hosted servers ----
+
+    fn servers(entries: &[(&str, ServerKind)]) -> Servers {
+        entries.iter().map(|(host, kind)| ((*host).to_owned(), *kind)).collect()
+    }
+
+    fn at(service: Service, host: &str, owner: &str, name: &str) -> RepoId {
+        RepoId { service, host: host.to_owned(), owner: owner.to_owned(), name: name.to_owned() }
+    }
+
+    #[test]
+    fn gitlab_com_remotes_are_recognised_with_nested_groups() {
+        let plain = at(Service::GitLab, "gitlab.com", "group", "app");
+        for url in [
+            "https://gitlab.com/group/app",
+            "https://gitlab.com/group/app.git",
+            "https://gitlab.com/group/app.git/",
+            "https://www.gitlab.com/group/app",
+            "https://GitLab.com/group/app.git",
+            "https://ada:glpat-hunter2@gitlab.com/group/app.git",
+            "https://gitlab.com:443/group/app.git",
+            "git@gitlab.com:group/app.git",
+            "gitlab.com:group/app",
+            "ssh://git@gitlab.com/group/app.git",
+            "ssh://git@altssh.gitlab.com:443/group/app.git",
+            "git+ssh://git@gitlab.com/group/app.git",
+        ] {
+            assert_eq!(parse_remote(url, &NO_SERVERS), Some(plain.clone()), "{url}");
+        }
+
+        let nested = parse_remote("git@gitlab.com:group/sub/deeper/my.app.git", &NO_SERVERS).unwrap();
+        assert_eq!(nested, at(Service::GitLab, "gitlab.com", "group/sub/deeper", "my.app"));
+        assert_eq!(nested.slug(), "group/sub/deeper/my.app");
+        assert_eq!(gitlab::project_id(&nested), "group%2Fsub%2Fdeeper%2Fmy.app");
+        // Names keep their case; the host is lower-cased.
+        let cased = parse_remote("https://GITLAB.COM/Group/App.git", &NO_SERVERS).unwrap();
+        assert_eq!((cased.host.as_str(), cased.slug().as_str()), ("gitlab.com", "Group/App"));
+
+        for url in [
+            "https://gitlab.com/group",
+            "https://gitlab.com/group/",
+            "https://gitlab.com/group/app/-/merge_requests",
+            "https://gitlab.com/group/-app",
+            "https://gitlab.com/group//app",
+            "https://gitlab.com/group/../app",
+            "https://gitlab.com/group/app b",
+            "https://gitlab.com/group/app?x=1",
+            "https://gitlab.com/group/app#readme",
+            "https://gitlab.com.evil.example/group/app.git",
+            "https://evilgitlab.com/group/app.git",
+            "https://gitlab.co/group/app.git",
+            "https://gitlab.com@evil.example/group/app.git",
+            "https://evil.example/gitlab.com/group/app",
+            "git@gitlab.com.evil.example:group/app.git",
+            "https://registry.gitlab.com/group/app",
+            "file:///srv/gitlab.com/group/app.git",
+            "C:/repos/gitlab.com/group/app",
+        ] {
+            assert_eq!(parse_remote(url, &NO_SERVERS), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_self_hosted_server_is_used_only_once_the_user_has_named_it() {
+        let urls = [
+            "https://git.acme.com/team/app.git",
+            "git@git.acme.com:team/app.git",
+            "ssh://git@git.acme.com/team/app.git",
+            // SSH's port says nothing about the web server.
+            "ssh://git@git.acme.com:2222/team/app.git",
+            "https://GIT.ACME.COM/team/app",
+            "https://git.acme.com:443/team/app.git",
+            // Plain HTTP's port is not where HTTPS listens either.
+            "http://git.acme.com:8080/team/app.git",
+        ];
+        for url in urls {
+            assert_eq!(parse_remote(url, &NO_SERVERS), None, "{url}");
+        }
+
+        let lab = servers(&[("git.acme.com", ServerKind::GitLab)]);
+        for url in urls {
+            assert_eq!(parse_remote(url, &lab), Some(at(Service::GitLab, "git.acme.com", "team", "app")), "{url}");
+        }
+        assert_eq!(
+            parse_remote("git@git.acme.com:team/backend/api.git", &lab),
+            Some(at(Service::GitLab, "git.acme.com", "team/backend", "api"))
+        );
+
+        // An HTTPS port is part of where the server is.
+        let ported = "https://git.acme.com:8443/team/app.git";
+        assert_eq!(parse_remote(ported, &lab), None);
+        let lab_on_port = servers(&[("git.acme.com:8443", ServerKind::GitLab)]);
+        let repo = parse_remote(ported, &lab_on_port).unwrap();
+        assert_eq!(repo.host, "git.acme.com:8443");
+        assert_eq!(repo.api_base(), "https://git.acme.com:8443/api/v4");
+        assert_eq!(parse_remote("git@git.acme.com:team/app.git", &lab_on_port), None);
+
+        // GitHub Enterprise: exactly owner/name.
+        let ghe = servers(&[("ghe.acme.com", ServerKind::GitHubEnterprise)]);
+        let repo = parse_remote("git@ghe.acme.com:octo/app.git", &ghe).unwrap();
+        assert_eq!(repo, at(Service::GitHubEnterprise, "ghe.acme.com", "octo", "app"));
+        assert_eq!(repo.api_base(), "https://ghe.acme.com/api/v3");
+        assert_eq!(parse_remote("https://ghe.acme.com/octo/app/pulls", &ghe), None);
+        let cloud = servers(&[("acme.ghe.com", ServerKind::GitHubEnterprise)]);
+        assert_eq!(parse_remote("https://acme.ghe.com/octo/app", &cloud).unwrap().api_base(), "https://api.acme.ghe.com");
+
+        // "Neither", or a kind this version does not know: never contacted.
+        let ignored = servers(&[("git.acme.com", ServerKind::Ignored)]);
+        assert_eq!(parse_remote("https://git.acme.com/team/app.git", &ignored), None);
+
+        // Hosts that only look like the one named.
+        for url in [
+            "https://git.acme.com.evil.example/team/app.git",
+            "https://evil-git.acme.com/team/app.git",
+            "https://xgit.acme.com/team/app.git",
+            "https://acme.com/team/app.git",
+            "https://git.acme.co/team/app.git",
+            "https://git.acme.com@evil.example/team/app.git",
+            "https://evil.example/git.acme.com/team/app.git",
+            "git@git.acme.com.evil.example:team/app.git",
+        ] {
+            assert_eq!(parse_remote(url, &lab), None, "{url}");
+        }
+
+        // A saved choice cannot turn github.com or gitlab.com into
+        // something else.
+        let confused = servers(&[("github.com", ServerKind::GitLab), ("gitlab.com", ServerKind::GitHubEnterprise)]);
+        assert_eq!(parse_remote("https://github.com/octo/app", &confused).unwrap().service, Service::GitHub);
+        assert_eq!(parse_remote("https://gitlab.com/group/app", &confused).unwrap().service, Service::GitLab);
+    }
+
+    #[test]
+    fn addresses_cannot_carry_anything_but_a_host_and_a_path() {
+        for url in [
+            "https://git.acme.com\nhost=evil.example/team/app",
+            "https://git.acme.com%0a/team/app",
+            "https://git.acme.com\r/team/app",
+            "https://[::1]:8443/team/app",
+            "https://-git.acme.com/team/app",
+            "https://git..acme.com/team/app",
+            "https://git.acme.com:99999/team/app",
+            "https://git.acme.com:port/team/app",
+            "https://git_acme.com/team/app",
+            "https://git.acme.com/team\\app/x",
+            "x:team/app",
+        ] {
+            assert_eq!(address(url), None, "{url:?}");
+        }
+        // What does parse is made of safe characters only.
+        let address = address("ssh://Git@Git.Acme.Com:22/Team/App.git").unwrap();
+        assert_eq!((address.host(), address.path.join("/")), ("git.acme.com".to_owned(), "Team/App".to_owned()));
+        assert_eq!(credential_query("git.acme.com:8443"), "protocol=https\nhost=git.acme.com:8443\n\n");
+    }
+
+    #[test]
+    fn links_for_every_service_are_built_only_from_validated_parts() {
+        let lab = servers(&[("git.acme.com:8443", ServerKind::GitLab), ("ghe.acme.com", ServerKind::GitHubEnterprise)]);
+        let nested = parse_remote("git@gitlab.com:group/sub/app.git", &lab).unwrap();
+        assert_eq!(nested.pulls_url(), "https://gitlab.com/group/sub/app/-/merge_requests");
+        assert_eq!(nested.pull_url(7), "https://gitlab.com/group/sub/app/-/merge_requests/7");
+        assert_eq!(nested.issues_url(), "https://gitlab.com/group/sub/app/-/issues");
+        assert_eq!(nested.issue_url(3), "https://gitlab.com/group/sub/app/-/issues/3");
+        assert_eq!(nested.runs_url(), "https://gitlab.com/group/sub/app/-/pipelines");
+        assert_eq!(nested.run_url(99), "https://gitlab.com/group/sub/app/-/pipelines/99");
+        assert_eq!(nested.api_base(), "https://gitlab.com/api/v4");
+
+        let ported = parse_remote("https://git.acme.com:8443/team/app.git", &lab).unwrap();
+        assert_eq!(ported.pull_url(1), "https://git.acme.com:8443/team/app/-/merge_requests/1");
+        let ghe = parse_remote("https://ghe.acme.com/octo/app", &lab).unwrap();
+        assert_eq!(ghe.pull_url(12), "https://ghe.acme.com/octo/app/pull/12");
+        assert_eq!(ghe.run_url(5), "https://ghe.acme.com/octo/app/actions/runs/5");
+
+        for repo in [nested, ported, ghe] {
+            for link in [
+                repo.pulls_url(),
+                repo.pull_url(12),
+                repo.issues_url(),
+                repo.issue_url(31),
+                repo.runs_url(),
+                repo.run_url(9001),
+                repo.api_base(),
+            ] {
+                assert!(link.starts_with("https://"), "{link}");
+                assert!(link.bytes().all(|b| b.is_ascii_alphanumeric() || b"/:._-".contains(&b)), "{link}");
+            }
+        }
+    }
+
+    #[test]
+    fn unknown_servers_are_offered_and_nothing_else_is() {
+        let none = &NO_SERVERS;
+        // origin on a server nobody has named: offered, with a guess.
+        let remotes = [remote("origin", "git@gitlab.acme.com:team/app.git")];
+        let offers = offers(&remotes, none);
+        assert_eq!(
+            offers,
+            [Offer {
+                host: "gitlab.acme.com".to_owned(),
+                path: "team/app".to_owned(),
+                remote: "origin".to_owned(),
+                guess: Some(ServerKind::GitLab),
+            }]
+        );
+        // And nothing is hosted until the user answers.
+        assert_eq!(detect(&remotes, none), None);
+
+        // Once answered, whatever the answer, it is no longer offered.
+        for kind in [ServerKind::GitLab, ServerKind::GitHubEnterprise, ServerKind::Ignored] {
+            assert!(super::offers(&remotes, &servers(&[("gitlab.acme.com", kind)])).is_empty());
+        }
+
+        // origin unknown while a fork is on github.com: the fork is shown,
+        // and origin's server is still offered (it would take precedence).
+        let mixed = [remote("fork", "git@github.com:ada/app.git"), remote("origin", "https://code.acme.com/team/app")];
+        assert_eq!(detect(&mixed, none).unwrap().0, "fork");
+        let offered = super::offers(&mixed, none);
+        assert_eq!(offered.iter().map(|o| (o.host.as_str(), o.guess)).collect::<Vec<_>>(), [("code.acme.com", None)]);
+
+        // origin hosted: a mirror elsewhere is not worth a row.
+        let mirrored = [remote("origin", "git@github.com:octo/app.git"), remote("mirror", "git@code.acme.com:octo/app.git")];
+        assert!(super::offers(&mirrored, none).is_empty());
+
+        // Nothing hosted: every unknown server, once each.
+        let several = [
+            remote("origin", "E:/demo-origin.git"),
+            remote("a", "git@code.acme.com:team/app.git"),
+            remote("b", "https://code.acme.com/team/app.git"),
+            remote("c", "https://ghe.example.org/team/app.git"),
+        ];
+        let hosts: Vec<String> = super::offers(&several, none).into_iter().map(|o| o.host).collect();
+        assert_eq!(hosts, ["code.acme.com", "ghe.example.org"]);
+
+        // Services we cannot show, gists, local paths: no offer.
+        for url in [
+            "git@bitbucket.org:team/app.git",
+            "https://codeberg.org/team/app",
+            "https://dev.azure.com/org/project/_git/app",
+            "https://acme.visualstudio.com/project/_git/app",
+            "https://gist.github.com/ada/0123abcd",
+            "E:/demo-origin.git",
+            "/srv/git/app.git",
+            "file:///srv/git/app.git",
+        ] {
+            assert!(super::offers(&[remote("origin", url)], none).is_empty(), "{url}");
+        }
+
+        // Guesses never decide anything; they only pre-select.
+        for (host, expected) in [
+            ("gitlab.acme.com", Some(ServerKind::GitLab)),
+            ("gitlab-ce.acme.com", Some(ServerKind::GitLab)),
+            ("src.gitlab.acme.org", Some(ServerKind::GitLab)),
+            ("github.acme.com", Some(ServerKind::GitHubEnterprise)),
+            ("ghe.acme.com", Some(ServerKind::GitHubEnterprise)),
+            ("acme.ghe.com", Some(ServerKind::GitHubEnterprise)),
+            ("code.acme.com", None),
+            ("notgitlab.acme.com", None),
+        ] {
+            assert_eq!(guess(host), expected, "{host}");
+        }
+    }
+
+    #[test]
+    fn server_choices_are_kept_in_the_settings_and_survive_unknown_entries() {
+        let saved = servers(&[
+            ("git.acme.com", ServerKind::GitLab),
+            ("ghe.acme.com", ServerKind::GitHubEnterprise),
+            ("old.acme.com", ServerKind::Ignored),
+        ]);
+        let json = serde_json::to_string(&saved).unwrap();
+        assert_eq!(json, r#"{"ghe.acme.com":"github-enterprise","git.acme.com":"gitlab","old.acme.com":"ignored"}"#);
+        assert_eq!(serde_json::from_str::<Servers>(&json).unwrap(), saved);
+
+        // A kind from a later version reads as "do not contact".
+        let later: Servers = serde_json::from_str(r#"{"git.acme.com": "gitea"}"#).unwrap();
+        assert_eq!(later["git.acme.com"], ServerKind::Ignored);
+
+        // Settings written before this existed still load, with no servers.
+        let settings: crate::state::Settings = serde_json::from_str(r#"{"tree_view": true}"#).unwrap();
+        assert!(settings.tree_view && settings.hosting_servers.is_empty());
+        let settings: crate::state::Settings =
+            serde_json::from_str(r#"{"hosting_servers": {"git.acme.com": "gitlab"}}"#).unwrap();
+        assert_eq!(settings.hosting_servers["git.acme.com"], ServerKind::GitLab);
+    }
+
+    #[test]
+    fn each_service_speaks_its_own_words() {
+        assert_eq!(Service::GitLab.pulls_title(), "MERGE REQUESTS");
+        assert_eq!(Service::GitLab.ci_title(), "PIPELINES");
+        assert_eq!(Service::GitLab.pull_number(7), "!7");
+        assert_eq!(Service::GitHubEnterprise.pulls_title(), "PULL REQUESTS");
+        assert_eq!(Service::GitHubEnterprise.pull_number(7), "#7");
+        assert_eq!(pull_branch(Service::GitLab, 7), "mr/7");
+        assert_eq!(pull_branch(Service::GitHubEnterprise, 7), "pr/7");
+
+        assert_eq!(Problem::NotSignedIn.line(Service::GitLab), "Not signed in: private project");
+        assert_eq!(Problem::Unreachable("timed out".to_owned()).line(Service::GitLab), "GitLab unreachable: timed out");
+        let gitlab = Problem::NotSignedIn.detail(Service::GitLab);
+        assert!(gitlab.contains("GITLAB_TOKEN") && gitlab.contains("glab auth login") && gitlab.contains("projects"));
+        assert!(!gitlab.contains("GITHUB_TOKEN"));
+        let enterprise = Problem::SignInRejected.detail(Service::GitHubEnterprise);
+        assert!(enterprise.contains("GH_ENTERPRISE_TOKEN") && enterprise.contains("--hostname"));
+        assert!(!enterprise.contains("GITHUB_TOKEN,"));
+
+        assert_eq!(Auth::SignedIn(TokenSource::Cli).describe(Service::GitLab), "Signed in through the GitLab CLI");
+        assert_eq!(Auth::Anonymous.describe(Service::GitLab), "Not signed in: public projects only");
+        assert_eq!(Auth::SignedIn(TokenSource::Cli).describe(Service::GitHubEnterprise), "Signed in through the GitHub CLI");
+
+        let gitlab_com = at(Service::GitLab, "gitlab.com", "g", "a");
+        let own = at(Service::GitLab, "git.acme.com", "g", "a");
+        assert_eq!((gitlab_com.site(), own.site()), ("GitLab".to_owned(), "git.acme.com".to_owned()));
+        assert!(!gitlab_com.self_hosted() && own.self_hosted());
+
+        let cmd = checkout_pull("origin", Service::GitLab, 7, false);
+        assert_eq!(cmd.label, "Check out merge request !7");
+    }
+
+    // ---- which token goes where ----
+
+    fn gitlab_com() -> RepoId {
+        at(Service::GitLab, "gitlab.com", "group", "app")
+    }
+
+    fn own_gitlab() -> RepoId {
+        at(Service::GitLab, "git.acme.com", "team", "app")
+    }
+
+    fn enterprise() -> RepoId {
+        at(Service::GitHubEnterprise, "ghe.acme.com", "octo", "app")
+    }
+
+    fn found(fake: &Fake, repo: &RepoId) -> Option<(String, TokenSource)> {
+        find_token(fake, repo, &[]).map(|(token, source)| (token.0, source))
+    }
+
+    #[test]
+    fn github_com_tokens_never_go_to_an_enterprise_server_or_the_other_way_round() {
+        let everything = Fake {
+            env: vec![
+                ("GITHUB_TOKEN", SECRET),
+                ("GH_TOKEN", SECRET),
+                ("GITLAB_TOKEN", SECRET),
+                ("GH_ENTERPRISE_TOKEN", OTHER),
+            ],
+            ..Default::default()
+        };
+        // The Enterprise server gets the Enterprise variable, nothing else.
+        assert_eq!(found(&everything, &enterprise()), Some((OTHER.to_owned(), TokenSource::Env("GH_ENTERPRISE_TOKEN"))));
+        assert_eq!(everything.asked(), ["GH_HOST", "GH_ENTERPRISE_TOKEN"]);
+
+        // Without it: GITHUB_ENTERPRISE_TOKEN, then gh and git for that host.
+        let github_only = Fake { env: vec![("GITHUB_TOKEN", SECRET), ("GH_TOKEN", SECRET)], ..Default::default() };
+        assert_eq!(found(&github_only, &enterprise()), None);
+        assert_eq!(
+            github_only.asked(),
+            ["GH_HOST", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "gh ghe.acme.com", "git ghe.acme.com"]
+        );
+        let fallback = Fake { env: vec![("GITHUB_ENTERPRISE_TOKEN", OTHER)], ..Default::default() };
+        assert_eq!(found(&fallback, &enterprise()).unwrap().1, TokenSource::Env("GITHUB_ENTERPRISE_TOKEN"));
+
+        // github.com never reads the Enterprise variables.
+        let enterprise_only = Fake { env: vec![("GH_ENTERPRISE_TOKEN", OTHER)], ..Default::default() };
+        assert_eq!(found(&enterprise_only, &repo()), None);
+        assert_eq!(enterprise_only.asked(), ["GITHUB_TOKEN", "GH_TOKEN", "gh github.com", "git github.com"]);
+
+        // GH_HOST naming another server keeps the variable from this one.
+        let elsewhere = Fake { env: vec![("GH_HOST", "ghe.other.example"), ("GH_ENTERPRISE_TOKEN", OTHER)], ..Default::default() };
+        assert_eq!(found(&elsewhere, &enterprise()), None);
+        assert_eq!(elsewhere.asked(), ["GH_HOST", "gh ghe.acme.com", "git ghe.acme.com"]);
+        for value in ["ghe.acme.com", "GHE.acme.com", "https://ghe.acme.com/", "https://ghe.acme.com:443"] {
+            let here = Fake { env: vec![("GH_HOST", value), ("GH_ENTERPRISE_TOKEN", OTHER)], ..Default::default() };
+            assert_eq!(found(&here, &enterprise()).unwrap().0, OTHER, "{value}");
+        }
+    }
+
+    #[test]
+    fn gitlab_token_variables_belong_to_the_host_gitlab_host_names() {
+        // gitlab.com: GITLAB_TOKEN when GITLAB_HOST is unset or names it.
+        let plain = Fake { env: vec![("GITLAB_TOKEN", SECRET), ("GITHUB_TOKEN", OTHER)], ..Default::default() };
+        assert_eq!(found(&plain, &gitlab_com()), Some((SECRET.to_owned(), TokenSource::Env("GITLAB_TOKEN"))));
+        assert_eq!(plain.asked(), ["GITLAB_HOST", "GITLAB_TOKEN"]);
+        let named = Fake { env: vec![("GITLAB_HOST", "https://gitlab.com"), ("GITLAB_TOKEN", SECRET)], ..Default::default() };
+        assert_eq!(found(&named, &gitlab_com()).unwrap().0, SECRET);
+
+        // GITLAB_HOST names another server: the variable is that server's.
+        let theirs = Fake { env: vec![("GITLAB_HOST", "git.acme.com"), ("GITLAB_TOKEN", SECRET)], ..Default::default() };
+        assert_eq!(found(&theirs, &gitlab_com()), None);
+        assert_eq!(theirs.asked(), ["GITLAB_HOST", "glab gitlab.com", "git gitlab.com"]);
+        assert_eq!(found(&theirs, &own_gitlab()).unwrap().0, SECRET);
+
+        // A self-hosted server gets GITLAB_TOKEN only when GITLAB_HOST names it.
+        let unnamed = Fake { env: vec![("GITLAB_TOKEN", SECRET)], ..Default::default() };
+        assert_eq!(found(&unnamed, &own_gitlab()), None);
+        assert_eq!(unnamed.asked(), ["GITLAB_HOST", "glab git.acme.com", "git git.acme.com"]);
+        for value in ["git.acme.com.evil.example", "acme.com", "evil.example", "", "https://git.acme.com/gitlab"] {
+            let wrong = Fake { env: vec![("GITLAB_HOST", value), ("GITLAB_TOKEN", SECRET)], ..Default::default() };
+            assert_eq!(found(&wrong, &own_gitlab()), None, "{value}");
+        }
+        // With a port, the port is part of the name.
+        let ported = at(Service::GitLab, "git.acme.com:8443", "team", "app");
+        let host_only = Fake { env: vec![("GITLAB_HOST", "git.acme.com"), ("GITLAB_TOKEN", SECRET)], ..Default::default() };
+        assert_eq!(found(&host_only, &ported), None);
+        let with_port = Fake { env: vec![("GITLAB_HOST", "https://git.acme.com:8443"), ("GITLAB_TOKEN", SECRET)], ..Default::default() };
+        assert_eq!(found(&with_port, &ported).unwrap().0, SECRET);
+
+        // GitLab never reads GitHub's variables, nor GitHub GitLab's.
+        let github = Fake { env: vec![("GITHUB_TOKEN", SECRET), ("GH_TOKEN", SECRET), ("GH_ENTERPRISE_TOKEN", SECRET)], ..Default::default() };
+        assert_eq!(found(&github, &gitlab_com()), None);
+        assert!(github.asked().iter().all(|asked| !asked.contains("GH")));
+        let gitlab = Fake { env: vec![("GITLAB_TOKEN", SECRET)], ..Default::default() };
+        assert_eq!(found(&gitlab, &repo()), None);
+        assert_eq!(found(&gitlab, &enterprise()), None);
+    }
+
+    #[test]
+    fn the_cli_and_the_credential_helper_are_asked_about_the_repositorys_host_only() {
+        let tools = Fake { cli: Some("glpat-cli-token-123456"), helper: Some("helper-token-123456"), ..Default::default() };
+        assert_eq!(found(&tools, &own_gitlab()).unwrap().1, TokenSource::Cli);
+        assert_eq!(tools.asked(), ["GITLAB_HOST", "glab git.acme.com"]);
+
+        let helper = Fake { helper: Some("helper-token-123456"), ..Default::default() };
+        let ported = at(Service::GitLab, "git.acme.com:8443", "team", "app");
+        assert_eq!(found(&helper, &ported).unwrap().1, TokenSource::CredentialHelper);
+        assert_eq!(helper.asked(), ["GITLAB_HOST", "glab git.acme.com:8443", "git git.acme.com:8443"]);
+
+        // The commands themselves: one host, no token variables to fall back on.
+        let args = |cmd: &Command| cmd.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let removed = |cmd: &Command| {
+            cmd.get_envs().filter(|(_, value)| value.is_none()).map(|(name, _)| name.to_string_lossy().into_owned()).collect::<Vec<_>>()
+        };
+        let glab = cli_command(Service::GitLab, "git.acme.com");
+        assert_eq!(glab.get_program(), "glab");
+        assert_eq!(args(&glab), ["config", "get", "token", "--host", "git.acme.com"]);
+        for name in ["GITLAB_TOKEN", "GITLAB_ACCESS_TOKEN", "OAUTH_TOKEN", "GITLAB_HOST"] {
+            assert!(removed(&glab).contains(&name.to_owned()), "{name}");
+        }
+        let gh = cli_command(Service::GitHubEnterprise, "ghe.acme.com");
+        assert_eq!(gh.get_program(), "gh");
+        assert_eq!(args(&gh), ["auth", "token", "--hostname", "ghe.acme.com"]);
+        for name in ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN", "GH_HOST"] {
+            assert!(removed(&gh).contains(&name.to_owned()), "{name}");
+        }
+        assert_eq!(args(&cli_command(Service::GitHub, "github.com")), ["auth", "token", "--hostname", "github.com"]);
+        let git = credential_command(Path::new("."));
+        assert_eq!(args(&git), ["-c", "core.askPass=", "credential", "fill"]);
+        assert!(git.get_envs().any(|(name, value)| name == "GIT_TERMINAL_PROMPT" && value == Some(std::ffi::OsStr::new("0"))));
+    }
+
+    #[test]
+    fn the_wire_attaches_a_token_only_below_its_own_api() {
+        let token = Token::new(SECRET).unwrap();
+        let ask = |wire: &Wire, url: &str| wire.authorization(&HttpRequest { url, etag: None, token: Some(&token) });
+        let gitlab = Wire::new("https://git.acme.com/api/v4".to_owned(), gitlab::HEADERS);
+        assert_eq!(ask(&gitlab, "https://git.acme.com/api/v4/projects/team%2Fapp/merge_requests"), Some(format!("Bearer {SECRET}")));
+        for url in [
+            "https://git.acme.com/team/app",
+            "https://git.acme.com/api/v40/projects",
+            "https://git.acme.com/api/v4.evil.example/x",
+            "https://git.acme.com/api/v4@evil.example/x",
+            "https://git.acme.com/api/v4/\\@evil.example",
+            "https://git.acme.com/api/v4/ x",
+            "http://git.acme.com/api/v4/projects",
+            "https://git.acme.com.evil.example/api/v4/projects",
+            "https://gitlab.com/api/v4/projects",
+            "https://api.github.com/repos/octo/app",
+        ] {
+            assert_eq!(ask(&gitlab, url), None, "{url}");
+        }
+        // No token, no header; an API address that is not HTTPS never gets one.
+        assert_eq!(gitlab.authorization(&HttpRequest { url: "https://git.acme.com/api/v4/x", etag: None, token: None }), None);
+        let plain = Wire::new("http://git.acme.com/api/v4".to_owned(), gitlab::HEADERS);
+        assert_eq!(ask(&plain, "http://git.acme.com/api/v4/projects"), None);
+        let github = Wire::new(API.to_owned(), github::HEADERS);
+        assert!(ask(&github, "https://api.github.com/repos/octo/app/pulls").is_some());
+        assert_eq!(ask(&github, "https://ghe.acme.com/api/v3/repos/octo/app/pulls"), None);
+    }
+
+    #[test]
+    fn an_enterprise_server_is_asked_through_its_own_api_with_its_own_token() {
+        let sent = Log::default();
+        let moved = "https://ghe.acme.com/api/v3/repositories/42/pulls?state=open&per_page=30";
+        let transport = Script {
+            replies: vec![
+                reply(301, &[("location", moved)], ""),
+                reply(200, &[], PULLS),
+                reply(302, &[("location", "https://api.github.com/repos/octo/app/issues")], ""),
+                reply(502, &[], "<html>"),
+            ]
+            .into(),
+            sent: sent.clone(),
+        };
+        let secrets = Fake { env: vec![("GITHUB_TOKEN", SECRET), ("GH_ENTERPRISE_TOKEN", OTHER)], ..Default::default() };
+        let mut client = Client::new(enterprise(), Box::new(transport), Box::new(secrets));
+
+        assert!(matches!(client.pulls(NOW), Outcome::Fresh { ref items, .. } if items.len() == 2));
+        assert_eq!(client.auth(), Auth::SignedIn(TokenSource::Env("GH_ENTERPRISE_TOKEN")));
+        // A redirect to github.com is not followed from an Enterprise server.
+        assert_eq!(
+            failure(client.issues(NOW)),
+            Problem::Failed("GitHub Enterprise sent an unexpected redirect".to_owned())
+        );
+        assert_eq!(failure(client.runs(NOW)), Problem::Failed("GitHub Enterprise answered 502".to_owned()));
+
+        let sent = sent.lock().unwrap();
+        let urls: Vec<&str> = sent.iter().map(|request| request.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            [
+                "https://ghe.acme.com/api/v3/repos/octo/app/pulls?state=open&per_page=30",
+                moved,
+                "https://ghe.acme.com/api/v3/repos/octo/app/issues?state=open&per_page=50",
+                "https://ghe.acme.com/api/v3/repos/octo/app/actions/runs?per_page=20&exclude_pull_requests=true",
+            ]
+        );
+        assert!(sent.iter().all(|request| request.token.as_deref() == Some(OTHER)));
+    }
+
+    #[test]
+    fn gitlab_rate_limit_headers_are_understood() {
+        let reset = (NOW + 600).to_string();
+        let response = HttpResponse {
+            status: 429,
+            headers: vec![("ratelimit-remaining".to_owned(), "0".to_owned()), ("ratelimit-reset".to_owned(), reset)],
+            body: "Retry later".to_owned(),
+        };
+        let rate = Rate::of(&response);
+        assert_eq!(rate, Rate { remaining: Some(0), reset: Some(NOW + 600), retry_after: None });
+        assert_eq!(limited_until(429, &rate, "Retry later", 0, NOW), Some(NOW + 600));
+    }
+
+    #[test]
+    fn the_offline_fixture_serves_gitlab_endpoints_too() {
+        let dir = std::env::temp_dir().join("gitkrill-tests").join(format!("hosting-canned-gitlab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("merge_requests.json"), r#"[{"iid": 4, "title": "Speed up", "source_branch": "fast"}]"#).unwrap();
+        std::fs::write(dir.join("pipelines.json"), r#"[{"id": 9, "status": "running"}]"#).unwrap();
+
+        let mut client = gitlab::Client::new(own_gitlab(), Box::new(Canned { dir: dir.clone() }), Box::new(NoSecrets));
+        assert!(matches!(client.pulls(NOW), Outcome::Fresh { ref items, .. } if items[0].number == 4));
+        assert!(matches!(client.runs(NOW), Outcome::Fresh { ref items, .. } if items[0].state == RunState::Running));
+        // No issues.json: the project looks private.
+        assert_eq!(failure(client.issues(NOW)), Problem::NotSignedIn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_merge_request_is_checked_out_from_gitlabs_ref() {
+        use crate::tests::{Fixture, git};
+
+        let fx = Fixture::new("hosting-mr");
+        let origin = fx.dir.with_file_name(format!("hosting-mr-origin-{}.git", std::process::id()));
+        let _ = std::fs::remove_dir_all(&origin);
+        let origin_arg = origin.to_string_lossy().into_owned();
+        fx.write("a.txt", "base\n");
+        fx.commit_all("base");
+        git(&fx.dir, &["clone", "-q", "--bare", ".", &origin_arg]);
+        git(&fx.dir, &["remote", "add", "origin", &origin_arg]);
+
+        // GitLab keeps a merge request's head at refs/merge-requests/<iid>/head.
+        git(&fx.dir, &["checkout", "-q", "--detach"]);
+        fx.write("mr.txt", "one\n");
+        fx.commit_all("MR: first");
+        git(&fx.dir, &["push", "-q", "origin", "HEAD:refs/merge-requests/3/head"]);
+        let head = git(&fx.dir, &["rev-parse", "HEAD"]);
+        git(&fx.dir, &["checkout", "-q", "main"]);
+
+        let done = fx.run(checkout_pull("origin", Service::GitLab, 3, false));
+        assert_eq!(done.snap.head.branch.as_deref(), Some("mr/3"));
+        assert_eq!(done.snap.head.oid.unwrap().to_string(), head);
+        assert!(done.undo.is_some());
 
         drop(fx);
         let _ = std::fs::remove_dir_all(&origin);

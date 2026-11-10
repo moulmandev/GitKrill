@@ -82,6 +82,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                     if menu_item(ui, icons::COPY, "Copy URL") {
                         ui.ctx().copy_text(remote.url.clone());
                     }
+                    crate::ui::hosting::remote_menu(ui, shared, remote);
                 });
                 if collapsed && filter.is_empty() {
                     continue;
@@ -194,6 +195,18 @@ pub fn toggle(tab: &mut RepoTab, key: &str) {
 
 /// Collapsible section header. Returns whether the section is open.
 pub fn section(ui: &mut Ui, tab: &mut RepoTab, title: &str, icon: &str, shown: usize, total: usize) -> bool {
+    section_header(ui, tab, title, icon, shown, total).0
+}
+
+/// [`section`], also returning the header's response (for a context menu).
+pub fn section_header(
+    ui: &mut Ui,
+    tab: &mut RepoTab,
+    title: &str,
+    icon: &str,
+    shown: usize,
+    total: usize,
+) -> (bool, Response) {
     let key = format!("section:{title}");
     let open = !tab.collapsed.contains(&key);
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
@@ -216,7 +229,7 @@ pub fn section(ui: &mut Ui, tab: &mut RepoTab, title: &str, icon: &str, shown: u
     if response.clicked() {
         toggle(tab, &key);
     }
-    open
+    (open, response)
 }
 
 /// Allocates a full-width row and lets `paint` draw inside it. `x` is the
