@@ -24,6 +24,7 @@ pub struct App {
     saved_settings: String,
     window_title: String,
     shot: Option<crate::shot::Shot>,
+    palette: ui::palette::Palette,
 }
 
 impl App {
@@ -46,6 +47,7 @@ impl App {
             saved_settings: String::new(),
             window_title: String::new(),
             shot: crate::shot::Shot::from_env(),
+            palette: Default::default(),
         };
 
         for path in &settings.tabs {
@@ -188,6 +190,14 @@ impl App {
         let modal = self.shared.dialog.is_some();
         let pressed = |modifiers: Modifiers, key: Key| ctx.input_mut(|i| i.consume_key(modifiers, key));
 
+        if !modal && pressed(Modifiers::COMMAND, Key::P) {
+            self.palette.toggle(ctx);
+        }
+        // While it is open the palette has the keyboard, Escape included.
+        if self.palette.is_open() {
+            self.palette.take_keys(ctx);
+            return;
+        }
         if !modal && pressed(Modifiers::COMMAND, Key::O) {
             self.shared.actions.push(AppAction::OpenDialog);
         }
@@ -203,9 +213,7 @@ impl App {
             return;
         }
         if pressed(Modifiers::COMMAND, Key::F) {
-            tab.search_open = true;
-            tab.search_focus = true;
-            tab.diff = None;
+            ui::graph::open_search(tab);
         }
         if pressed(Modifiers::NONE, Key::F5) {
             tab.refresh();
@@ -240,7 +248,7 @@ impl App {
     }
 
     fn menu_bar(&mut self, ui: &mut Ui) {
-        let App { tabs, active, shared, .. } = self;
+        let App { tabs, active, shared, palette, .. } = self;
         egui::containers::menu::MenuBar::new().ui(ui, |ui| {
             ui.spacing_mut().button_padding = vec2(8.0, 3.0);
             ui.menu_button("File", |ui| {
@@ -249,7 +257,7 @@ impl App {
                     shared.actions.push(AppAction::OpenDialog);
                 }
                 if ui.button("Clone Repository…").clicked() {
-                    shared.show(Dialog::Clone { url: String::new(), dest: ui::toolbar::default_clone_dir() });
+                    shared.show(ui::toolbar::clone_dialog());
                 }
                 if ui.button("Init Repository…").clicked() {
                     shared.actions.push(AppAction::InitDialog);
@@ -286,27 +294,28 @@ impl App {
                 ui.checkbox(&mut shared.settings.hosting_integration, "Show GitHub pull requests, issues and Actions");
                 if let Some(tab) = tabs.get_mut(*active) {
                     if ui.add(egui::Button::new("Search Commits").shortcut_text("Ctrl+F")).clicked() {
-                        tab.search_open = true;
-                        tab.search_focus = true;
-                        tab.diff = None;
+                        ui::graph::open_search(tab);
                     }
                     if ui.add(egui::Button::new("Refresh").shortcut_text("F5")).clicked() {
                         tab.refresh();
                     }
                 }
                 ui.separator();
-                let zoom = ui.ctx().zoom_factor();
                 if ui.add(egui::Button::new("Zoom In").shortcut_text("Ctrl++")).clicked() {
-                    ui.ctx().set_zoom_factor((zoom + 0.1).min(3.0));
+                    zoom(ui.ctx(), Zoom::In);
                 }
                 if ui.add(egui::Button::new("Zoom Out").shortcut_text("Ctrl+-")).clicked() {
-                    ui.ctx().set_zoom_factor((zoom - 0.1).max(0.5));
+                    zoom(ui.ctx(), Zoom::Out);
                 }
                 if ui.add(egui::Button::new("Reset Zoom").shortcut_text("Ctrl+0")).clicked() {
-                    ui.ctx().set_zoom_factor(1.0);
+                    zoom(ui.ctx(), Zoom::Reset);
                 }
             });
             ui.menu_button("Help", |ui| {
+                ui.set_min_width(200.0);
+                if ui.add(egui::Button::new("Command Palette").shortcut_text("Ctrl+P")).clicked() {
+                    palette.open(ui.ctx());
+                }
                 if ui.button("About GitKrill").clicked() {
                     shared.show(Dialog::About);
                 }
@@ -453,7 +462,7 @@ impl App {
                 self.shared.actions.push(AppAction::OpenDialog);
             }
             if ui.add(big(format!("{}   Clone repository", icons::CLOUD_ARROW_DOWN))).clicked() {
-                self.shared.show(Dialog::Clone { url: String::new(), dest: ui::toolbar::default_clone_dir() });
+                self.shared.show(ui::toolbar::clone_dialog());
             }
             if ui.add(big(format!("{}   Init repository", icons::PLUS))).clicked() {
                 self.shared.actions.push(AppAction::InitDialog);
@@ -474,6 +483,22 @@ impl App {
             }
         });
     }
+}
+
+pub enum Zoom {
+    In,
+    Out,
+    Reset,
+}
+
+/// View > Zoom In / Zoom Out / Reset Zoom.
+pub fn zoom(ctx: &egui::Context, how: Zoom) {
+    let factor = match how {
+        Zoom::In => (ctx.zoom_factor() + 0.1).min(3.0),
+        Zoom::Out => (ctx.zoom_factor() - 0.1).max(0.5),
+        Zoom::Reset => 1.0,
+    };
+    ctx.set_zoom_factor(factor);
 }
 
 impl eframe::App for App {
@@ -551,6 +576,7 @@ impl eframe::App for App {
                 .show(ui, |ui| self.welcome(ui));
         }
 
+        self.palette.show(&ctx, &mut self.tabs, self.active, &mut self.shared);
         ui::dialogs::show(&ctx, &mut self.shared, self.tabs.get_mut(self.active));
         ui::dialogs::toasts(&ctx, &mut self.shared, self.tabs.get(self.active));
 

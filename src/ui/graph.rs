@@ -976,6 +976,13 @@ pub fn discard_all_dialog(snap: &RepoSnapshot) -> Dialog {
     )
 }
 
+/// Opens the search bar above the graph with the cursor in it (Ctrl+F).
+pub fn open_search(tab: &mut RepoTab) {
+    tab.search_open = true;
+    tab.search_focus = true;
+    tab.diff = None;
+}
+
 fn search_bar(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot) {
     // Recompute matches only when the query or the history changes.
     let query = tab.search.trim().to_lowercase();

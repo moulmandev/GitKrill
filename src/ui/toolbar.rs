@@ -31,7 +31,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                     shared.actions.push(AppAction::OpenDialog);
                 }
                 if menu_item(ui, icons::CLOUD_ARROW_DOWN, "Clone repository…") {
-                    shared.show(Dialog::Clone { url: String::new(), dest: default_clone_dir() });
+                    shared.show(clone_dialog());
                 }
                 if menu_item(ui, icons::FOLDER_SIMPLE, "Show in file manager") {
                     platform::reveal(&tab.path);
@@ -113,7 +113,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                 "Pull from the upstream branch"
             };
             if tool_button(ui, "Pull", icons::ARROW_LINE_DOWN, has_remote && on_branch, tab.is_running("Pull") || tab.is_running("Fetch"), pull_tip).clicked() {
-                tab.run(ops::pull(PullMode::Default));
+                pull(tab, PullMode::Default);
             }
             let (caret, response) = ui.allocate_exact_size(vec2(14.0, BUTTON.y), Sense::click());
             if response.hovered() {
@@ -129,17 +129,17 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
             Popup::menu(&response).show(|ui| {
                 ui.set_min_width(230.0);
                 if menu_item(ui, icons::ARROWS_CLOCKWISE, "Fetch all") {
-                    tab.run(ops::fetch_all());
+                    fetch(tab);
                 }
                 ui.separator();
                 if menu_item(ui, icons::ARROW_LINE_DOWN, "Pull (fast-forward if possible)") {
-                    tab.run(ops::pull(PullMode::Default));
+                    pull(tab, PullMode::Default);
                 }
                 if menu_item(ui, icons::ARROW_LINE_DOWN, "Pull (fast-forward only)") {
-                    tab.run(ops::pull(PullMode::FastForwardOnly));
+                    pull(tab, PullMode::FastForwardOnly);
                 }
                 if menu_item(ui, icons::ARROW_LINE_DOWN, "Pull (rebase)") {
-                    tab.run(ops::pull(PullMode::Rebase));
+                    pull(tab, PullMode::Rebase);
                 }
             });
 
@@ -150,22 +150,14 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
             } else {
                 "Push to the upstream branch (right-click to force)"
             };
-            let push = tool_button(ui, "Push", icons::ARROW_LINE_UP, has_remote && on_branch, tab.is_running("Push") || tab.is_running("Force push"), push_tip);
-            if push.clicked()
-                && let Some(cmd) = push_cmd(tab, false) {
-                    tab.run(cmd);
+            let push_button = tool_button(ui, "Push", icons::ARROW_LINE_UP, has_remote && on_branch, tab.is_running("Push") || tab.is_running("Force push"), push_tip);
+            if push_button.clicked() {
+                push(tab);
+            }
+            push_button.context_menu(|ui| {
+                if menu_item(ui, icons::WARNING, "Force push (with lease)") {
+                    force_push(tab, shared);
                 }
-            push.context_menu(|ui| {
-                if menu_item(ui, icons::WARNING, "Force push (with lease)")
-                    && let Some(cmd) = push_cmd(tab, true) {
-                        shared.show(Dialog::confirm(
-                            "Force push",
-                            "Overwrite the remote branch with your local history? Commits that \
-                             exist only on the remote will be lost.",
-                            "Force push",
-                            cmd,
-                        ));
-                    }
             });
             ui.add_space(8.0);
 
@@ -173,10 +165,10 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                 shared.show(new_branch_dialog());
             }
             if tool_button(ui, "Stash", icons::TRAY_ARROW_DOWN, dirty, tab.is_running("Stash changes"), "Stash all changes").clicked() {
-                tab.run(ops::stash_push(""));
+                stash(tab);
             }
             if tool_button(ui, "Pop", icons::TRAY_ARROW_UP, has_stash, tab.is_running("Pop stash"), "Apply and remove the latest stash").clicked() {
-                tab.run(ops::stash_pop(0));
+                pop_stash(tab);
             }
 
             let (sep, _) = ui.allocate_exact_size(vec2(13.0, BUTTON.y), Sense::hover());
@@ -212,6 +204,47 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
 
 pub fn new_branch_dialog() -> Dialog {
     Dialog::CreateBranch { at: None, at_label: "HEAD".to_owned(), name: String::new(), checkout: true }
+}
+
+pub fn clone_dialog() -> Dialog {
+    Dialog::Clone { url: String::new(), dest: default_clone_dir() }
+}
+
+// What the buttons do, as functions so the command palette runs the same code.
+
+pub fn fetch(tab: &mut RepoTab) {
+    tab.run(ops::fetch_all());
+}
+
+pub fn pull(tab: &mut RepoTab, mode: PullMode) {
+    tab.run(ops::pull(mode));
+}
+
+pub fn push(tab: &mut RepoTab) {
+    if let Some(cmd) = push_cmd(tab, false) {
+        tab.run(cmd);
+    }
+}
+
+/// Asks first: commits that exist only on the remote are lost.
+pub fn force_push(tab: &mut RepoTab, shared: &mut Shared) {
+    if let Some(cmd) = push_cmd(tab, true) {
+        shared.show(Dialog::confirm(
+            "Force push",
+            "Overwrite the remote branch with your local history? Commits that \
+             exist only on the remote will be lost.",
+            "Force push",
+            cmd,
+        ));
+    }
+}
+
+pub fn stash(tab: &mut RepoTab) {
+    tab.run(ops::stash_push(""));
+}
+
+pub fn pop_stash(tab: &mut RepoTab) {
+    tab.run(ops::stash_pop(0));
 }
 
 pub fn default_clone_dir() -> String {

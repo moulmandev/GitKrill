@@ -93,6 +93,8 @@ Wayland; nothing else has to be installed.
 - Multiple repositories in tabs, restored on start; drop a folder to open it
 - Clone and init
 - Open a terminal in the repository
+- Command palette (`Ctrl+P`): type a few letters of any action, branch, tag,
+  repository or commit SHA and press Enter
 
 Right-click almost anything (commits, labels, branches, tags, stashes, files,
 pull requests) for the relevant actions. Double-click a branch to check it out.
@@ -112,6 +114,7 @@ Three features talk to the network on their own. Each has a switch in the
 
 | Key | Action |
 | --- | --- |
+| `Ctrl+P` | Command palette |
 | `Ctrl+O` | Open repository |
 | `Ctrl+W` | Close tab |
 | `Ctrl+Tab` | Next tab |
@@ -119,7 +122,7 @@ Three features talk to the network on their own. Each has a switch in the
 | `Ctrl+Enter` | Commit (from the message fields); start an interactive rebase |
 | `Up` / `Down` | Previous / next commit |
 | `F5` | Refresh |
-| `Esc` | Close the current view, then the diff, then the search bar |
+| `Esc` | Close the command palette, the current view, then the diff, then the search bar |
 | `Ctrl` `+` / `-` / `0` | Zoom |
 
 ## How it is built
@@ -164,6 +167,7 @@ src/
     conflict.rs  conflict resolver   rebase.rs   interactive rebase
     history.rs   file history, blame
     toolbar.rs   toolbar             dialogs.rs  modals and toasts
+    palette.rs   command palette (Ctrl+P)
     widgets.rs   shared widgets
   shot.rs        scripted screenshots for development
   tests.rs       end-to-end backend tests against real temp repositories
