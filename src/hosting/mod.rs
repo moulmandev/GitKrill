@@ -27,8 +27,13 @@
 //! (see `Canned`) and no token is looked for, so screenshots of every state
 //! can be taken offline. Opening a pull request is answered from
 //! `create.json`; an empty file named `signed-in` stands in for a sign-in.
+//! The accounts in Preferences > Integrations ([`account`]) are answered
+//! from `user.json` and `keys.json` the same way.
+//!
+//! An account the user disconnected there ([`Disconnected`]) is not
+//! signed in to: its repositories are asked about without a token.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -163,6 +168,12 @@ impl From<ServerKind> for &'static str {
 /// the user said each one is. Kept in the settings; a host that is not in
 /// here, and is not github.com or gitlab.com, is never sent anything.
 pub type Servers = BTreeMap<String, ServerKind>;
+
+/// Hosts (written as [`RepoId::host`] is) whose sign-in GitKrill does not
+/// use, because the user disconnected the account in Preferences >
+/// Integrations. Kept in the settings. The sign-in itself is left alone:
+/// git and other tools keep using it.
+pub type Disconnected = BTreeSet<String>;
 
 /// A repository on a hosting service, as named by a remote URL.
 ///
@@ -1456,8 +1467,9 @@ pub struct NewPull {
 }
 
 /// The backend for `repo`: its service's client, talking to that service's
-/// API with tokens looked up for its host.
-fn connect(repo: &RepoId, workdir: &Path) -> Box<dyn Backend> {
+/// API with tokens looked up for its host, or with none at all when the
+/// account there is `signed_out` (see [`Disconnected`]).
+fn connect(repo: &RepoId, workdir: &Path, signed_out: bool) -> Box<dyn Backend> {
     let (transport, secrets): (Box<dyn Transport>, Box<dyn Secrets>) =
         match std::env::var_os("GITKRILL_HOSTING_FIXTURE") {
             Some(dir) => {
@@ -1474,6 +1486,7 @@ fn connect(repo: &RepoId, workdir: &Path) -> Box<dyn Backend> {
                 (Box::new(Wire::new(repo.api_base(), headers)), Box::new(System::new(workdir)))
             }
         };
+    let secrets = signed_out_secrets(signed_out, secrets);
     match repo.service {
         Service::GitHub | Service::GitHubEnterprise => {
             Box::new(github::Client::new(repo.clone(), transport, secrets))
@@ -1482,6 +1495,12 @@ fn connect(repo: &RepoId, workdir: &Path) -> Box<dyn Backend> {
     }
 }
 
+/// No sign-in at all for an account the user disconnected; else `secrets`.
+fn signed_out_secrets(signed_out: bool, secrets: Box<dyn Secrets>) -> Box<dyn Secrets> {
+    if signed_out { Box::new(NoSecrets) } else { secrets }
+}
+
+pub mod account;
 pub mod github;
 pub mod gitlab;
 
@@ -1607,6 +1626,9 @@ pub struct Shown {
     pub remote: String,
     pub repo: RepoId,
     pub view: Arc<View>,
+    /// The account on the repository's host is disconnected ([`Disconnected`]):
+    /// no sign-in is used, whatever is found.
+    pub disconnected: bool,
 }
 
 /// A running integration: one repository, one background thread.
@@ -1627,6 +1649,8 @@ struct Session {
     /// A pull request was opened during a refresh round: refresh once more
     /// when it ends, so the list has it for certain.
     refresh_after: bool,
+    /// Started without a sign-in, the account being disconnected.
+    signed_out: bool,
 }
 
 impl Drop for Session {
@@ -1662,6 +1686,7 @@ impl Session {
             created: Vec::new(),
             last_id: 0,
             refresh_after: false,
+            signed_out: false,
         };
         session.request(false);
         session
@@ -1767,13 +1792,15 @@ impl HostingState {
     /// Returns `None`, having made no request, when the integration is
     /// switched off or no remote points at a known service: github.com,
     /// gitlab.com, or a server in `servers` the user said runs GitHub
-    /// Enterprise or GitLab.
+    /// Enterprise or GitLab. A repository on a host in `disconnected` is
+    /// shown without a sign-in.
     pub fn sync(
         &mut self,
         ctx: &egui::Context,
         workdir: &Path,
         remotes: &[RemoteInfo],
         servers: &Servers,
+        disconnected: &Disconnected,
         enabled: bool,
     ) -> Option<Shown> {
         let wake = {
@@ -1782,11 +1809,54 @@ impl HostingState {
         };
         // Only poll while someone is looking at the window.
         let attended = ctx.input(|input| input.focused);
-        let shown = self.sync_with(remotes, servers, enabled, attended, |repo| connect(repo, workdir), wake);
+        let connect = |repo: &RepoId, signed_out: bool| connect(repo, workdir, signed_out);
+        let shown = self.sync_accounts(remotes, servers, disconnected, enabled, attended, connect, wake);
         if let Some(due) = self.session.as_ref().and_then(|session| session.next_auto)
             && attended
         {
             ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
+        }
+        shown
+    }
+
+    /// [`HostingState::sync_with`], in step with the accounts disconnected
+    /// in Preferences > Integrations: a session runs signed out exactly when
+    /// its host is in `disconnected`, and starts over when that changes.
+    /// `connect` is told whether to sign in.
+    #[allow(clippy::too_many_arguments)]
+    fn sync_accounts(
+        &mut self,
+        remotes: &[RemoteInfo],
+        servers: &Servers,
+        disconnected: &Disconnected,
+        enabled: bool,
+        attended: bool,
+        connect: impl FnOnce(&RepoId, bool) -> Box<dyn Backend>,
+        wake: impl Fn() + Send + 'static,
+    ) -> Option<Shown> {
+        let signed_out = |repo: &RepoId| disconnected.contains(&repo.host);
+        if self.session.as_ref().is_some_and(|session| session.signed_out != signed_out(&session.repo)) {
+            // Dropping the session stops its thread.
+            self.session = None;
+        }
+        let mut started = None;
+        let mut shown = self.sync_with(
+            remotes,
+            servers,
+            enabled,
+            attended,
+            |repo| {
+                let out = signed_out(repo);
+                started = Some(out);
+                connect(repo, out)
+            },
+            wake,
+        );
+        if let (Some(out), Some(session)) = (started, &mut self.session) {
+            session.signed_out = out;
+        }
+        if let (Some(shown), Some(session)) = (&mut shown, &self.session) {
+            shown.disconnected = session.signed_out;
         }
         shown
     }
@@ -1822,6 +1892,7 @@ impl HostingState {
             remote: session.remote.clone(),
             repo: session.repo.clone(),
             view: session.view.clone(),
+            disconnected: session.signed_out,
         })
     }
 
@@ -1836,7 +1907,12 @@ impl HostingState {
     /// it is: what "Create pull request" works with.
     pub fn connected(&self) -> Option<Shown> {
         let session = self.session.as_ref()?;
-        Some(Shown { remote: session.remote.clone(), repo: session.repo.clone(), view: session.view.clone() })
+        Some(Shown {
+            remote: session.remote.clone(),
+            repo: session.repo.clone(),
+            view: session.view.clone(),
+            disconnected: session.signed_out,
+        })
     }
 
     /// Takes in what the background thread has produced, without the rest
@@ -3675,6 +3751,59 @@ mod tests {
         // Asking again does not hang or panic either.
         state.refresh();
         assert!(!settle(&mut state, &hosted()).view.busy);
+    }
+
+    #[test]
+    fn a_disconnected_account_is_never_signed_in_to() {
+        // Whatever sign-in is around, the backend of a disconnected host
+        // sends no token and reports itself signed out.
+        let sent = Log::default();
+        let transport = Script { replies: vec![reply(200, &[], PULLS)].into(), sent: sent.clone() };
+        let mut client = Client::new(repo(), Box::new(transport), signed_out_secrets(true, Box::new(with_token())));
+        assert!(matches!(client.pulls(NOW), Outcome::Fresh { .. }));
+        assert_eq!(client.auth(), Auth::Anonymous);
+        assert_eq!(sent.lock().unwrap()[0].token, None);
+
+        // Connected, the same sign-in is used.
+        let transport = Script { replies: vec![reply(200, &[], PULLS)].into(), sent: sent.clone() };
+        let mut client = Client::new(repo(), Box::new(transport), signed_out_secrets(false, Box::new(with_token())));
+        assert!(matches!(client.pulls(NOW), Outcome::Fresh { .. }));
+        assert_eq!(client.auth(), Auth::SignedIn(TokenSource::Env("GITHUB_TOKEN")));
+        assert_eq!(sent.lock().unwrap()[1].token.as_deref(), Some(SECRET));
+    }
+
+    #[test]
+    fn disconnecting_or_connecting_an_account_starts_the_session_over() {
+        let mut state = HostingState::default();
+        let mut out = Disconnected::new();
+        out.insert("github.com".to_owned());
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let connect = |starts: &Arc<Mutex<Vec<bool>>>| {
+            let starts = starts.clone();
+            move |_: &RepoId, signed_out: bool| -> Box<dyn Backend> {
+                starts.lock().unwrap().push(signed_out);
+                Box::new(Stub::default())
+            }
+        };
+
+        // Disconnected: started signed out, and shown as such.
+        let shown = state.sync_accounts(&hosted(), &NO_SERVERS, &out, true, false, connect(&starts), || {}).unwrap();
+        assert!(shown.disconnected);
+        assert!(state.connected().unwrap().disconnected);
+        // Nothing changed: the same session goes on.
+        state.sync_accounts(&hosted(), &NO_SERVERS, &out, true, false, connect(&starts), || {});
+        assert_eq!(*starts.lock().unwrap(), [true]);
+
+        // Connected again: a new session that may sign in.
+        out.clear();
+        let shown = state.sync_accounts(&hosted(), &NO_SERVERS, &out, true, false, connect(&starts), || {}).unwrap();
+        assert!(!shown.disconnected);
+        assert_eq!(*starts.lock().unwrap(), [true, false]);
+
+        // Another host's account changes nothing here.
+        out.insert("gitlab.com".to_owned());
+        state.sync_accounts(&hosted(), &NO_SERVERS, &out, true, false, connect(&starts), || {});
+        assert_eq!(*starts.lock().unwrap(), [true, false]);
     }
 
     // ---- checking out a pull request, against a real repository ----

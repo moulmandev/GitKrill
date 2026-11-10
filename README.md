@@ -189,7 +189,7 @@ in the **Help** menu, the others in the **View** menu.
 | Feature | What is sent | Where |
 | --- | --- | --- |
 | Author pictures | SHA-256 of each author's email address, or the GitHub user id from a `noreply` address | gravatar.com, avatars.githubusercontent.com |
-| Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, and the requests you open, with a token when one is found for that host (below) | api.github.com, gitlab.com, and only the servers you connected |
+| Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, and the requests you open, with a token when one is found for that host (below). While Preferences > Integrations shows an account: whose token it is, its SSH keys, and the public keys you add there | api.github.com, gitlab.com, and only the servers you connected |
 | Automatic fetch | `git fetch --prune --all` (without `--prune` when Auto-Prune is off), as you would run it | your remotes |
 | Updates | A request for the latest release shortly after start and every six hours; the download when there is a newer one | api.github.com, github.com and its download host |
 
@@ -208,6 +208,11 @@ host's API over HTTPS. They are never stored, logged or shown.
 A github.com token never goes to an Enterprise server, nor the other way
 round. `gh` and `glab` are run without the token variables, so they answer
 with what they keep for that exact host.
+
+Preferences > Integrations shows which sign-in was found for each host and
+the account it belongs to. **Disconnect** there makes GitKrill stop using it
+(the host is listed in `hosting_disconnected` in the settings) without
+erasing it: git and the other tools keep their sign-in.
 
 ## Shortcuts
 
@@ -252,7 +257,8 @@ src/
   avatars.rs     author pictures: fetch, disk cache, textures
   update.rs      checking for, downloading and applying updates
   hosting/       pull / merge requests, issues and CI: github.rs (GitHub
-                 and Enterprise), gitlab.rs, shared sign-in and network
+                 and Enterprise), gitlab.rs, shared sign-in and network;
+                 account.rs: the accounts and their SSH keys
   git/
     repo.rs      snapshot loading (refs, status, history walk)
     graph.rs     lane layout and line colours
