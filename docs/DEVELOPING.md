@@ -91,10 +91,6 @@ front, and the global and repository git configuration files.
   `prefs::appearance::custom_date`, so they follow Preferences > UI
   Customization > Date/Time Short Format; do not call chrono's `format`
   for a date shown to the user.
-- In a text field that keeps what is typed aside until it loses focus, ask
-  `ui.memory(|m| m.has_focus(response.id))`: `response.has_focus()` is also
-  false while the window is in the background (and always in scripted
-  screenshot runs), which would drop what was typed.
 
 ## Conventions
 
