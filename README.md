@@ -128,6 +128,17 @@ be installed.
   the commits, the branch is pushed first when the remote lacks it, and
   "Open on GitHub" (or GitLab) works without signing in
 
+**Profiles, SSH and signing** (File > Preferences)
+- Profiles: an author name and email, an SSH key and signing settings each;
+  switch from the menu at the right of the tab strip or the command palette
+  ("Switch to profile ..."). Your global `.gitconfig` follows the profile
+  in use, or, with that option off, only GitKrill's own git commands do
+- SSH: your system's agent, or a key of the profile's own; generate an
+  ed25519 key pair and copy its public key
+- Commit and tag signing with OpenPGP, SSH or X.509 keys: pick a secret key
+  from GnuPG, generate a new 4096-bit one, sign by default
+- The commit panel shows who the next commit will be by
+
 **Shell**
 - Multiple repositories in tabs, restored on start; drop a folder to open it
 - Folders of repositories (workspaces): pick a parent folder once (**File >
@@ -266,7 +277,8 @@ build.rs         the Windows executable's icon and version details
   its two side panes cannot be selected (the result can, in its editor)
 - Syntax grammars are syntect's bundled set: TypeScript is coloured as
   JavaScript, and Kotlin, Swift, Dart and PowerShell stay plain
-- SSH keys with a passphrase need an agent; there is no passphrase prompt
+- SSH and GPG keys with a passphrase need an agent that already holds them
+  (ssh-agent, gpg-agent); there is no passphrase prompt
 - Submodule management, worktrees, Git LFS controls; SVG changes show as text
 
 ## License

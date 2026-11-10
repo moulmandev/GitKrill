@@ -9,7 +9,7 @@ use eframe::egui::{
 };
 
 use crate::git::{DiffSource, Oid, RepoSnapshot, RepoState, RowKind, ops, short};
-use crate::state::{RepoTab, Selection, Shared, format_time, relative_time};
+use crate::state::{RepoTab, Selection, Settings, Shared, format_time, relative_time};
 use crate::theme::{self, icons};
 use crate::ui::files::{self, file_list};
 use crate::ui::graph::discard_all_dialog;
@@ -31,7 +31,7 @@ fn working_tree(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<
         .resizable(false)
         .show_separator_line(false)
         .frame(Frame::new().fill(theme::bg_app()).inner_margin(Margin::same(10)))
-        .show(ui, |ui| commit_box(ui, tab, snap));
+        .show(ui, |ui| commit_box(ui, tab, &shared.settings, snap));
 
     egui::CentralPanel::default().frame(Frame::new().fill(theme::bg_app())).show(ui, |ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -158,7 +158,7 @@ fn operation_banner(ui: &mut Ui, tab: &mut RepoTab, state: RepoState, label: &st
     ui.add_space(4.0);
 }
 
-fn commit_box(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot) {
+fn commit_box(ui: &mut Ui, tab: &mut RepoTab, settings: &Settings, snap: &RepoSnapshot) {
     ui.spacing_mut().item_spacing.y = 6.0;
 
     ui.horizontal(|ui| {
@@ -185,6 +185,7 @@ fn commit_box(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot) {
             .desired_rows(4)
             .desired_width(f32::INFINITY),
     );
+    crate::ui::prefs::profiles::commit_author(ui, tab, settings);
 
     let staged = snap.status.staged.len();
     let unstaged = snap.status.unstaged.len();

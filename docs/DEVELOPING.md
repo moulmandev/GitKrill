@@ -36,7 +36,8 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Persist a preference | Add a field to your area's struct in `src/prefs/<area>.rs` (held by `Settings::<area>`; per repository: `RepoPrefs` via `prefs::repo` / `prefs::repo_mut`); it is saved automatically. Older top-level fields of `Settings` stay where they are. |
 | Show a preference | Its section's page in `src/ui/prefs/<section>.rs` (see "Preferences" below). |
 | Read or change git's configuration | `crate::prefs::gitconfig`: `page.global` / `page.repo` on a preferences page (`get`, `get_bool`, `set`, `set_bool`; read in the background, written through `git config`); `gitconfig::read` / `write` / `effective` from background code. |
-| Give every git command an environment variable | `git::cli::set_session_env` (the SSH key and author of the profile in use). |
+| Give every git command an environment variable | `git::cli::set_session_env` (the SSH key and author of the profile in use). It replaces the whole set and `prefs::identity::apply` owns it: add what you need to `identity::session_env` rather than calling it from elsewhere. |
+| Know who commits | `prefs::identity`: `settings.identity.current()` is the profile in use; `identity::generation()` changes whenever the identity git commands get may have changed (ask git again then, as `ui::prefs::profiles::commit_author` does). |
 | Do network or other non-repository background work | Spawn your own thread, send results over a channel, call `ctx.request_repaint()` when something arrives, and poll the channel from your UI code. Never block in UI code. |
 
 `tab.jump_to(oid)` selects a commit and scrolls the graph to it.
@@ -182,6 +183,15 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   installed|portable|browser` to pick the flow. Screenshot runs only check
   against such a feed, and print instead of restarting. A portable run
   really replaces the executable it runs as: point `BIN` at a copy.
+- To try commit signing, give the run a throwaway GnuPG home: `export
+  MSYS2_ENV_CONV_EXCL=GNUPGHOME GNUPGHOME=/c/Users/<you>/AppData/Local/Temp/<area>/gnupg`
+  (Git for Windows' gpg only reads the `/c/...` form, and Git Bash would
+  rewrite it to `C:/...` for the app without the first variable). Start
+  its agent first, detached (`gpgconf --launch gpg-agent </dev/null
+  >/dev/null 2>&1`): one started by the app inherits the run's output pipe
+  and keeps a `| tail` waiting. Stop it afterwards with `gpgconf --kill
+  gpg-agent`. SSH keys made from Preferences > SSH go to
+  `<GITKRILL_CONFIG_DIR>/ssh` during runs, never `~/.ssh`.
 - Folder dialogs cannot be clicked through by a script: with
   `GITKRILL_SHOT_FOLDER=<dir>` set, "Add a folder of repositories" picks
   `<dir>` instead of asking. Workspaces can also be put straight into the
