@@ -15,7 +15,7 @@ dirs = "7.0.0"
 eframe = { version = "0.36", default-features = false, features = ["glow", "default_fonts"] }
 egui-phosphor = "0.14.0"
 git2 = { version = "0.21.0", default-features = false, features = ["vendored-libgit2"] }
-image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "webp"] }
 notify = "8"
 rfd = "0.18.0"
 serde = { version = "1.0.229", features = ["derive"] }

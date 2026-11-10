@@ -11,6 +11,7 @@ pub mod conflict;
 pub mod diff;
 pub mod graph;
 pub mod ops;
+pub mod picture;
 pub mod rebase;
 pub mod repo;
 pub mod text;
@@ -299,6 +300,8 @@ pub struct FileDiff {
     pub old_path: Option<String>,
     /// Longest line in characters, for sizing the horizontal scroll area.
     pub max_chars: usize,
+    /// Both versions of a binary image file, decoded for the preview.
+    pub images: Option<std::sync::Arc<picture::ImageDiff>>,
 }
 
 impl FileDiff {

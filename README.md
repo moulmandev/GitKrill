@@ -66,6 +66,9 @@ Wayland; nothing else has to be installed.
 - Unstaged / staged lists as paths or a folder tree
 - Stage, unstage and discard files, folders, hunks or individual lines
 - Syntax-highlighted diffs with word-level emphasis of what changed
+- Image previews for PNG, JPEG, GIF, BMP, WebP and ICO: before and after
+  side by side, a swipe between them, or an onion skin, with sizes and
+  dimensions; tiny icons are enlarged with sharp pixels
 - Select and copy text in diffs and blame as in an editor: drag, double-click
   a word, triple-click a line, Shift+click to extend. Copies leave out line
   numbers and +/- markers and keep tabs as tabs; picking lines to stage is
@@ -227,7 +230,7 @@ tools/           demo repository and screenshot scripts
 - Syntax grammars are syntect's bundled set: TypeScript is coloured as
   JavaScript, and Kotlin, Swift, Dart and PowerShell stay plain
 - SSH keys with a passphrase need an agent; there is no passphrase prompt
-- Image diffs, submodule management, worktrees, Git LFS controls
+- Submodule management, worktrees, Git LFS controls; SVG changes show as text
 
 ## License
 

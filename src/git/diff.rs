@@ -4,6 +4,7 @@
 use git2::{DiffFindOptions, DiffFormat, DiffOptions};
 
 use super::repo::{Loader, delta_kind, lossy};
+use super::picture;
 use super::text::{display_text, source_text};
 use super::{DiffLine, DiffSource, DiffTarget, FileDiff, Hunk};
 
@@ -51,6 +52,8 @@ impl Loader {
         }
 
         let mut out = FileDiff::default();
+        // Blob ids of both sides of the file shown, for the image preview.
+        let mut blobs = None;
         let mut wanted = false;
         let mut seen_file = false;
         let mut shown = 0usize;
@@ -68,6 +71,7 @@ impl Loader {
                 wanted = !seen_file && (new_path == Some(path) || old_path == Some(path));
                 if wanted {
                     seen_file = true;
+                    blobs = Some((delta.old_file().id(), delta.new_file().id()));
                     out.file_header = content.to_vec();
                     out.kind = delta_kind(delta.status());
                     out.old_path = old_path
@@ -130,6 +134,20 @@ impl Loader {
         // hunk by hunk.
         if out.hunks.is_empty() {
             out.file_header.clear();
+        }
+
+        let is_image = picture::is_image_path(&target.path)
+            || target.old_path.as_deref().is_some_and(picture::is_image_path);
+        if out.binary && is_image && let Some((old, new)) = blobs {
+            // An unstaged file has no blob yet: it is read from disk, unless
+            // it is the deletion being shown.
+            let on_disk = (target.source == DiffSource::Unstaged && out.kind != Some(super::ChangeKind::Deleted))
+                .then(|| repo.workdir().map(|dir| dir.join(&target.path)))
+                .flatten();
+            let images = picture::load(repo, Some(old), Some(new), on_disk.as_deref());
+            if images.old.is_some() || images.new.is_some() {
+                out.images = Some(std::sync::Arc::new(images));
+            }
         }
         Ok(out)
     }
@@ -430,7 +448,7 @@ mod tests {
     use std::process::{Command, Stdio};
 
     use super::LineApply::{Forward, Reverse};
-    use crate::git::DiffSource::{Staged, Unstaged};
+    use crate::git::DiffSource::{Commit, Staged, Unstaged};
     use crate::git::{ChangeKind, DiffTarget, FileDiff, ops};
     use crate::tests::{Fixture, TIMEOUT, git};
     use crate::worker::Response;
@@ -798,6 +816,48 @@ mod tests {
         git(&fx.dir, &["add", "-A"]);
         unstage(&fx, name, &[('+', "a")]);
         assert_eq!(index(&fx, name), "b\n");
+    }
+
+    #[test]
+    fn image_files_come_with_both_versions_decoded() {
+        use crate::git::picture::Side;
+        use crate::git::picture::tests::png;
+        let fx = Fixture::new("diff-images");
+        let put = |path: &str, bytes: Vec<u8>| std::fs::write(fx.dir.join(path), bytes).unwrap();
+        put("logo.png", png(4, 4, [255, 0, 0, 255]));
+        put("gone.png", png(2, 2, [0, 0, 0, 255]));
+        fx.write("b.bin", "a b");
+        fx.commit_all("base");
+        put("logo.png", png(8, 4, [0, 255, 0, 255]));
+        std::fs::remove_file(fx.dir.join("gone.png")).unwrap();
+        fx.write("b.bin", "a c");
+
+        let size = |side: &Option<Side>| {
+            side.as_ref().map(|side| side.picture.as_ref().map(|p| (p.width, p.height)).unwrap())
+        };
+        let sizes = |diff: &FileDiff| {
+            let images = diff.images.as_ref().expect("an image preview");
+            (size(&images.old), size(&images.new))
+        };
+
+        // Unstaged: the index's version against the file on disk.
+        assert_eq!(sizes(&fx.diff(Unstaged, "logo.png")), (Some((4, 4)), Some((8, 4))));
+        // A deletion has only the old side.
+        assert_eq!(sizes(&fx.diff(Unstaged, "gone.png")), (Some((2, 2)), None));
+        // Binary but not an image: no preview.
+        assert!(fx.diff(Unstaged, "b.bin").images.is_none());
+
+        // Staged: HEAD against the index.
+        git(&fx.dir, &["add", "-A"]);
+        assert_eq!(sizes(&fx.diff(Staged, "logo.png")), (Some((4, 4)), Some((8, 4))));
+
+        // Committed: the parent against the commit, and the first commit's
+        // image is an addition.
+        git(&fx.dir, &["commit", "-q", "-m", "green"]);
+        let oid = |rev: &str| crate::git::Oid::from_str(git(&fx.dir, &["rev-parse", rev]).trim()).unwrap();
+        assert_eq!(sizes(&fx.diff(Commit(oid("HEAD")), "logo.png")), (Some((4, 4)), Some((8, 4))));
+        assert_eq!(sizes(&fx.diff(Commit(oid("HEAD~1")), "logo.png")), (None, Some((4, 4))));
+        assert_eq!(sizes(&fx.diff(Commit(oid("HEAD")), "gone.png")), (Some((2, 2)), None));
     }
 
     #[test]

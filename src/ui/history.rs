@@ -886,7 +886,10 @@ fn history_detail(
     };
     match shown {
         None => busy(ui, "Loading diff…"),
-        Some((_, diff)) if diff.binary => widgets::placeholder(ui, "Binary file - no text diff to show"),
+        Some((_, diff)) if diff.binary => match &diff.images {
+            Some(images) => crate::ui::image_diff::show(ui, images),
+            None => widgets::placeholder(ui, "Binary file - no text diff to show"),
+        },
         Some((_, diff)) if diff.hunks.is_empty() => {
             widgets::placeholder(ui, "No content changes (the file mode or name changed)")
         }

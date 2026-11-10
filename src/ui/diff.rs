@@ -48,7 +48,10 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
     match data {
         None => widgets::placeholder(ui, "Loading diff…"),
         Some(Err(e)) => widgets::placeholder(ui, &e),
-        Some(Ok(diff)) if diff.binary => widgets::placeholder(ui, "Binary file - no text diff to show"),
+        Some(Ok(diff)) if diff.binary => match &diff.images {
+            Some(images) => crate::ui::image_diff::show(ui, images),
+            None => widgets::placeholder(ui, "Binary file - no text diff to show"),
+        },
         Some(Ok(diff)) if diff.hunks.is_empty() => {
             widgets::placeholder(ui, "No content changes (the file mode or name changed)")
         }
@@ -117,7 +120,7 @@ fn title_bar(
                 }
                 DiffSource::Commit(_) => {}
             }
-            if let Some(diff) = diff {
+            if let Some(diff) = diff.filter(|diff| !diff.binary) {
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new(format!("-{}", diff.deletions)).color(theme::red()).font(theme::mono(12.0)));
                 ui.label(egui::RichText::new(format!("+{}", diff.additions)).color(theme::green()).font(theme::mono(12.0)));
