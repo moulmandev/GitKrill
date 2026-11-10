@@ -58,9 +58,21 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # The tests create real repositories and commits.
+      # The tests create real repositories and commits. When some fail, their
+      # output is repeated as an annotation on the run's summary page, so the
+      # cause is visible without digging through the log.
       - name: Test
-        run: cargo test --locked
+        shell: bash
+        run: |
+          set -o pipefail
+          if cargo test --locked 2>&1 | tee test.log; then
+            exit 0
+          fi
+          # Annotations are single-line: newlines travel as %0A.
+          details=$(sed -n '/^failures:$/,/^test result/p' test.log | head -n 120 \
+            | tr -d '\r' | sed 's/%/%25/g' | awk '{ printf "%s%%0A", $0 }')
+          echo "::error title=Tests failed on ${RUNNER_OS}::${details:-see the log}"
+          exit 1
 
       - name: Build (Windows, Linux)
         if: runner.os != 'macOS'
