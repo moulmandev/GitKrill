@@ -22,7 +22,23 @@ middle, and a staging / commit-details panel on the right.
 ## Install
 
 From the [latest release](https://github.com/moulmandev/GitKrill/releases/latest).
-Git must be installed and on `PATH`.
+
+GitKrill needs Git to change repositories (it reads them without it). When
+Git is missing:
+
+- the Windows installer offers, ticked, to download Git for Windows and
+  install it for your account only (no administrator rights; about 65 MB,
+  checked against the SHA-256 GitHub publishes for it). Unattended installs
+  do that only with `/INSTALLGIT=1`;
+- GitKrill itself, any download, says so when it starts and keeps a
+  **Git not found** warning in the status bar. On Windows it installs Git
+  for Windows the same way in one click; on macOS it starts Apple's Command
+  Line Tools install (or use `brew install git`); on Linux it shows the
+  command for your distribution.
+
+Git is found on `PATH` or where its installers put it, so a Git installed
+while GitKrill runs, or one left off `PATH`, works too.
+`gitkrill --git` prints which one is used.
 
 | System | Download | Updates |
 | --- | --- | --- |

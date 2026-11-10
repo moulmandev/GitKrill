@@ -464,7 +464,7 @@ pub fn blame(
         }
         let mut child = command.spawn().map_err(|e| {
             BlameError::Git(if e.kind() == std::io::ErrorKind::NotFound {
-                "Could not find `git`. Install Git and make sure it is on your PATH.".to_owned()
+                cli::NOT_FOUND.to_owned()
             } else {
                 format!("Failed to start git: {e}")
             })

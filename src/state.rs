@@ -92,6 +92,8 @@ pub enum Dialog {
     GitflowStart(crate::ui::gitflow::StartForm),
     /// Gitflow: finish one; see `ui::gitflow`.
     GitflowFinish(Box<crate::ui::gitflow::FinishForm>),
+    /// Git is missing: the offer to get it; see `ui::git_setup`.
+    GitSetup,
 }
 
 impl Dialog {
@@ -272,6 +274,8 @@ pub struct Shared {
     pub workspaces: crate::workspace::Workspaces,
     /// The preferences page, while it is open (`crate::ui::prefs`).
     pub prefs: Option<Box<crate::ui::prefs::PrefsView>>,
+    /// Whether git is installed, and getting it; see `crate::git_setup`.
+    pub git: crate::git_setup::GitSetup,
 }
 
 impl Shared {

@@ -1041,7 +1041,7 @@ fn cli_command(service: Service, host: &str) -> Command {
 /// every askpass fallback and the terminal prompt are disabled. With
 /// nothing stored, git simply fails.
 fn credential_command(workdir: &Path) -> Command {
-    let mut cmd = Command::new("git");
+    let mut cmd = Command::new(crate::git::cli::program());
     cmd.current_dir(workdir)
         .args(["-c", "core.askPass=", "credential", "fill"])
         .env("GIT_TERMINAL_PROMPT", "0")

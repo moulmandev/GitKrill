@@ -33,6 +33,9 @@ use sha2::{Digest, Sha256};
 /// Where releases are published.
 pub const RELEASES: &str = "https://github.com/moulmandev/GitKrill/releases";
 const LATEST: &str = "https://api.github.com/repos/moulmandev/GitKrill/releases/latest";
+/// Where Git for Windows is published, for installing Git (`crate::git_setup`).
+const GIT_FOR_WINDOWS: &str = "https://github.com/git-for-windows/git/releases";
+const GIT_FOR_WINDOWS_LATEST: &str = "https://api.github.com/repos/git-for-windows/git/releases/latest";
 
 /// Left next to the executable by the installer.
 pub const INSTALLED_MARKER: &str = "gitkrill-installed";
@@ -141,10 +144,20 @@ pub struct Source {
 
 impl Source {
     pub fn github() -> Source {
+        Source::releases(RELEASES, LATEST)
+    }
+
+    /// Git for Windows' releases. `GITKRILL_GIT_FEED` stands in for them as
+    /// `GITKRILL_UPDATE_FEED` does for GitKrill's (see [`Source::from_env`]).
+    pub fn git_for_windows() -> Source {
+        Source::local_or("GITKRILL_GIT_FEED", Source::releases(GIT_FOR_WINDOWS, GIT_FOR_WINDOWS_LATEST))
+    }
+
+    fn releases(pages: &str, latest: &str) -> Source {
         Source {
-            feed: LATEST.to_owned(),
-            downloads: format!("{RELEASES}/download"),
-            pages: format!("{RELEASES}/tag"),
+            feed: latest.to_owned(),
+            downloads: format!("{pages}/download"),
+            pages: format!("{pages}/tag"),
             local: false,
         }
     }
@@ -154,7 +167,12 @@ impl Source {
     /// the files under `<feed>/download/<tag>/`. Only loopback addresses are
     /// accepted; anything else means GitHub.
     pub fn from_env() -> Source {
-        match std::env::var("GITKRILL_UPDATE_FEED") {
+        Source::local_or("GITKRILL_UPDATE_FEED", Source::github())
+    }
+
+    /// The local test server named by the variable `var`, or `fallback`.
+    fn local_or(var: &str, fallback: Source) -> Source {
+        match std::env::var(var) {
             Ok(base) if loopback(&base) => {
                 let base = base.trim_end_matches('/');
                 Source {
@@ -164,8 +182,18 @@ impl Source {
                     local: true,
                 }
             }
-            _ => Source::github(),
+            _ => fallback,
         }
+    }
+
+    /// Where the latest release is described (the API's `releases/latest`).
+    pub fn feed(&self) -> &str {
+        &self.feed
+    }
+
+    /// A local test server rather than GitHub.
+    pub fn is_local(&self) -> bool {
+        self.local
     }
 
     /// The release's page, for "What's new" and for downloading by hand.
@@ -228,47 +256,80 @@ pub struct Asset {
 
 /// The `releases/latest` answer.
 pub fn parse_release(json: &str) -> Result<Release, String> {
-    #[derive(Deserialize)]
-    struct Raw {
-        tag_name: String,
-        #[serde(default)]
-        body: Option<String>,
-        #[serde(default)]
-        draft: bool,
-        #[serde(default)]
-        prerelease: bool,
-        #[serde(default)]
-        assets: Vec<RawAsset>,
-    }
-    #[derive(Deserialize)]
-    struct RawAsset {
-        name: String,
-        #[serde(default)]
-        size: u64,
-        #[serde(default)]
-        digest: Option<String>,
-    }
-
-    let raw: Raw = serde_json::from_str(json).map_err(|_| "The release information could not be read".to_owned())?;
+    let raw = parse_raw(json)?;
     let version = Version::parse(&raw.tag_name).filter(|_| !raw.draft && !raw.prerelease);
     let Some(version) = version else { return Err("No release to update to".to_owned()) };
-    let assets = raw
-        .assets
-        .into_iter()
-        .map(|asset| Asset {
-            sha256: asset
-                .digest
-                .and_then(|digest| digest.strip_prefix("sha256:").map(str::to_ascii_lowercase))
-                .filter(|hex| is_sha256(hex)),
-            name: asset.name,
-            size: asset.size,
-        })
-        .collect();
-    let mut notes = raw.body.unwrap_or_default().replace("\r\n", "\n");
-    if let Some((cut, _)) = notes.char_indices().nth(6000) {
-        notes.truncate(cut);
+    Ok(raw.into_release(version))
+}
+
+/// Git for Windows' `releases/latest` answer. Its tags read
+/// `v2.56.0.windows.4`; the version is the part before `.windows`. Files
+/// without a digest from GitHub take the SHA-256 from the table in the
+/// release notes ("Git-2.56.0.4-64-bit.exe | 4961a4...").
+pub fn parse_git_for_windows(json: &str) -> Result<Release, String> {
+    let raw = parse_raw(json)?;
+    let number = raw.tag_name.split(".windows").next().unwrap_or_default();
+    let plain = raw.tag_name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.');
+    let version = Version::parse(number).filter(|_| plain && !raw.draft && !raw.prerelease);
+    let Some(version) = version else { return Err("Git for Windows has no release to install".to_owned()) };
+    let mut release = raw.into_release(version);
+    for asset in &mut release.assets {
+        if asset.sha256.is_none() {
+            asset.sha256 = release.notes.lines().find_map(|line| {
+                let (name, hex) = line.split_once('|')?;
+                (name.trim() == asset.name && is_sha256(hex.trim())).then(|| hex.trim().to_ascii_lowercase())
+            });
+        }
     }
-    Ok(Release { version, tag: raw.tag_name, notes, assets })
+    Ok(release)
+}
+
+#[derive(Deserialize)]
+struct Raw {
+    tag_name: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
+    assets: Vec<RawAsset>,
+}
+
+#[derive(Deserialize)]
+struct RawAsset {
+    name: String,
+    #[serde(default)]
+    size: u64,
+    #[serde(default)]
+    digest: Option<String>,
+}
+
+fn parse_raw(json: &str) -> Result<Raw, String> {
+    serde_json::from_str(json).map_err(|_| "The release information could not be read".to_owned())
+}
+
+impl Raw {
+    fn into_release(self, version: Version) -> Release {
+        let assets = self
+            .assets
+            .into_iter()
+            .map(|asset| Asset {
+                sha256: asset
+                    .digest
+                    .and_then(|digest| digest.strip_prefix("sha256:").map(str::to_ascii_lowercase))
+                    .filter(|hex| is_sha256(hex)),
+                name: asset.name,
+                size: asset.size,
+            })
+            .collect();
+        let mut notes = self.body.unwrap_or_default().replace("\r\n", "\n");
+        if let Some((cut, _)) = notes.char_indices().nth(6000) {
+            notes.truncate(cut);
+        }
+        Release { version, tag: self.tag_name, notes, assets }
+    }
 }
 
 fn is_sha256(hex: &str) -> bool {
@@ -430,7 +491,7 @@ pub fn download(
         .assets
         .iter()
         .find(|asset| asset.name == name)
-        .ok_or_else(|| format!("GitKrill {} has no download for this system", release.version))?;
+        .ok_or_else(|| format!("Release {} has no download for this system", release.tag))?;
 
     // What the file must hash to: GitHub's own record and the release's
     // checksum list. At least one is needed, and they must agree.
@@ -452,9 +513,9 @@ pub fn download(
         return Err("The download is damaged (its checksum does not match)".to_owned());
     }
 
-    std::fs::create_dir_all(dir).map_err(|e| format!("Could not save the update ({e})"))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("Could not save the download ({e})"))?;
     let path = dir.join(format!("{}-{name}", release.tag));
-    std::fs::write(&path, &bytes).map_err(|e| format!("Could not save the update ({e})"))?;
+    std::fs::write(&path, &bytes).map_err(|e| format!("Could not save the download ({e})"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

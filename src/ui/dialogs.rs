@@ -25,7 +25,7 @@ pub fn show(ctx: &egui::Context, shared: &mut Shared, mut tab: Option<&mut RepoT
     let fresh = std::mem::take(&mut shared.dialog_fresh);
     let width = match dialog {
         Dialog::NewPull(_) => 520.0,
-        Dialog::Update(_) => 460.0,
+        Dialog::Update(_) | Dialog::GitSetup => 460.0,
         _ => 400.0,
     };
 
@@ -299,9 +299,21 @@ fn body(
             }
         }
 
+        Dialog::GitSetup => match crate::ui::git_setup::dialog(ui, shared) {
+            true => Outcome::Close,
+            // An install keeps running if the dialog goes; Escape may close it.
+            false => Outcome::Keep,
+        },
+
         Dialog::About => {
             title(ui, "GitKrill");
             ui.label(format!("Version {}", env!("CARGO_PKG_VERSION")));
+            let git = match shared.git.state() {
+                crate::git_setup::State::Found(version) => format!("Uses {version}, {}", crate::git::cli::program().display()),
+                crate::git_setup::State::Checking => "Looking for Git…".to_owned(),
+                _ => "Git was not found".to_owned(),
+            };
+            ui.label(RichText::new(git).color(theme::text_dim()));
             ui.label(
                 RichText::new(
                     "A native Git client written in Rust. History, status and diffs are read \

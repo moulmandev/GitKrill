@@ -17,7 +17,7 @@ name: Build
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master, dev]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
@@ -147,6 +147,36 @@ jobs:
           for ($i = 0; $i -lt 60 -and (Test-Path "$dir\gitkrill.exe"); $i++) { Start-Sleep -Milliseconds 500 }
           if (Test-Path "$dir\gitkrill.exe") { throw "The uninstaller left gitkrill.exe behind" }
           Write-Output "Installed, ran ($out) and uninstalled."
+
+      # With the runner's own Git hidden, /INSTALLGIT=1 must download Git for
+      # Windows (checked against its SHA-256) and install it for the user,
+      # and GitKrill must find that Git although this step's PATH predates it.
+      - name: Install Git with the installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Command git -All -ErrorAction SilentlyContinue | ForEach-Object { "Git before: $($_.Source)" }
+          Rename-Item 'C:\Program Files\Git' 'Git.hidden'
+          try {
+            $log = "$env:RUNNER_TEMP\setup.log"
+            Start-Process -Wait -FilePath upload/GitKrill-Setup-x64.exe -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/INSTALLGIT=1', "/LOG=$log"
+            Select-String -Path $log -Pattern 'Git' | ForEach-Object { $_.Line }
+            $installed = "$env:LOCALAPPDATA\Programs\Git\cmd\git.exe"
+            if (-not (Test-Path $installed)) {
+              Get-Content "$env:TEMP\GitKrill-git-setup.log" -Tail 40 -ErrorAction SilentlyContinue
+              throw "Git for Windows is not in $installed"
+            }
+            & $installed --version
+            $out = (& "$env:LOCALAPPDATA\Programs\GitKrill\gitkrill.exe" --git | Out-String).Trim()
+            Write-Output $out
+            if (-not $out.StartsWith($installed)) { throw "GitKrill does not find the Git it installed: '$out'" }
+          } finally {
+            $dir = "$env:LOCALAPPDATA\Programs\GitKrill"
+            if (Test-Path "$dir\unins000.exe") {
+              Start-Process -Wait -FilePath "$dir\unins000.exe" -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'
+            }
+            Rename-Item 'C:\Program Files\Git.hidden' 'Git'
+          }
 
       - name: Package (Linux)
         if: runner.os == 'Linux'
