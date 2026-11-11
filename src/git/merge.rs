@@ -14,7 +14,7 @@
 //! aborted or undone ([`UndoKind::Staged`]).
 
 use super::internal::Internal;
-use super::ops::{GitCmd, Step, UndoKind};
+use super::ops::{GitCmd, RefMove, Step, UndoKind};
 use super::repo::lossy;
 
 /// How `git merge` brings a branch in.
@@ -147,15 +147,20 @@ fn squash_guard(mut cmd: GitCmd, mode: MergeMode) -> GitCmd {
 
 /// Checks out `into`, then merges `source` into it: for a branch dropped on
 /// one that is not checked out. Like the plain checkout-and-merge of a drop,
-/// it is one command and not undoable as a whole.
+/// one undo puts back both the branch that was checked out and `into`. A
+/// squash merge, which leaves its changes staged on `into`, is not undoable
+/// as a whole: Abort on its banner unstages them.
 pub fn checkout_and_merge(source: &str, into: &str, mode: MergeMode) -> GitCmd {
     let what = match mode {
         MergeMode::Squash => "squash merge",
         _ => "merge",
     };
-    let cmd = GitCmd::new(format!("Checkout {into} and {what} {source}"), &["checkout", into])
+    let mut cmd = GitCmd::new(format!("Checkout {into} and {what} {source}"), &["checkout", into])
         .step(&args(source, mode))
         .done(format!("Checked out {into} and {what}d {source}"));
+    if mode != MergeMode::Squash {
+        cmd = cmd.undoable(UndoKind::Refs(vec![RefMove::new(format!("refs/heads/{into}"))]));
+    }
     squash_guard(cmd, mode)
 }
 
@@ -330,6 +335,22 @@ mod tests {
         let entry = done.undo.expect("a merge is undoable");
         fx.run_as(entry.undo.clone(), Origin::Undo(entry.clone()));
         assert_eq!(git(&fx.dir, &["rev-parse", "HEAD"]), before);
+    }
+
+    #[test]
+    fn a_drop_that_checks_out_first_is_undone_in_one_go() {
+        let fx = diverged("merge-checkout-undo");
+        git(&fx.dir, &["checkout", "-q", "feature"]);
+        let main = git(&fx.dir, &["rev-parse", "main"]);
+        let done = fx.run(checkout_and_merge("feature", "main", MergeMode::NoFastForward));
+        assert_eq!(git(&fx.dir, &["branch", "--show-current"]), "main");
+        assert_eq!(git(&fx.dir, &["rev-list", "--count", "--merges", "main"]), "1");
+        let entry = done.undo.expect("checkout and merge is undoable");
+        fx.run_as(entry.undo.clone(), Origin::Undo(entry));
+        assert_eq!(git(&fx.dir, &["branch", "--show-current"]), "feature");
+        assert_eq!(git(&fx.dir, &["rev-parse", "main"]), main);
+        // A squash leaves its changes staged on main: Abort, not undo.
+        assert!(matches!(checkout_and_merge("feature", "main", MergeMode::Squash).undo, UndoKind::None));
     }
 
     #[test]
