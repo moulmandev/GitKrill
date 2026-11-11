@@ -468,12 +468,13 @@ be installed.
   ed25519 key pair and copy its public key
 - Commit and tag signing with OpenPGP, SSH or X.509 keys: pick a secret key
   from GnuPG, generate a new 4096-bit one, sign by default
-- Keys with a passphrase: when gpg-agent does not hold an OpenPGP key's
-  passphrase (or a card's PIN), GitKrill asks for it in the app and the
-  agent keeps it for its usual time; a wrong one is asked again. SSH
-  signing keys, and SSH keys not in ssh-agent, ask the same way. Needs
-  GnuPG 2.1 or later (Git for Windows' own gpg, Gpg4win, GPG Suite, Linux
-  distributions' gpg)
+- Keys with a passphrase: when gpg-agent does not hold the passphrase of
+  an OpenPGP key or of an X.509 certificate's key in gpgsm (or a card's
+  PIN), GitKrill asks for it in the app and the agent keeps it for its
+  usual time; a wrong one is asked again. SSH signing keys, and SSH keys
+  not in ssh-agent, ask the same way. Needs GnuPG 2.1 or later (Git for
+  Windows' own gpg and gpgsm, Gpg4win, GPG Suite, Linux distributions');
+  other X.509 programs, such as smimesign, ask in their own way
 - The commit panel shows who the next commit will be by
 
 **Shell**
@@ -718,8 +719,6 @@ build.rs         the Windows executable's icon and version details
   large file (from 70,000 to 200,000 lines of Rust, more of simpler
   formats), syntax colours start afresh at every hunk: a block comment or
   string that runs across the start of a hunk is coloured as if it did not
-- X.509 (gpgsm) signing keys with a passphrase still need gpg-agent's own
-  pinentry: GitKrill asks only for OpenPGP and SSH keys
 - On macOS, system notifications are shown through `osascript`, so
   Notification Center lists them under Script Editor rather than GitKrill
 

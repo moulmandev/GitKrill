@@ -1,8 +1,9 @@
 //! GitKrill's executable when git or ssh start it to ask something: as
 //! `GIT_ASKPASS` / `SSH_ASKPASS` it gets the question as its only
-//! argument and prints the answer; as `gpg.program` it gets gpg's
-//! arguments (`super::gpg`). `main` calls [`dispatch`] before anything
-//! else, so no window ever opens in these modes.
+//! argument and prints the answer; as `gpg.program` or `gpg.x509.program`
+//! it gets gpg's or gpgsm's arguments (`super::gpg`). `main` calls
+//! [`dispatch`] before anything else, so no window ever opens in these
+//! modes.
 //!
 //! Both are recognised by the bridge's token in the environment (only
 //! GitKrill's own git commands carry it): with it, a first argument that

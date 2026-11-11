@@ -28,7 +28,8 @@ use eframe::egui;
 
 fn main() -> eframe::Result {
     // Started by git or ssh to ask the user something (GIT_ASKPASS,
-    // SSH_ASKPASS, gpg.program): answer and leave before any window opens.
+    // SSH_ASKPASS, gpg.program, gpg.x509.program): answer and leave before
+    // any window opens.
     if let Some(code) = git::prompt::helper::dispatch() {
         std::process::exit(code);
     }

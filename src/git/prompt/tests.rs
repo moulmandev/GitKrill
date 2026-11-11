@@ -399,7 +399,6 @@ fn ssh_asks_for_a_key_passphrase() {
     crate::tests::git(&repo, &["init", "-q", "-b", "main"]);
     let op = next_op();
     let answerer = Answerer::start(bridge.clone(), op, |_, _| Some(("correct horse".to_owned(), None)));
-    let slashes = |path: &Path| path.to_string_lossy().replace('\\', "/");
     let args = strings(&[
         "-c",
         "gpg.format=ssh",
@@ -482,6 +481,53 @@ impl Gnupg {
             .next()
             .map(|key| key.fingerprint)
     }
+
+    /// gpgsm, next to gpg.
+    fn gpgsm(&self) -> Option<PathBuf> {
+        let next = self.gpg.with_file_name(if cfg!(windows) { "gpgsm.exe" } else { "gpgsm" });
+        if next.is_file() { Some(next) } else { crate::prefs::identity::find_program("gpgsm") }
+    }
+
+    /// A self-signed X.509 certificate that can sign, its key protected by
+    /// `passphrase`, made, imported and trusted in this home (without CRL
+    /// checks, so no dirmngr is started); its id.
+    fn certificate(&self, gpgsm: &Path, passphrase: &str) -> Option<String> {
+        std::fs::write(self.dir.join("gpgsm.conf"), "disable-crl-checks\ndisable-dirmngr\n").ok()?;
+        let params = self.dir.join("certificate.txt");
+        std::fs::write(
+            &params,
+            "Key-Type: RSA\nKey-Length: 2048\nKey-Usage: sign\nSerial: random\n\
+             Name-DN: CN=Ada Test,O=Example\nName-Email: ada@example.com\n%commit\n",
+        )
+        .ok()?;
+        let cert = self.dir.join("certificate.der");
+        // The agent asks for the new key's passphrase once, from standard
+        // input in loopback mode.
+        let mut make = self.command(gpgsm);
+        make.args(["--batch", "--pinentry-mode", "loopback", "--passphrase-fd", "0", "--gen-key", "-o"])
+            .arg(slashes(&cert))
+            .arg(slashes(&params))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped());
+        let mut child = make.spawn().ok()?;
+        child.stdin.take()?.write_all(format!("{passphrase}\n").as_bytes()).ok()?;
+        let made = child.wait_with_output().ok()?;
+        if !made.status.success() {
+            eprintln!("gpgsm could not make a certificate: {}", String::from_utf8_lossy(&made.stderr));
+            return None;
+        }
+        let imported = self.command(gpgsm).args(["--batch", "--import"]).arg(slashes(&cert)).output().ok()?;
+        assert!(imported.status.success(), "{}", String::from_utf8_lossy(&imported.stderr));
+        let listed = self.command(gpgsm).args(["--batch", "--with-colons", "--list-secret-keys"]).output().ok()?;
+        let key = crate::prefs::identity::parse_secret_keys(&String::from_utf8_lossy(&listed.stdout), 0).into_iter().next()?;
+        // The agent's list of trusted roots: the SHA-1 fingerprint in pairs.
+        let pairs: Vec<String> = key.fingerprint.as_bytes().chunks(2).map(|pair| String::from_utf8_lossy(pair).into_owned()).collect();
+        std::fs::write(self.dir.join("trustlist.txt"), format!("{} S relax\n", pairs.join(":"))).ok()?;
+        // Reads the trust list, and forgets the passphrase.
+        self.gpgconf(&["--reload", "gpg-agent"]);
+        Some(key.id)
+    }
 }
 
 impl Drop for Gnupg {
@@ -489,6 +535,12 @@ impl Drop for Gnupg {
         self.gpgconf(&["--kill", "gpg-agent"]);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
+}
+
+/// A path with forward slashes, which Git for Windows' programs and native
+/// ones read alike.
+fn slashes(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 /// `GNUPGHOME` for `gpg`: Git for Windows' own gpg reads only the
@@ -561,6 +613,82 @@ fn signing_asks_for_the_passphrase_the_agent_does_not_hold() {
     let mut args = bridge.config().to_vec();
     args.extend(strings(&["verify-commit", "HEAD"]));
     let verified = git_with(&dir, &args, env).expect("the signature verifies");
+    assert!(verified.contains("Good signature"), "{verified}");
+}
+
+#[test]
+fn x509_signing_asks_for_the_certificate_passphrase() {
+    let Some(gnupg) = Gnupg::new("gpgsm") else {
+        eprintln!("gpg not found; skipped");
+        return;
+    };
+    let Some(gpgsm) = gnupg.gpgsm() else {
+        eprintln!("gpgsm not found; skipped");
+        return;
+    };
+    let Some(id) = gnupg.certificate(&gpgsm, "c0rrect") else { return };
+    let dir = gnupg.dir.join("repo");
+    std::fs::create_dir_all(&dir).unwrap();
+    crate::tests::git(&dir, &["init", "-q", "-b", "main"]);
+    let bridge = bridge();
+    let env = |op: u64| {
+        let mut env = isolated_env(&bridge, op, &gnupg.dir);
+        env.push(("GNUPGHOME".into(), gnupg.home.clone()));
+        env
+    };
+    // gpgsm as git finds it here: on PATH, or Git for Windows' own.
+    let program = format!("gpg.x509.program={}", slashes(&gpgsm));
+    let commit = |message: &str, op: u64| {
+        let mut args = strings(&["-c", "gpg.format=x509", "-c", &program, "-c", &format!("user.signingkey={id}")]);
+        args.extend(bridge.config());
+        args.extend(strings(&["commit", "-q", "-S", "--allow-empty", "-m", message]));
+        git_with(&dir, &args, env(op))
+    };
+
+    // A wrong passphrase is asked again, then the right one signs.
+    let op = next_op();
+    let answerer = Answerer::start(bridge.clone(), op, |_, count| Some((if count == 1 { "wrong" } else { "c0rrect" }.into(), None)));
+    commit("signed", op).expect("the commit is signed");
+    let asked = answerer.asked();
+    assert_eq!(asked.len(), 2, "{asked:?}");
+    match (&asked[0].kind, &asked[1].kind) {
+        (Kind::Signing(first), Kind::Signing(second)) => {
+            assert!(!first.retry && second.retry);
+            assert_eq!(first.format, crate::prefs::identity::SignFormat::X509);
+            assert_eq!(first.key, id);
+            assert_eq!(first.user.as_deref(), Some("Ada Test <ada@example.com>"));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(asked[0].prompt.starts_with("Passphrase of the X.509 key"), "{}", asked[0].prompt);
+    let object = crate::tests::git(&dir, &["cat-file", "-p", "HEAD"]);
+    assert!(object.contains("gpgsig -----BEGIN SIGNED MESSAGE-----"), "{object}");
+    drop(answerer);
+
+    // The agent has it now: nothing is asked.
+    let op = next_op();
+    let answerer = Answerer::start(bridge.clone(), op, |_, _| None);
+    commit("signed again", op).expect("signed from the agent's cache");
+    assert!(answerer.asked().is_empty());
+    drop(answerer);
+
+    // Without it, cancelling fails the commit and says why.
+    gnupg.gpgconf(&["--reload", "gpg-agent"]);
+    let op = next_op();
+    let answerer = Answerer::start(bridge.clone(), op, |_, _| None);
+    assert!(commit("not signed", op).is_err());
+    assert_eq!(answerer.asked().len(), 1);
+    assert!(bridge.take_cancelled(op).is_some_and(|why| why.starts_with("Signing was cancelled")));
+    assert_eq!(crate::tests::git(&dir, &["log", "--format=%s"]), "signed again\nsigned");
+    drop(answerer);
+
+    // Checking the signature goes to gpgsm untouched, although both
+    // programs are the wrapper and gpg.format no longer says X.509.
+    let op = next_op();
+    let mut args = strings(&["-c", "gpg.format=openpgp", "-c", &program]);
+    args.extend(bridge.config());
+    args.extend(strings(&["verify-commit", "HEAD"]));
+    let verified = git_with(&dir, &args, env(op)).expect("the signature verifies");
     assert!(verified.contains("Good signature"), "{verified}");
 }
 

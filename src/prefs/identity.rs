@@ -614,7 +614,7 @@ pub fn parse_secret_keys(out: &str, now: i64) -> Vec<SecretKey> {
 }
 
 /// Colon listings escape special characters as `\xHH`.
-fn unescape_colons(value: &str) -> String {
+pub(crate) fn unescape_colons(value: &str) -> String {
     let bytes = value.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

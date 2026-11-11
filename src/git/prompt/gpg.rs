@@ -1,22 +1,32 @@
-//! `gpg.program` for GitKrill's git commands: the gpg git would have run
-//! does the work, and when gpg-agent does not hold the signing key's
-//! passphrase the user is asked in the app.
+//! `gpg.program` and `gpg.x509.program` for GitKrill's git commands: the
+//! program git would have run (gpg for OpenPGP keys, gpgsm for X.509
+//! certificates) does the work, and when gpg-agent does not hold the
+//! signing key's passphrase the user is asked in the app.
 //!
-//! git signs with `<gpg.program> --status-fd=2 -bsau <key>`, the data on
-//! standard input, the signature on standard output and gpg's status lines
-//! on standard error. The wrapper first runs that with `--pinentry-mode
-//! error`: when the agent has the passphrase cached it signs and nothing is
-//! asked. When it would need a pinentry (`FAILURE sign` with gpg's "No
-//! pinentry" code), the wrapper asks the app for the passphrase and runs it
-//! again with `--pinentry-mode loopback --batch --passphrase-fd 0`, the
+//! git signs with `<program> --status-fd=2 -bsau <key>`, the data on
+//! standard input, the signature on standard output and the program's
+//! status lines on standard error. The wrapper first runs that with
+//! `--pinentry-mode error`: when the agent has the passphrase cached it
+//! signs and nothing is asked. When it would need a pinentry (gpg's "No
+//! pinentry" error), the wrapper asks the app for the passphrase and runs
+//! it again with `--pinentry-mode loopback --batch --passphrase-fd 0`, the
 //! passphrase on standard input and the data in a temporary file; the
 //! agent caches the passphrase as it does for its own pinentry. A wrong
 //! passphrase is asked again, twice. This works with GnuPG 2.1 and later
-//! (Git for Windows' own gpg, Gpg4win, GPG Suite, Linux distributions)
-//! unless the agent was set up with `no-allow-loopback-pinentry`.
+//! (Git for Windows' own gpg and gpgsm, Gpg4win, GPG Suite, Linux
+//! distributions) unless the agent was set up with
+//! `no-allow-loopback-pinentry`.
 //!
-//! Everything else (verifying, a `gpg.program` that is not GnuPG, a gpg
-//! that does not know `--pinentry-mode`) is passed through untouched.
+//! git runs both programs with the same arguments, so the wrapper tells
+//! them apart the way git chose between them ([`Setup::format_of`]): it
+//! signs in the format `gpg.format` names, and checks a signature with the
+//! program of the format the signature is in. gpg reports its errors in
+//! status lines (`FAILURE sign <code>`); gpgsm writes none for these, so
+//! its messages are read instead, and it is run with them untranslated.
+//!
+//! Everything else (verifying, a program that is not GnuPG's, such as
+//! smimesign, one that does not know `--pinentry-mode`) is passed through
+//! untouched.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
@@ -28,6 +38,7 @@ use std::time::Duration;
 
 use super::{Signing, wipe};
 use crate::git::cli;
+use crate::prefs::identity::SignFormat;
 
 /// gpg's error codes (`gpg-error.h`), in the low 16 bits of a status
 /// line's number.
@@ -38,30 +49,37 @@ const NO_PASSPHRASE: u32 = 89;
 /// How many passphrases are tried before giving up.
 const TRIES: usize = 3;
 
-/// Runs gpg for git with `args`; returns the exit code to leave with.
+/// How an X.509 signature (gpgsm's) starts: git checks a signature that
+/// starts so with `gpg.x509.program`.
+const X509_SIGNATURE: &[u8] = b"-----BEGIN SIGNED MESSAGE-----";
+
+/// Runs gpg or gpgsm for git with `args`; returns the exit code to leave
+/// with.
 pub fn wrap(args: Vec<OsString>) -> i32 {
     #[cfg(windows)]
     private_std_handles();
-    let program = real_program();
+    let setup = Setup::read();
+    let format = setup.format_of(&args);
+    let tool = Tool { program: setup.program(format), format };
     let key = signing_key(&args);
-    let Some(key) = key.filter(|_| is_gnupg(&program)) else {
-        return passthrough(&program, &args);
+    let Some(key) = key.filter(|_| is_gnupg(&tool.program, format)) else {
+        return passthrough(&tool.program, &args);
     };
 
     let mut data = Vec::new();
     if std::io::stdin().read_to_end(&mut data).is_err() {
-        return passthrough(&program, &args);
+        return passthrough(&tool.program, &args);
     }
-    let first = run(&program, &with(&["--pinentry-mode", "error"], &args, &[]), &data);
+    let first = tool.run(&with(&["--pinentry-mode", "error"], &args, &[]), &data);
     if first.code == 0 || !first.needs(&[NO_PIN_ENTRY]) {
         if first.code != 0 && first.unknown_option() {
             // GnuPG 1, without an agent's pinentry modes.
-            return run(&program, &args, &data).emit();
+            return tool.run(&args, &data).emit();
         }
         return first.emit();
     }
 
-    let user = user_id(&program, &key);
+    let user = tool.user_id(&key);
     let file = match DataFile::new(&data) {
         Ok(file) => file,
         Err(e) => {
@@ -72,14 +90,14 @@ pub fn wrap(args: Vec<OsString>) -> i32 {
     };
     let mut retry = false;
     for _ in 0..TRIES {
-        let signing = Signing { key: key.clone(), user: user.clone(), retry };
-        let prompt = format!("Passphrase of the OpenPGP key {}", user.as_deref().unwrap_or(&key));
+        let signing = Signing { key: key.clone(), user: user.clone(), retry, format };
+        let prompt = format!("Passphrase of the {} key {}", format.label(), user.as_deref().unwrap_or(&key));
         match super::helper::ask(&prompt, "", Some(signing)) {
             Ok(Some(mut passphrase)) => {
                 passphrase.push('\n');
                 let loopback = ["--pinentry-mode", "loopback", "--batch", "--passphrase-fd", "0"];
                 let tail = [OsString::from("-o"), OsString::from("-"), file.arg()];
-                let ran = run(&program, &with(&loopback, &args, &tail), passphrase.as_bytes());
+                let ran = tool.run(&with(&loopback, &args, &tail), passphrase.as_bytes());
                 wipe(&mut passphrase);
                 if ran.code != 0 && ran.needs(&[BAD_PASSPHRASE, NO_PASSPHRASE]) {
                     retry = true;
@@ -152,52 +170,186 @@ pub fn signing_key(args: &[OsString]) -> Option<String> {
     signs.then(|| key.unwrap_or_default())
 }
 
-/// Whether `program` is GnuPG's gpg (`gpg`, `gpg2`, `gpg.exe`, a full
-/// path to one), which knows the pinentry modes.
-fn is_gnupg(program: &OsStr) -> bool {
-    Path::new(program)
-        .file_name()
-        .map(|name| name.to_string_lossy().to_ascii_lowercase())
-        .is_some_and(|name| name.starts_with("gpg") && !name.starts_with("gpgsm"))
-}
-
-/// The OpenPGP program git would run without GitKrill's `-c
-/// gpg.program=...`: `gpg.openpgp.program` or `gpg.program` from the
-/// configuration files (the later one wins, as in git), else `gpg`.
-fn real_program() -> OsString {
-    let mut cmd = Command::new(cli::program());
-    cmd.args(["config", "--get-regexp", r"^gpg\.(openpgp\.)?program$"])
-        // The `-c` options of the command that runs us, ours among them.
-        .env_remove("GIT_CONFIG_PARAMETERS")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null());
-    cli::hide_window(&mut cmd);
-    let configured = cmd
-        .output()
-        .ok()
-        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-        .and_then(|out| out.lines().filter_map(|line| line.split_once(' ')).map(|(_, value)| value.trim().to_owned()).next_back())
-        .filter(|value| !value.is_empty());
-    let program = configured.map(OsString::from).unwrap_or_else(|| OsString::from("gpg"));
-    // Never ourselves, whatever a configuration file says.
-    let me = std::env::current_exe().ok().and_then(|exe| exe.canonicalize().ok());
-    let it = Path::new(&program).canonicalize().ok();
-    if me.is_some() && me == it { OsString::from("gpg") } else { program }
-}
-
-/// The user id of `key`, for the dialog: "Ada Lovelace <ada@example.com>".
-fn user_id(program: &OsStr, key: &str) -> Option<String> {
-    let mut args = vec!["--batch", "--with-colons", "--list-secret-keys"];
-    if !key.is_empty() {
-        args.extend(["--", key]);
+/// Whether `program` is GnuPG's own for `format`, which knows the pinentry
+/// modes: gpg (`gpg`, `gpg2`, `gpg.exe`, a full path to one) for OpenPGP,
+/// gpgsm for X.509.
+fn is_gnupg(program: &OsStr, format: SignFormat) -> bool {
+    let Some(name) = Path::new(program).file_name().map(|name| name.to_string_lossy().to_ascii_lowercase()) else {
+        return false;
+    };
+    match format {
+        SignFormat::X509 => name.starts_with("gpgsm"),
+        SignFormat::OpenPgp | SignFormat::Ssh => name.starts_with("gpg") && !name.starts_with("gpgsm"),
     }
-    let args: Vec<OsString> = args.into_iter().map(OsString::from).collect();
-    let ran = run(program, &args, b"");
-    let out = String::from_utf8_lossy(&ran.stdout);
-    crate::prefs::identity::parse_secret_keys(&out, 0)
+}
+
+/// What git's configuration says about signing, as the git that started
+/// the wrapper reads it (the `-c` options of its command included), and
+/// without the programs that are GitKrill itself: those are GitKrill's own
+/// `-c gpg.program=...` and `-c gpg.x509.program=...`, which come after the
+/// user's settings.
+#[derive(Debug, Default, PartialEq)]
+struct Setup {
+    /// `gpg.format`.
+    format: Option<String>,
+    /// `gpg.program` or `gpg.openpgp.program`, whichever comes last.
+    openpgp: Option<String>,
+    /// `gpg.x509.program`.
+    x509: Option<String>,
+}
+
+impl Setup {
+    fn read() -> Setup {
+        let mut cmd = Command::new(cli::program());
+        cmd.args(["config", "--get-regexp", r"^gpg\.(format|program|openpgp\.program|x509\.program)$"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        cli::hide_window(&mut cmd);
+        let listing = cmd.output().map(|out| String::from_utf8_lossy(&out.stdout).into_owned()).unwrap_or_default();
+        let me = std::env::current_exe().ok().and_then(|exe| exe.canonicalize().ok());
+        Setup::parse(&listing, |value| me.is_some() && Path::new(value).canonicalize().ok() == me)
+    }
+
+    /// Reads `git config --get-regexp` output, oldest scope first: a later
+    /// value wins, as in git, and an empty one stands for git's default.
+    /// Programs that `is_me` are left out.
+    fn parse(listing: &str, is_me: impl Fn(&str) -> bool) -> Setup {
+        let mut setup = Setup::default();
+        for (key, value) in listing.lines().filter_map(|line| line.split_once(' ')) {
+            let value = value.trim();
+            let slot = match key {
+                "gpg.format" => &mut setup.format,
+                "gpg.program" | "gpg.openpgp.program" => &mut setup.openpgp,
+                "gpg.x509.program" => &mut setup.x509,
+                _ => continue,
+            };
+            if key != "gpg.format" && is_me(value) {
+                continue;
+            }
+            *slot = (!value.is_empty()).then(|| value.to_owned());
+        }
+        setup
+    }
+
+    /// Which program git started the wrapper as. git signs in the format
+    /// `gpg.format` names; it checks a signature (`--verify <file>`) with
+    /// the program of the format the signature is in. SSH has a program
+    /// of its own, which is never the wrapper.
+    fn format_of(&self, args: &[OsString]) -> SignFormat {
+        let signature = verified_file(args).and_then(|file| {
+            let mut start = Vec::new();
+            std::fs::File::open(file).and_then(|f| f.take(X509_SIGNATURE.len() as u64).read_to_end(&mut start)).ok()?;
+            Some(start)
+        });
+        let x509 = match signature {
+            Some(start) => start.starts_with(X509_SIGNATURE),
+            None => SignFormat::parse(self.format.as_deref()) == SignFormat::X509,
+        };
+        if x509 { SignFormat::X509 } else { SignFormat::OpenPgp }
+    }
+
+    /// The program git would have run for `format` without GitKrill's `-c`
+    /// options: the one configured, else git's default.
+    fn program(&self, format: SignFormat) -> OsString {
+        let configured = if format == SignFormat::X509 { &self.x509 } else { &self.openpgp };
+        OsString::from(configured.as_deref().unwrap_or(format.default_program()))
+    }
+}
+
+/// The signature file of a verifying call (`--verify <file> -`).
+fn verified_file(args: &[OsString]) -> Option<&OsString> {
+    let at = args.iter().position(|arg| arg == "--verify")?;
+    args.get(at + 1)
+}
+
+/// The program a call goes to.
+struct Tool {
+    program: OsString,
+    format: SignFormat,
+}
+
+impl Tool {
+    /// Runs the program with `args` and `input` (see [`run`]). gpgsm's
+    /// messages are what tells why it failed, so they are asked for
+    /// untranslated: `LC_MESSAGES` decides unless `LC_ALL` is set, and
+    /// gettext does not look at `LANGUAGE` for the C locale.
+    fn run(&self, args: &[OsString], input: &[u8]) -> Ran {
+        let mut cmd = Command::new(&self.program);
+        cmd.args(args);
+        if self.format == SignFormat::X509 {
+            let all = std::env::var_os("LC_ALL").is_some_and(|value| !value.is_empty());
+            cmd.env(if all { "LC_ALL" } else { "LC_MESSAGES" }, "C").env_remove("LANGUAGE");
+        }
+        run(cmd, input)
+    }
+
+    /// Who `key` belongs to, for the dialog: "Ada Lovelace
+    /// <ada@example.com>", from the key's user ids, or from an X.509
+    /// certificate's subject name and email address.
+    fn user_id(&self, key: &str) -> Option<String> {
+        let mut args = vec!["--batch", "--with-colons", "--list-secret-keys"];
+        if !key.is_empty() {
+            args.extend(["--", key]);
+        }
+        let args: Vec<OsString> = args.into_iter().map(OsString::from).collect();
+        let ran = self.run(&args, b"");
+        let out = String::from_utf8_lossy(&ran.stdout);
+        if self.format == SignFormat::X509 {
+            return certificate_owner(&out);
+        }
+        crate::prefs::identity::parse_secret_keys(&out, 0)
+            .into_iter()
+            .map(|key| key.user_id)
+            .find(|user| !user.is_empty())
+    }
+}
+
+/// The owner of the first secret certificate in `gpgsm --with-colons
+/// --list-secret-keys` output: its subject's common name with the email
+/// address gpgsm lists after it (`Ada Lovelace <ada@example.com>`), else
+/// whichever of the two it has, else the subject as it is.
+fn certificate_owner(listing: &str) -> Option<String> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut inside = false;
+    for line in listing.lines() {
+        let fields: Vec<&str> = line.trim_end_matches('\r').split(':').collect();
+        match fields[0] {
+            "crs" if inside => break,
+            "crs" => inside = true,
+            "crt" if inside => break,
+            "uid" if inside => ids.push(crate::prefs::identity::unescape_colons(fields.get(9).copied().unwrap_or(""))),
+            _ => {}
+        }
+    }
+    let subject = ids.first().filter(|id| !id.starts_with('<'))?.clone();
+    let email = ids.iter().find(|id| id.starts_with('<') && id.ends_with('>'));
+    let name = common_name(&subject);
+    match (name, email) {
+        (Some(name), Some(email)) => Some(format!("{name} {email}")),
+        (Some(name), None) => Some(name),
+        (None, Some(email)) => Some(email.trim_start_matches('<').trim_end_matches('>').to_owned()),
+        (None, None) => Some(subject),
+    }
+}
+
+/// The `CN` of a distinguished name as gpgsm writes it (`CN=Lovelace\,
+/// Ada,O=Example`): the parts are split at commas no backslash escapes.
+fn common_name(subject: &str) -> Option<String> {
+    let mut parts = Vec::new();
+    let mut part = String::new();
+    let mut chars = subject.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => part.extend(chars.next()),
+            ',' => parts.push(std::mem::take(&mut part)),
+            c => part.push(c),
+        }
+    }
+    parts.push(part);
+    parts
         .into_iter()
-        .map(|key| key.user_id)
-        .find(|user| !user.is_empty())
+        .find_map(|part| part.split_once('=').filter(|(attr, _)| attr.trim().eq_ignore_ascii_case("CN")).map(|(_, v)| v.trim().to_owned()))
+        .filter(|name| !name.is_empty())
 }
 
 /// Runs gpg with this process's standard input, output and error.
@@ -222,9 +374,11 @@ struct Ran {
 }
 
 impl Ran {
-    /// Whether gpg failed with one of `codes` (its status lines say).
+    /// Whether gpg failed with one of `codes`: its status lines say, or
+    /// (gpgsm) its messages.
     fn needs(&self, codes: &[u32]) -> bool {
-        failure_codes(&String::from_utf8_lossy(&self.stderr)).any(|code| codes.contains(&code))
+        let stderr = String::from_utf8_lossy(&self.stderr);
+        failure_codes(&stderr).chain(message_codes(&stderr)).any(|code| codes.contains(&code))
     }
 
     fn unknown_option(&self) -> bool {
@@ -251,18 +405,29 @@ fn failure_codes(status: &str) -> impl Iterator<Item = u32> + '_ {
     })
 }
 
-/// Runs `program` with `input` on its standard input and collects what it
+/// The error codes gpgsm's untranslated messages name ("gpgsm: error
+/// creating signature: No pinentry <GPG Agent>"): it writes no status line
+/// when signing fails.
+fn message_codes(stderr: &str) -> impl Iterator<Item = u32> + '_ {
+    const TEXTS: [(u32, &str); 3] =
+        [(NO_PIN_ENTRY, ": No pinentry"), (BAD_PASSPHRASE, ": Bad passphrase"), (NO_PASSPHRASE, ": No passphrase given")];
+    stderr
+        .lines()
+        .filter(|line| !line.starts_with("[GNUPG:]"))
+        .flat_map(|line| TEXTS.iter().filter(move |(_, text)| line.contains(text)).map(|(code, _)| *code))
+}
+
+/// Runs `cmd` with `input` on its standard input and collects what it
 /// prints. A gpg-agent that gpg starts may keep the pipes open long after
 /// gpg exited, so they are read on threads and given only a moment once
 /// gpg is done.
-fn run(program: &OsStr, args: &[OsString], input: &[u8]) -> Ran {
-    let mut cmd = Command::new(program);
-    cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+fn run(mut cmd: Command, input: &[u8]) -> Ran {
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
     cli::hide_window(&mut cmd);
     let mut child = match cmd.spawn() {
         Ok(child) => child,
         Err(e) => {
-            let stderr = format!("GitKrill could not run {}: {e}\n", program.to_string_lossy()).into_bytes();
+            let stderr = format!("GitKrill could not run {}: {e}\n", cmd.get_program().to_string_lossy()).into_bytes();
             return Ran { code: 2, stdout: Vec::new(), stderr };
         }
     };
@@ -393,10 +558,109 @@ mod tests {
     #[test]
     fn only_gnupg_gets_pinentry_options() {
         for program in ["gpg", "gpg2", "C:/Program Files/Git/usr/bin/gpg.exe", "/usr/local/bin/GPG2"] {
-            assert!(is_gnupg(OsStr::new(program)), "{program}");
+            assert!(is_gnupg(OsStr::new(program), SignFormat::OpenPgp), "{program}");
+            assert!(!is_gnupg(OsStr::new(program), SignFormat::X509), "{program}");
         }
         for program in ["gpgsm", "keybase", "/usr/bin/ssh-keygen"] {
-            assert!(!is_gnupg(OsStr::new(program)), "{program}");
+            assert!(!is_gnupg(OsStr::new(program), SignFormat::OpenPgp), "{program}");
         }
+        for program in ["gpgsm", "C:/Program Files (x86)/GnuPG/bin/gpgsm.exe"] {
+            assert!(is_gnupg(OsStr::new(program), SignFormat::X509), "{program}");
+        }
+        for program in ["smimesign", "/opt/homebrew/bin/smimesign", "gpg"] {
+            assert!(!is_gnupg(OsStr::new(program), SignFormat::X509), "{program}");
+        }
+    }
+
+    #[test]
+    fn reads_the_settings_without_gitkrill_itself() {
+        let me = "C:/Program Files/GitKrill/gitkrill.exe";
+        let listing = "gpg.format x509\ngpg.program /usr/local/bin/gpg2\ngpg.x509.program /opt/gnupg/bin/gpgsm\n\
+                       gpg.program C:/Program Files/GitKrill/gitkrill.exe\ngpg.x509.program C:/Program Files/GitKrill/gitkrill.exe\n";
+        let setup = Setup::parse(listing, |value| value == me);
+        assert_eq!(
+            setup,
+            Setup { format: Some("x509".into()), openpgp: Some("/usr/local/bin/gpg2".into()), x509: Some("/opt/gnupg/bin/gpgsm".into()) }
+        );
+        assert_eq!(setup.program(SignFormat::X509), OsString::from("/opt/gnupg/bin/gpgsm"));
+        assert_eq!(setup.program(SignFormat::OpenPgp), OsString::from("/usr/local/bin/gpg2"));
+
+        // Only GitKrill's own: git's defaults. A later gpg.openpgp.program
+        // wins over gpg.program, and an empty value means the default.
+        let setup = Setup::parse(&format!("gpg.program {me}\ngpg.x509.program {me}\n"), |value| value == me);
+        assert_eq!(setup, Setup::default());
+        assert_eq!(setup.program(SignFormat::X509), OsString::from("gpgsm"));
+        assert_eq!(setup.program(SignFormat::OpenPgp), OsString::from("gpg"));
+        let setup = Setup::parse("gpg.program gpg2\ngpg.openpgp.program /bin/gpg\n", |_| false);
+        assert_eq!(setup.program(SignFormat::OpenPgp), OsString::from("/bin/gpg"));
+        let setup = Setup::parse("gpg.x509.program smimesign\ngpg.x509.program\ngpg.x509.program \n", |_| false);
+        assert_eq!(setup.program(SignFormat::X509), OsString::from("gpgsm"));
+    }
+
+    #[test]
+    fn calls_go_to_the_program_git_chose() {
+        let x509 = Setup { format: Some("x509".into()), ..Setup::default() };
+        let openpgp = Setup::default();
+        let signing = args(&["--status-fd=2", "-bsau", "AC52F5E21AF70FE6"]);
+        assert_eq!(x509.format_of(&signing), SignFormat::X509);
+        assert_eq!(openpgp.format_of(&signing), SignFormat::OpenPgp);
+        let ssh = Setup { format: Some("ssh".into()), ..Setup::default() };
+        assert_eq!(ssh.format_of(&signing), SignFormat::OpenPgp);
+
+        // Checking a signature: its first line decides, whatever gpg.format says.
+        let dir = std::env::temp_dir().join(format!("gitkrill-gpg-format-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let smime = dir.join("smime.sig");
+        std::fs::write(&smime, "-----BEGIN SIGNED MESSAGE-----\nMIAGCSqGSIb3DQEHAqCAMIACAQEx\n").unwrap();
+        let pgp = dir.join("pgp.sig");
+        std::fs::write(&pgp, "-----BEGIN PGP SIGNATURE-----\n\niHUEABYKAB0WIQ\n").unwrap();
+        let verify = |file: &Path, keyid: bool| {
+            let mut list = if keyid { vec![OsString::from("--keyid-format=long")] } else { Vec::new() };
+            list.extend(args(&["--status-fd=1", "--verify"]));
+            list.push(file.as_os_str().to_owned());
+            list.push(OsString::from("-"));
+            list
+        };
+        assert_eq!(openpgp.format_of(&verify(&smime, false)), SignFormat::X509);
+        assert_eq!(x509.format_of(&verify(&pgp, true)), SignFormat::OpenPgp);
+        // A file that cannot be read: gpg.format.
+        assert_eq!(x509.format_of(&verify(&dir.join("missing"), false)), SignFormat::X509);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reads_gpgsm_failures_from_its_messages() {
+        let pinentry = "gpgsm: CRLs not checked due to --disable-crl-checks option\n\
+                        gpgsm: error creating signature: No pinentry <GPG Agent>\n";
+        let ran = |stderr: &str| Ran { code: 2, stdout: Vec::new(), stderr: stderr.as_bytes().to_vec() };
+        assert!(ran(pinentry).needs(&[NO_PIN_ENTRY]));
+        assert!(!ran(pinentry).needs(&[BAD_PASSPHRASE, NO_PASSPHRASE]));
+        assert!(ran("gpgsm: error creating signature: Bad passphrase <GPG Agent>\r\n").needs(&[BAD_PASSPHRASE]));
+        assert!(ran("gpgsm: error creating signature: No passphrase given <Pinentry>\n").needs(&[NO_PASSPHRASE]));
+        // Not trusted: something to show, not to ask about.
+        let untrusted = "gpgsm: can't sign using 'AC52F5E21AF70FE6': Not trusted\n[GNUPG:] INV_SGNR 10 AC52F5E21AF70FE6\n";
+        assert!(!ran(untrusted).needs(&[NO_PIN_ENTRY, BAD_PASSPHRASE, NO_PASSPHRASE]));
+        // gpg's status lines still count.
+        assert!(ran("[GNUPG:] FAILURE sign 67108949\n").needs(&[NO_PIN_ENTRY]));
+    }
+
+    #[test]
+    fn names_the_owner_of_a_certificate() {
+        let listing = "/home/ada/.gnupg/pubring.kbx\n------------------------\n\
+            crs:u:2048:1:AC52F5E21AF70FE6:20261111T204546:20630405T170000:14E94818C26F0773::CN=Ada Test,O=Example::sS::::::23:\n\
+            fpr:::::::::3CA1124B703B6720377E6028AC52F5E21AF70FE6:::3CA1124B703B6720377E6028AC52F5E21AF70FE6:\n\
+            grp:::::::::E531E5F59B0D1B90C9B81BAC2DBF6A9239DCC7FF:\n\
+            uid:u::::::::CN=Ada Test,O=Example:::\n\
+            uid:u::::::::<ada@example.com>::\n\
+            crs:u:2048:1:0000000000000001:::01::CN=Someone Else::sS::::::23:\n\
+            uid:u::::::::CN=Someone Else:::\n";
+        assert_eq!(certificate_owner(listing).as_deref(), Some("Ada Test <ada@example.com>"));
+        let escaped = "crs:u:2048:1:01:::01::x::sS:\nuid:u::::::::CN=Lovelace\\, Ada,OU=R\\x3aD,O=Example:::\n";
+        assert_eq!(certificate_owner(escaped).as_deref(), Some("Lovelace, Ada"));
+        let no_name = "crs:u:2048:1:01:::01::x::sS:\nuid:u::::::::O=Example,C=GB:::\nuid:u::::::::<it@example.com>::\n";
+        assert_eq!(certificate_owner(no_name).as_deref(), Some("it@example.com"));
+        let bare = "crs:u:2048:1:01:::01::x::sS:\nuid:u::::::::O=Example,C=GB:::\n";
+        assert_eq!(certificate_owner(bare).as_deref(), Some("O=Example,C=GB"));
+        assert_eq!(certificate_owner(""), None);
     }
 }

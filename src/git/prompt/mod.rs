@@ -1,18 +1,19 @@
 //! Asking the user what git, ssh and gpg would ask on a terminal: an HTTPS
 //! remote's user name and password, an SSH key's passphrase, whether to
-//! trust a new host, the passphrase of the OpenPGP key commits are signed
-//! with.
+//! trust a new host, the passphrase of the OpenPGP key or X.509
+//! certificate commits are signed with.
 //!
 //! GitKrill's git commands have no terminal, so every one of them gets
 //! `GIT_ASKPASS` and `SSH_ASKPASS` (with `SSH_ASKPASS_REQUIRE=force`)
-//! naming GitKrill's own executable, and `gpg.program` naming it too
+//! naming GitKrill's own executable, and `gpg.program` and
+//! `gpg.x509.program` naming it too
 //! ([`Bridge::env`], [`Bridge::config`]; `cli::command` adds them). Started
 //! that way, the executable is a *helper* ([`helper::dispatch`], run by
 //! `main` before anything else): it sends the question to the running app
 //! over a loopback TCP connection, waits for the answer and prints it,
 //! which is all git and ssh want from an askpass program. The GPG wrapper
-//! ([`gpg`]) runs the real gpg and asks only when gpg-agent does not hold
-//! the passphrase already.
+//! ([`gpg`]) runs the real gpg (or gpgsm) and asks only when gpg-agent does
+//! not hold the passphrase already.
 //!
 //! The connection is the app's alone: it listens on 127.0.0.1 only, and a
 //! question counts only with the run's token, 32 random bytes that only
@@ -184,11 +185,13 @@ impl Bridge {
         env
     }
 
-    /// `-c gpg.program=<GitKrill>`, before a git command's own arguments:
-    /// signing goes through the wrapper, which runs the gpg git would
-    /// have run ([`gpg`]).
-    pub fn config(&self) -> [String; 2] {
-        ["-c".to_owned(), format!("gpg.program={}", self.exe.to_string_lossy())]
+    /// `-c gpg.program=<GitKrill> -c gpg.x509.program=<GitKrill>`, before a
+    /// git command's own arguments: OpenPGP and X.509 signing go through
+    /// the wrapper, which runs the gpg or gpgsm git would have run
+    /// ([`gpg`]).
+    pub fn config(&self) -> [String; 4] {
+        let exe = self.exe.to_string_lossy();
+        ["-c".to_owned(), format!("gpg.program={exe}"), "-c".to_owned(), format!("gpg.x509.program={exe}")]
     }
 
     /// Where a helper of command `op` sends its questions.

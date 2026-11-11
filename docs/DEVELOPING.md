@@ -362,7 +362,13 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   >/dev/null 2>&1`): one started by the app inherits the run's output pipe
   and keeps a `| tail` waiting. Stop it afterwards with `gpgconf --kill
   gpg-agent`. SSH keys made from Preferences > SSH go to
-  `<GITKRILL_CONFIG_DIR>/ssh` during runs, never `~/.ssh`.
+  `<GITKRILL_CONFIG_DIR>/ssh` during runs, never `~/.ssh`. For X.509,
+  `gpgsm --batch --pinentry-mode loopback --passphrase-fd 0 --gen-key`
+  makes a self-signed certificate in that home (`Gnupg::certificate` in
+  `git::prompt::tests` has the parameters, the `trustlist.txt` line that
+  lets it sign and the `gpgsm.conf` that keeps dirmngr out of it). gpg-agent
+  refuses a socket path longer than about 100 characters: keep the home
+  short.
 - Folder dialogs cannot be clicked through by a script: with
   `GITKRILL_SHOT_FOLDER=<dir>` set, "Add a folder of repositories" (and
   saving patches one per commit) picks `<dir>` instead of asking. File
@@ -398,8 +404,9 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   them; the test binary stands in for GitKrill's executable as askpass and
   gpg program (a `GITKRILL_TEST_HELPER` hook runs before the test harness),
   with git's system and global configuration replaced so no credential
-  manager can open a window. Its GnuPG and SSH tests make throwaway keys in
-  temporary folders and stop the gpg-agent they started.
+  manager can open a window. Its GnuPG and SSH tests make throwaway keys
+  (and a self-signed X.509 certificate for gpgsm) in temporary folders and
+  stop the gpg-agent they started.
 - `tools/shot.sh` keeps settings in a `cfg` folder next to the output. Never
   run the app for testing without `GITKRILL_CONFIG_DIR` set, or the user's real
   tab list gets temp repositories in it.

@@ -16,6 +16,7 @@ use eframe::egui::{
 };
 
 use crate::git::prompt::{self, Asked, Kind, wipe};
+use crate::prefs::identity::SignFormat;
 use crate::state::Settings;
 use crate::theme::{self, icons};
 use crate::ui::dialogs::buttons;
@@ -174,7 +175,10 @@ fn body(ui: &mut Ui, asked: &Asked, form: &mut Form) -> Option<Outcome> {
             "Unlock"
         }
         Kind::Signing(signing) => {
-            let who = signing.user.as_deref().unwrap_or("Your OpenPGP key");
+            let who = signing.user.as_deref().unwrap_or(match signing.format {
+                SignFormat::X509 => "your X.509 certificate",
+                SignFormat::OpenPgp | SignFormat::Ssh => "your OpenPGP key",
+            });
             dim(ui, &format!("Signing needs the passphrase of {who}."));
             if !signing.key.is_empty() {
                 ui.label(RichText::new(format!("Key {}", signing.key)).font(theme::mono(12.0)).color(theme::text_dim()));

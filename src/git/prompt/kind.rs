@@ -9,16 +9,22 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::prefs::identity::SignFormat;
+
 /// What the GPG wrapper (`super::gpg`) says about the key it needs.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Signing {
     /// The key git signs with (`user.signingkey`): an id, a fingerprint or
     /// an email address.
     pub key: String,
-    /// The key's user id (`Ada Lovelace <ada@example.com>`), when gpg said.
+    /// The key's user id (`Ada Lovelace <ada@example.com>`), when gpg said;
+    /// for an X.509 certificate, its owner's name and email address.
     pub user: Option<String>,
     /// The passphrase given before was not the right one.
     pub retry: bool,
+    /// An OpenPGP key (gpg) or an X.509 certificate's (gpgsm).
+    #[serde(default)]
+    pub format: SignFormat,
 }
 
 /// The kinds of question there are.
@@ -40,8 +46,8 @@ pub enum Kind {
     /// Something to read while ssh waits (`SSH_ASKPASS_PROMPT=none`: touch
     /// the security key). There is nothing to answer.
     Notice,
-    /// The passphrase (or card PIN) of the OpenPGP key a commit or tag is
-    /// signed with.
+    /// The passphrase (or card PIN) of the OpenPGP key or X.509 certificate
+    /// a commit or tag is signed with.
     Signing(Signing),
     /// Anything else: shown as it is, answered in a masked field.
     Other,
@@ -242,10 +248,20 @@ mod tests {
     fn hints_and_signing_win_over_the_text() {
         assert_eq!(Question::parse("Allow use of key id_ed25519?", "confirm", None).kind, Kind::Confirm);
         assert_eq!(Question::parse("Confirm user presence for key ED25519-SK SHA256:x", "none", None).kind, Kind::Notice);
-        let signing = Signing { key: "436C50D526FA7874".into(), user: Some("Ada <ada@example.com>".into()), retry: false };
+        let signing = Signing {
+            key: "436C50D526FA7874".into(),
+            user: Some("Ada <ada@example.com>".into()),
+            retry: false,
+            format: SignFormat::OpenPgp,
+        };
         let q = Question::parse("Passphrase", "", Some(signing.clone()));
         assert_eq!(q.kind, Kind::Signing(signing));
         assert!(q.cancelled().contains("Ada <ada@example.com>"));
+        // Helpers from before X.509 signing leave the format out.
+        let older: Signing = serde_json::from_str(r#"{"key":"ABCD","user":null,"retry":true}"#).unwrap();
+        assert_eq!(older.format, SignFormat::OpenPgp);
+        let x509: Signing = serde_json::from_str(r#"{"key":"ABCD","user":null,"retry":false,"format":"x509"}"#).unwrap();
+        assert_eq!(x509.format, SignFormat::X509);
         assert_eq!(kind("Something else entirely?"), Kind::Other);
     }
 
