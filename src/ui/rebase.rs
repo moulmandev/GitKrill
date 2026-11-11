@@ -80,6 +80,11 @@ struct Controls {
     restored: bool,
     /// Fingerprint of the plan as last saved to the draft slot.
     saved: u64,
+    /// Commits to set to squash together once the range is loaded, oldest
+    /// first (see [`RebaseView::squash`]).
+    squash: Option<Vec<Oid>>,
+    /// Said above the buttons whatever the plan (commits already pushed).
+    warning: Option<String>,
 }
 
 pub struct RebaseView {
@@ -104,6 +109,16 @@ impl RebaseView {
             state: State::Loading,
             controls: Box::default(),
         }
+    }
+
+    /// The planner with `run` (oldest first, from `git::multi::check_squash`)
+    /// set to be squashed together and everything else picked, the combined
+    /// message ready to edit, and `warning` shown above its buttons.
+    pub fn squash(base: Oid, run: Vec<Oid>, warning: Option<String>) -> Self {
+        let mut view = RebaseView::new(base);
+        view.controls.squash = Some(run);
+        view.controls.warning = warning;
+        view
     }
 
     /// Key of the job that reads the range.
@@ -187,7 +202,10 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, view: &mut Reba
                 let mut plan = Plan::new(Arc::new(range));
                 let untouched = fingerprint(&plan);
                 view.controls.saved = untouched;
-                let draft = ctx.data(|data| data.get_temp::<Draft>(draft_id(tab)));
+                // A squash asked for from the graph starts afresh.
+                let draft = ctx
+                    .data(|data| data.get_temp::<Draft>(draft_id(tab)))
+                    .filter(|_| view.controls.squash.is_none());
                 if let Some(draft) = draft
                     && draft.base == plan.range.base
                     && draft.head == plan.range.head.oid
@@ -200,6 +218,14 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, view: &mut Reba
                         view.controls.edited_from = draft.edited_from;
                         view.controls.restored = true;
                     }
+                }
+                if let Some(run) = view.controls.squash.take()
+                    && let Some(leader) = crate::git::multi::squash_plan(&mut plan, &run)
+                {
+                    let source = plan.items[leader].source;
+                    view.controls.selected = Some(source);
+                    view.controls.reveal = Some(source);
+                    view.controls.focus = Some(source);
                 }
                 State::Ready(plan)
             }
@@ -478,6 +504,9 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, plan: &mut Plan, co
 
                     if let Some(error) = &controls.error {
                         line(ui, icons::WARNING_CIRCLE, theme::red(), error);
+                    }
+                    if let Some(warning) = &controls.warning {
+                        line(ui, icons::WARNING, theme::orange(), warning);
                     }
                     for problem in &problems {
                         line(ui, icons::WARNING, theme::orange(), problem);

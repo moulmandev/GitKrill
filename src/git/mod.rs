@@ -14,6 +14,7 @@ pub mod gitflow;
 pub mod graph;
 pub mod hidden;
 pub mod lfs;
+pub mod multi;
 pub mod ops;
 pub mod picture;
 pub mod rebase;

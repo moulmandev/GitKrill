@@ -127,8 +127,8 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
         if step != 0 {
             let current = tab.selected_row().unwrap_or(0) as i64;
             let next = (current + step).clamp(0, rows as i64 - 1) as usize;
-            tab.select_row(next);
-            tab.scroll_to = Some(next);
+            // Shift extends the selection (`ui::multi`).
+            crate::ui::multi::arrow(ui, tab, next);
         }
     }
 
@@ -249,7 +249,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                     _ => None,
                 };
                 let look = RowLook {
-                    selected,
+                    selected: selected || tab.multi.contains(commit.oid),
                     // Nothing but the landing place reacts during a drag.
                     hovered: session.is_none()
                         && (response.hovered()
@@ -281,7 +281,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                 if response.double_clicked() {
                     checkout_row(tab, &snap, commit);
                 } else if response.clicked() {
-                    tab.select_row(i);
+                    crate::ui::multi::click(ui, tab, i);
                 }
                 response.context_menu(|ui| row_menu(ui, tab, shared, &snap, i));
 
@@ -303,7 +303,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                     if pill_response.double_clicked() {
                         checkout_label(tab, &snap, commit, label);
                     } else if pill_response.clicked() {
-                        tab.select_row(i);
+                        crate::ui::multi::click(ui, tab, i);
                     }
                     drag::source(&pill_response, || Branch::of_label(&snap, label), color);
                     pill_response.context_menu(|ui| label_menu(ui, tab, shared, &snap, i, label));
@@ -954,6 +954,8 @@ fn tag_menu(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSnap
         && menu_item(ui, icons::ARROW_LINE_UP, &format!("Push to {remote}")) {
             tab.run(ops::push_tag(remote, name));
         }
+    let tip = snap.tags.iter().find(|t| t.name == name).map(|t| t.oid);
+    crate::ui::multi::compare_item(ui, tab, shared, snap, tip);
     if menu_item(ui, icons::TRASH, "Delete tag") {
         shared.show(Dialog::confirm(
             "Delete tag",
@@ -995,6 +997,10 @@ fn row_menu(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<Repo
             return;
         }
         RowKind::Commit => {}
+    }
+    // One of several selected commits: the menu for all of them.
+    if crate::ui::multi::menu(ui, tab, snap, commit.oid) {
+        return;
     }
 
     let sha = commit.oid.to_string();
@@ -1063,6 +1069,7 @@ fn row_menu(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<Repo
     if menu_item(ui, icons::ARROW_COUNTER_CLOCKWISE, "Revert commit") {
         tab.run(ops::revert(commit.oid, is_merge));
     }
+    crate::ui::multi::compare_with_head(ui, tab, shared, snap, commit.oid);
     // Reword, squash, reorder or drop everything after this commit.
     if !is_head
         && let Some(branch) = &snap.head.branch

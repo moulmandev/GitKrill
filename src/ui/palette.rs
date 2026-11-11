@@ -429,6 +429,7 @@ pub fn entries(tabs: &[RepoTab], active: usize, settings: &Settings) -> Vec<Entr
     if let (Some(tab), Some(snap)) = (tab, snap) {
         crate::ui::gitflow::palette_entries(&mut list, tab, snap);
         crate::ui::remotes::palette_entries(&mut list, tab, snap);
+        crate::ui::multi::palette_entries(&mut list, tab, snap);
     }
     if let Some(tab) = tab {
         external_tools(&mut list, tab, snap, settings);

@@ -171,6 +171,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                         && menu_item(ui, icons::ARROW_LINE_UP, &format!("Push to {remote}")) {
                             tab.run(ops::push_tag(remote, &tag.name));
                         }
+                    crate::ui::multi::compare_item(ui, tab, shared, &snap, Some(tag.oid));
                     ui.separator();
                     if menu_item(ui, icons::TRASH, &format!("Delete {}", tag.name)) {
                         shared.show(Dialog::confirm(
@@ -586,6 +587,7 @@ pub fn local_branch_menu(
                 tab.run(ops::rebase(&branch.name));
             }
         }
+        crate::ui::multi::compare_item(ui, tab, shared, snap, branch.oid);
         ui.separator();
     }
 
@@ -688,6 +690,7 @@ pub fn remote_branch_menu(
                 tab.run(ops::set_upstream(current, &branch.full));
             }
     }
+    crate::ui::multi::compare_item(ui, tab, shared, snap, Some(branch.oid));
     // Only for the hosted remote: a fork's branch would need its owner too.
     if let Some(shown) = tab.hosting.connected().filter(|shown| shown.remote == branch.remote) {
         ui.separator();
