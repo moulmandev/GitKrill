@@ -90,12 +90,19 @@ fn icon_file() -> Option<PathBuf> {
 
 #[cfg(windows)]
 fn show(title: &str, body: &str) -> Result<(), String> {
+    static REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
+    REGISTERED.get_or_init(|| register(APP_ID, "GitKrill")).clone()?;
+    toast(APP_ID, title, body, false)
+}
+
+/// Shows a toast under `app_id`; `quiet` puts it in the notification
+/// centre without a banner.
+#[cfg(windows)]
+fn toast(app_id: &str, title: &str, body: &str, quiet: bool) -> Result<(), String> {
     use windows::Data::Xml::Dom::XmlDocument;
     use windows::UI::Notifications::{ToastNotification, ToastNotificationManager};
     use windows::core::HSTRING;
 
-    static REGISTERED: OnceLock<Result<(), String>> = OnceLock::new();
-    REGISTERED.get_or_init(register).clone()?;
     let xml = format!(
         "<toast><visual><binding template=\"ToastGeneric\"><text>{}</text><text>{}</text></binding></visual></toast>",
         escape_xml(title),
@@ -105,18 +112,22 @@ fn show(title: &str, body: &str) -> Result<(), String> {
     let document = XmlDocument::new().map_err(fail)?;
     document.LoadXml(&HSTRING::from(xml)).map_err(fail)?;
     let toast = ToastNotification::CreateToastNotification(&document).map_err(fail)?;
-    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID)).map_err(fail)?;
+    if quiet {
+        toast.SetSuppressPopup(true).map_err(fail)?;
+    }
+    let notifier = ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(app_id)).map_err(fail)?;
     notifier.Show(&toast).map_err(fail)
 }
 
-/// Tells Windows the name and icon of [`APP_ID`], for the current user.
+/// Tells Windows the name and icon of `app_id` ([`APP_ID`]), for the
+/// current user.
 #[cfg(windows)]
-fn register() -> Result<(), String> {
+fn register(app_id: &str, name: &str) -> Result<(), String> {
     use windows::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
     use windows::core::HSTRING;
 
-    let key = HSTRING::from(format!(r"Software\Classes\AppUserModelId\{APP_ID}"));
-    let mut values = vec![("DisplayName", "GitKrill".to_owned())];
+    let key = HSTRING::from(format!(r"Software\Classes\AppUserModelId\{app_id}"));
+    let mut values = vec![("DisplayName", name.to_owned())];
     if let Some(icon) = icon_file() {
         values.push(("IconUri", icon.to_string_lossy().into_owned()));
     }
@@ -234,6 +245,34 @@ mod tests {
         let short = shorten(&long);
         assert_eq!(short.chars().count(), 200);
         assert!(short.ends_with('…'));
+    }
+
+    /// Run by hand on Windows: a toast under a throwaway application id,
+    /// without a banner, reaches the notification centre; the toast and
+    /// the id are removed again.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "writes HKCU and the notification centre (both cleaned up)"]
+    fn a_windows_toast_reaches_the_notification_centre() {
+        use windows::UI::Notifications::ToastNotificationManager;
+        use windows::Win32::System::Registry::{HKEY_CURRENT_USER, RegDeleteTreeW};
+        use windows::core::HSTRING;
+
+        const ID: &str = "Moulman.GitKrill.Test";
+        // SAFETY: before any WinRT call on this thread.
+        unsafe {
+            let _ = windows::Win32::System::WinRT::RoInitialize(windows::Win32::System::WinRT::RO_INIT_MULTITHREADED);
+        }
+        register(ID, "GitKrill Test").unwrap();
+        let sent = toast(ID, "GitKrill test", "Delivery check <&>", true);
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        let history = ToastNotificationManager::History().unwrap();
+        let delivered = history.GetHistoryWithId(&HSTRING::from(ID)).and_then(|list| list.Size());
+        let _ = history.ClearWithId(&HSTRING::from(ID));
+        // SAFETY: deletes the key made above.
+        let _ = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(format!(r"Software\Classes\AppUserModelId\{ID}"))) };
+        sent.unwrap();
+        assert_eq!(delivered.unwrap(), 1);
     }
 
     #[test]

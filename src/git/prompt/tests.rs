@@ -392,6 +392,32 @@ fn ssh_asks_for_a_key_passphrase() {
         assert!(!asked.is_empty());
         assert!(matches!(&asked[0].kind, Kind::KeyPassphrase { .. }), "{asked:?}");
     }
+
+    // Commits signed with that key (gpg.format=ssh) ask the same way.
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    crate::tests::git(&repo, &["init", "-q", "-b", "main"]);
+    let op = next_op();
+    let answerer = Answerer::start(bridge.clone(), op, |_, _| Some(("correct horse".to_owned(), None)));
+    let slashes = |path: &Path| path.to_string_lossy().replace('\\', "/");
+    let args = strings(&[
+        "-c",
+        "gpg.format=ssh",
+        "-c",
+        &format!("gpg.ssh.program={}", slashes(&keygen)),
+        "-c",
+        &format!("user.signingkey={}", slashes(&key)),
+        "commit",
+        "-q",
+        "-S",
+        "--allow-empty",
+        "-m",
+        "signed with ssh",
+    ]);
+    git_with(&repo, &args, isolated_env(&bridge, op, &dir)).expect("signed with the SSH key");
+    let object = crate::tests::git(&repo, &["cat-file", "-p", "HEAD"]);
+    assert!(object.contains("-----BEGIN SSH SIGNATURE-----"), "{object}");
+    assert!(!answerer.asked().is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 

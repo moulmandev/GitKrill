@@ -47,6 +47,8 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Show a preference | Its section's page in `src/ui/prefs/<section>.rs` (see "Preferences" below). |
 | Read or change git's configuration | `crate::prefs::gitconfig`: `page.global` / `page.repo` on a preferences page (`get`, `get_bool`, `set`, `set_bool`; read in the background, written through `git config`); `gitconfig::read` / `write` / `effective` from background code. |
 | Hand a file or folder to the user's merge tool, diff tool, editor or terminal | `crate::external`: `merge(tools, file)` gives a `GitCmd` for `tab.run`; `diff`, `edit` and `terminal` start the program on a short-lived thread. Pass `&shared.settings.tools`. Failures come back as toasts; a `GITKRILL_SHOT` run prints the command instead. To support another tool, add it to `KNOWN` (where to look, its command lines). |
+| Let a git command ask the user something (a password, a passphrase, a host key) | Nothing to do: every command made by `git::cli::command` or `cli::run` can ask once `git::prompt::install` ran (`App::new`); `ui::prompt` shows the dialog. Commands nobody waits for (`GitCmd` with `.background`, `cli::Options { background: true }`) cannot ask (`prompt::silence`). A cancelled question makes `cli::run` fail with `Question::cancelled` in place of git's words. Starting git with `Command::new` yourself, call `git::prompt::apply(&mut cmd, 0)` first, or it cannot ask. |
+| Show a system notification | `crate::notification::send(title, body)`: shown from a thread of its own, printed instead in `GITKRILL_SHOT` runs. Toasts raised while the window is in the background already send one when Preferences > Notifications says so. |
 | Give every git command an environment variable | `git::cli::set_session_env` (the SSH key and author of the profile in use). It replaces the whole set and `prefs::identity::apply` owns it: add what you need to `identity::session_env` rather than calling it from elsewhere. |
 | Change what the commit button does | `src/ui/commit_button.rs`: the split button (`show`), what runs once a commit succeeded (`follow_up`), the commit template in the message fields (`prefill`). |
 | Ask a hosting account something (who is signed in, its SSH keys) | `hosting::account::AccountSession::start(account, ctx)`, polled from the UI; `account::local_keys`, `parse_public_key` and `fingerprint` read `.pub` files. A host in `settings.hosting_disconnected` is never signed in to. |
@@ -111,9 +113,11 @@ front, and the global and repository git configuration files.
   `colours()` there (a test fails otherwise), and gets the base set's value
   in theme files that do not name it.
 - Dates go through `state::format_time` (with the time of day) or
-  `prefs::appearance::custom_date`, so they follow Preferences > UI
-  Customization > Date/Time Short Format; do not call chrono's `format`
-  for a date shown to the user.
+  `prefs::appearance::custom_date` (a time of day alone:
+  `custom_clock`), so they follow Preferences > UI Customization >
+  Date/Time Short Format, the system's format included
+  (`prefs::system_date`); do not call chrono's `format` for a date shown
+  to the user.
 
 ## Conventions
 
@@ -281,7 +285,26 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   test run the real Git installer on a development machine. CI runs the
   real one, on a runner whose own Git is hidden (`/INSTALLGIT=1`).
 - Unknown command-line flags start the GUI. Set `GITKRILL_CONFIG_DIR` even
-  for one-off runs of the binary.
+  for one-off runs of the binary. `main` first hands the command line to
+  `git::prompt::helper::dispatch`: with `GITKRILL_PROMPT_TOKEN` in the
+  environment (only GitKrill's git commands have it) the binary is an
+  askpass helper or the gpg wrapper, never the GUI; `--askpass <prompt>`
+  and `--gpg <arguments>` ask for those modes outright.
+- To see the prompt dialog, give the run's git no credential manager
+  (`GIT_CONFIG_NOSYSTEM=1`, as `tools/shot.sh` already isolates the global
+  file) and fetch from a server that wants a password, or ask yourself: a
+  `GITKRILL_SHOT` run prints `prompt bridge: GITKRILL_PROMPT_PORT=...
+  GITKRILL_PROMPT_TOKEN=...`, and `gitkrill --askpass "<prompt>"` with
+  those two in its environment shows `<prompt>` as git or ssh would
+  (`SSH_ASKPASS_PROMPT=confirm` for a yes / no question). Use `!` steps
+  while the question is open: the script waits for git otherwise.
+- Tests never wait on a prompt: without `prompt::install` git commands
+  cannot ask. `git::prompt::tests` starts bridges of its own and answers
+  them; the test binary stands in for GitKrill's executable as askpass and
+  gpg program (a `GITKRILL_TEST_HELPER` hook runs before the test harness),
+  with git's system and global configuration replaced so no credential
+  manager can open a window. Its GnuPG and SSH tests make throwaway keys in
+  temporary folders and stop the gpg-agent they started.
 - `tools/shot.sh` keeps settings in a `cfg` folder next to the output. Never
   run the app for testing without `GITKRILL_CONFIG_DIR` set, or the user's real
   tab list gets temp repositories in it.

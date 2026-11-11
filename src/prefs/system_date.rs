@@ -51,10 +51,12 @@ fn valid(spec: &str) -> bool {
     !spec.trim().is_empty() && StrftimeItems::new(spec).all(|item| !matches!(item, Item::Error))
 }
 
-/// Which letters a system's patterns use.
+/// Which letters a system's patterns use (Linux has strftime's instead).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub enum Dialect {
     /// `d dd ddd dddd`, `M..MMMM`, `y yy yyyy`, `h H m s`, `tt`.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Windows,
     /// Unicode's (ICU, macOS): `d dd`, `E..EEEE`, `M..MMMM`, `y yy`, `a`.
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -63,6 +65,7 @@ pub enum Dialect {
 
 /// A pattern of letters (`dd.MM.yyyy`, `h:mm a`, text in 'quotes') in
 /// chrono's format. Eras and time zones are left out.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 pub fn from_letters(pattern: &str, dialect: Dialect) -> String {
     use Dialect::{Unicode, Windows};
     let chars: Vec<char> = pattern.chars().collect();

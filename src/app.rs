@@ -245,7 +245,8 @@ impl App {
     }
 
     fn shortcuts(&mut self, ctx: &egui::Context) {
-        let modal = self.shared.dialog.is_some();
+        // A question from git (`ui::prompt`) is a dialog too.
+        let modal = self.shared.dialog.is_some() || crate::git::prompt::app().is_some_and(|bridge| bridge.waiting());
         let pressed = |modifiers: Modifiers, key: Key| ctx.input_mut(|i| i.consume_key(modifiers, key));
 
         if !modal && pressed(Modifiers::COMMAND, Key::P) {

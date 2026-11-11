@@ -207,6 +207,14 @@ be installed.
 
 **Remotes**
 - Fetch, pull (default / ff-only / rebase), push, force push with lease
+- Sign-in prompts: when a push, pull, fetch or clone over HTTPS needs a
+  user name and password that no credential helper knows, GitKrill asks
+  for both in one dialog, and git hands them to your credential helper (if
+  you have one) to keep. Over SSH it asks for a key's passphrase, a
+  server's password, or whether to trust a host it has not seen (with the
+  fingerprint). A credential helper that answers by itself (Git Credential
+  Manager, the macOS keychain) works as before. Cancel makes the operation
+  fail with a message saying so; the automatic fetch never asks
 - Add a remote with the + on the sidebar's REMOTE header (or the command
   palette): a name (`origin` for the first), a fetch URL, an optional push
   URL, and a first fetch. Right-click a remote to fetch or prune it alone,
@@ -240,6 +248,12 @@ be installed.
   ed25519 key pair and copy its public key
 - Commit and tag signing with OpenPGP, SSH or X.509 keys: pick a secret key
   from GnuPG, generate a new 4096-bit one, sign by default
+- Keys with a passphrase: when gpg-agent does not hold an OpenPGP key's
+  passphrase (or a card's PIN), GitKrill asks for it in the app and the
+  agent keeps it for its usual time; a wrong one is asked again. SSH
+  signing keys, and SSH keys not in ssh-agent, ask the same way. Needs
+  GnuPG 2.1 or later (Git for Windows' own gpg, Gpg4win, GPG Suite, Linux
+  distributions' gpg)
 - The commit panel shows who the next commit will be by
 
 **Shell**
@@ -256,12 +270,17 @@ be installed.
 - Dark and light themes, or follow the system setting (**View > Theme**);
   custom themes are JSON files in the `themes` folder next to the settings,
   started from a template that **Preferences > UI Customization** writes
-- Preferences > UI Customization: where messages appear, a date format
-  (`DD.MM.YYYY`, `YYYY-MM-DD HH:mm`...) used everywhere a date is shown, an
-  icon-only toolbar, initials instead of avatars, and a
-  workspace › repository › branch breadcrumb in the toolbar
-- Preferences > Notifications: the taskbar button flashes (the Dock icon
-  bounces) when an operation ends while GitKrill is in the background
+- Preferences > UI Customization: where messages appear, dates in the
+  system's short date and time format (Windows' region settings, macOS's
+  Language & Region, Linux's `LC_TIME`; the default for new installs) or a
+  pattern of your own (`DD.MM.YYYY`, `YYYY-MM-DD HH:mm`...), used
+  everywhere a date is shown, an icon-only toolbar, initials instead of
+  avatars, and a workspace › repository › branch breadcrumb in the toolbar
+- Preferences > Notifications: when an operation ends while GitKrill is in
+  the background, the taskbar button flashes (the Dock icon bounces) and the
+  message appears in a system notification (Windows' notifications, macOS's
+  Notification Center, the desktop's notifications on Linux), which can be
+  turned off on its own; also when git waits for a password
 - Clone and init
 - External tools (**Preferences > External Tools**): a merge tool, a diff
   tool, an editor and a terminal, picked from those installed (VS Code,
@@ -286,6 +305,11 @@ in the **Help** menu, the others in the **View** menu.
 | Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, and the requests you open, with a token when one is found for that host (below). While Preferences > Integrations shows an account: whose token it is, its SSH keys, and the public keys you add there | api.github.com, gitlab.com, and only the servers you connected |
 | Automatic fetch | `git fetch --prune --all` (without `--prune` when Auto-Prune is off), as you would run it | your remotes |
 | Updates | A request for the latest release shortly after start and every six hours; the download when there is a newer one | api.github.com, github.com and its download host |
+
+GitKrill also listens on a port of the loopback address (127.0.0.1, so
+nothing outside the computer can reach it) for the questions of its own git
+commands (a password, a passphrase); only those commands know the random
+token it accepts.
 
 A server other than github.com and gitlab.com is never sent anything until
 you have said what it runs; the answer is kept in the settings file
@@ -351,6 +375,7 @@ src/
   theme.rs       colours, fonts, egui style
   avatars.rs     author pictures: fetch, disk cache, textures
   update.rs      checking for, downloading and applying updates
+  notification.rs  system notifications
   hosting/       pull / merge requests, issues and CI: github.rs (GitHub
                  and Enterprise), gitlab.rs, shared sign-in and network;
                  account.rs: the accounts and their SSH keys
@@ -365,6 +390,8 @@ src/
     multi.rs     cherry-pick, revert and squash several commits
     blame.rs     file history and blame
     picture.rs   decoding images for the image preview
+    prompt/      git's, ssh's and gpg's questions answered in the app: the
+                 askpass helper, the gpg wrapper, the loopback bridge
     cli.rs       running git
   ui/
     graph.rs     commit graph (graph/drag.rs: dragging branches,
@@ -381,6 +408,7 @@ src/
                  panel, comparison, menu and palette entries
     palette.rs   command palette (Ctrl+P)
     image_diff.rs  image preview     update.rs   update offer, status bar
+    prompt.rs    the password and passphrase dialog
     widgets.rs   shared widgets
   shot.rs        scripted screenshots for development
   tests.rs       end-to-end backend tests against real temp repositories
@@ -414,8 +442,8 @@ build.rs         the Windows executable's icon and version details
   a hunk is coloured as if it did not
 - Syntax grammars are syntect's bundled set: TypeScript is coloured as
   JavaScript, and Kotlin, Swift, Dart and PowerShell stay plain
-- SSH and GPG keys with a passphrase need an agent that already holds them
-  (ssh-agent, gpg-agent); there is no passphrase prompt
+- X.509 (gpgsm) signing keys with a passphrase still need gpg-agent's own
+  pinentry: GitKrill asks only for OpenPGP and SSH keys
 - Submodule management, worktrees, Git LFS file locking; SVG changes show
   as text
 - No reflog view and no bisect (a bisect started in a terminal is only
@@ -437,12 +465,8 @@ build.rs         the Windows executable's icon and version details
 - All tags cannot be pushed at once, and a tag cannot be deleted on a
   remote
 - The graph can hide branches but not show one branch alone
-- Pushing and pulling over HTTPS needs a credential helper: without one
-  (Windows comes with Git Credential Manager) GitKrill does not ask for a
-  user name and password
-- Desktop notifications draw attention to the window but do not pop up a
-  system notification with the message; dates follow one pattern, not the
-  system's locale
+- On macOS, system notifications are shown through `osascript`, so
+  Notification Center lists them under Script Editor rather than GitKrill
 
 ## License
 

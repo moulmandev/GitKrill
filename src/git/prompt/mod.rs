@@ -165,7 +165,6 @@ impl Bridge {
     /// command line.
     pub fn env(&self, op: u64) -> Vec<(String, String)> {
         let exe = self.exe.to_string_lossy().into_owned();
-        #[allow(unused_mut)]
         let mut env = vec![
             ("GIT_ASKPASS".to_owned(), exe.clone()),
             ("SSH_ASKPASS".to_owned(), exe),
@@ -176,9 +175,10 @@ impl Bridge {
             (TOKEN_VAR.to_owned(), self.token.clone()),
             (OP_VAR.to_owned(), op.to_string()),
         ];
-        // Older OpenSSH uses SSH_ASKPASS only when DISPLAY is set.
-        #[cfg(all(unix, not(target_os = "macos")))]
-        if std::env::var_os("DISPLAY").is_none_or(|display| display.is_empty()) {
+        // Older OpenSSH (before 8.4, on older Linux distributions) uses
+        // SSH_ASKPASS only when DISPLAY is set.
+        let no_display = std::env::var_os("DISPLAY").is_none_or(|display| display.is_empty());
+        if cfg!(all(unix, not(target_os = "macos"))) && no_display {
             env.push(("DISPLAY".to_owned(), ":0".to_owned()));
         }
         env
