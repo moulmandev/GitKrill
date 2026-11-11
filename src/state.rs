@@ -253,12 +253,22 @@ impl Settings {
     pub fn load() -> Self {
         // The old location is only read, never written or removed: the first
         // save puts the settings in the new place.
-        [Self::file(), Self::legacy_file()]
-            .into_iter()
-            .flatten()
-            .find_map(|path| std::fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+        let saved = [Self::file(), Self::legacy_file()].into_iter().flatten().find_map(|path| std::fs::read(path).ok());
+        Self::from_saved(saved.as_deref())
+    }
+
+    /// The settings saved as `bytes`. A first start (nothing saved) gets
+    /// what new installs start with: dates in the system's own format.
+    /// Settings saved before a choice existed keep what they showed.
+    pub(crate) fn from_saved(bytes: Option<&[u8]>) -> Self {
+        match bytes {
+            Some(bytes) => serde_json::from_slice(bytes).unwrap_or_default(),
+            None => {
+                let mut settings = Settings::default();
+                settings.appearance.system_dates = true;
+                settings
+            }
+        }
     }
 
     pub fn save(&self) {

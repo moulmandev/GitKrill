@@ -625,7 +625,11 @@ fn success(ui: &mut Ui, text: &str) {
 /// `Feb 23, 2025` in local time.
 fn date(epoch: i64) -> String {
     use chrono::{Local, TimeZone};
-    Local.timestamp_opt(epoch, 0).single().map(|time| time.format("%b %-d, %Y").to_string()).unwrap_or_default()
+    Local
+        .timestamp_opt(epoch, 0)
+        .single()
+        .map(|time| crate::prefs::appearance::custom_date(&time, false).unwrap_or_else(|| time.format("%b %-d, %Y").to_string()))
+        .unwrap_or_default()
 }
 
 // ---- self-hosted servers ----------------------------------------------------

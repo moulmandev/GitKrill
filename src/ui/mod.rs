@@ -30,6 +30,7 @@ pub mod patch;
 pub mod new_pull;
 pub mod panel;
 pub mod prefs;
+pub mod prompt;
 pub mod rebase;
 pub mod reflog;
 pub mod remotes;

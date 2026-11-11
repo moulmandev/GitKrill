@@ -372,7 +372,7 @@ pub fn toasts(ctx: &egui::Context, shared: &mut Shared, tab: Option<&RepoTab>) {
     }
 
     if shared.settings.appearance.desktop_notifications {
-        notify(ctx, &shared.toasts);
+        notify(ctx, &shared.toasts, shared.settings.appearance.system_notifications);
     }
 
     // Preferences > UI Customization > Notification Location. At the top,
@@ -462,9 +462,11 @@ pub fn toasts(ctx: &egui::Context, shared: &mut Shared, tab: Option<&RepoTab>) {
 /// Preferences > Notifications: when toasts appeared since the last frame
 /// while the window is in the background, asks the window manager for the
 /// user's attention (the taskbar button flashes until the window is
-/// focused; the dock icon bounces). Operations that end raise a toast in
-/// the frame they end, so this is where they are noticed; nothing polls.
-fn notify(ctx: &egui::Context, toasts: &[crate::state::Toast]) {
+/// focused; the dock icon bounces) and, with `system` on, shows each new
+/// toast's message in a system notification (`crate::notification`).
+/// Operations that end raise a toast in the frame they end, so this is
+/// where they are noticed; nothing polls.
+fn notify(ctx: &egui::Context, toasts: &[crate::state::Toast], system: bool) {
     let id = Id::new("toasts-notified");
     let Some(newest) = toasts.iter().map(|t| t.born).max() else { return };
     let seen: Option<Instant> = ctx.data(|d| d.get_temp(id));
@@ -477,6 +479,11 @@ fn notify(ctx: &egui::Context, toasts: &[crate::state::Toast]) {
     }
     let failed = toasts.iter().any(|t| t.kind == ToastKind::Error && seen.is_none_or(|seen| t.born > seen));
     let kind = if failed { egui::UserAttentionType::Critical } else { egui::UserAttentionType::Informational };
+    if system {
+        for toast in toasts.iter().filter(|t| seen.is_none_or(|seen| t.born > seen)).take(3) {
+            crate::notification::send(&toast.title, &toast.body);
+        }
+    }
     // A scripted run's window is never focused: say it instead of flashing
     // the taskbar of whoever uses the machine.
     if std::env::var_os("GITKRILL_SHOT").is_some() {

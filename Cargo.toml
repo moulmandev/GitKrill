@@ -33,6 +33,23 @@ ureq = "3.5.1"
 # Replacing the running executable when a portable copy updates itself
 # (Windows keeps a running .exe locked; this works around that).
 self-replace = "1.5"
+# The token that keeps the prompt bridge (src/git/prompt) GitKrill's own.
+# Already in the build through egui.
+getrandom = "0.3"
+
+# System notifications (Windows toasts) and the system's date format, and
+# keeping the GPG wrapper's handles from gpg-agent. windows-core is already
+# in the build; only these modules are compiled.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", default-features = false, features = [
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_System_Console",
+    "Win32_System_Registry",
+    "Win32_System_WinRT",
+] }
 
 [build-dependencies]
 # The executable's icon and version details on Windows (see build.rs).
@@ -42,6 +59,8 @@ winresource = "0.1"
 # default features are off; with both, the app runs on X11 and Wayland.
 [target.'cfg(target_os = "linux")'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["x11", "wayland"] }
+# The system's date format (nl_langinfo). Already in the build.
+libc = "0.2"
 
 # Keep our own code quick to rebuild, but run dependencies (text layout,
 # tessellation, libgit2) optimised so debug builds stay usable.

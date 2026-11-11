@@ -26,6 +26,7 @@ pub mod multi;
 pub mod ops;
 pub mod patch;
 pub mod picture;
+pub mod prompt;
 pub mod rebase;
 pub mod reflog;
 pub mod remotes;

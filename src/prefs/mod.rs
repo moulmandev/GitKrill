@@ -25,6 +25,7 @@ pub mod general;
 pub mod gitconfig;
 pub mod graph;
 pub mod identity;
+pub mod system_date;
 pub mod tools;
 
 use std::path::Path;

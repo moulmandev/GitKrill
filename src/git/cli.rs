@@ -151,9 +151,18 @@ pub fn version() -> Result<String, String> {
     }
 }
 
-/// A `git` command rooted at `dir`, set up so it can never block on a prompt
-/// or flash a console window.
+/// A `git` command rooted at `dir`, set up so it can never block on a
+/// terminal prompt or flash a console window. What git, ssh and gpg would
+/// ask on a terminal is asked in the app instead, once its prompt bridge
+/// is installed (`git::prompt`); this is the one place every git command
+/// gets that from.
 pub fn command(dir: &Path) -> Command {
+    command_as(dir, 0)
+}
+
+/// [`command`] for command number `op` of `git::prompt::next_op`, so a
+/// question the user cancels can explain its failure.
+fn command_as(dir: &Path, op: u64) -> Command {
     let mut cmd = Command::new(program());
     cmd.current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -161,6 +170,7 @@ pub fn command(dir: &Path) -> Command {
         .env("GIT_SEQUENCE_EDITOR", "true")
         .env("GIT_MERGE_AUTOEDIT", "no")
         .args(["-c", "color.ui=false", "-c", "core.quotepath=false"]);
+    super::prompt::apply(&mut cmd, op);
     apply_session_env(&mut cmd);
     hide_window(&mut cmd);
     cmd
@@ -196,13 +206,23 @@ pub struct Options<'a> {
 /// (git reports plenty of useful progress on stderr); on failure returns
 /// whatever git printed.
 pub fn run(dir: &Path, args: &[String], options: Options<'_>) -> Result<String, String> {
+    let op = super::prompt::next_op();
+    // A failure because the user cancelled a question says so, not that
+    // "terminal prompts are disabled".
+    let result = run_as(dir, args, options, op).map_err(|e| super::prompt::take_cancelled(op).unwrap_or(e));
+    super::prompt::finish(op);
+    result
+}
+
+fn run_as(dir: &Path, args: &[String], options: Options<'_>, op: u64) -> Result<String, String> {
     let Options { stdin, literal_paths, background, env } = options;
-    let mut cmd = command(dir);
+    let mut cmd = command_as(dir, op);
     if literal_paths {
         cmd.env("GIT_LITERAL_PATHSPECS", "1");
     }
     if background {
-        cmd.env("GCM_INTERACTIVE", "Never").env("GIT_ASKPASS", "");
+        cmd.env("GCM_INTERACTIVE", "Never");
+        super::prompt::silence(&mut cmd);
     }
     for (key, value) in env {
         cmd.env(key, value);

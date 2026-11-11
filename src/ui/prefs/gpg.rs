@@ -277,7 +277,11 @@ fn key_choice(ui: &mut Ui, key: &mut String, keys: &[SecretKey]) {
 fn key_label(key: &SecretKey) -> String {
     let date = |secs: i64| {
         use chrono::{Local, TimeZone};
-        Local.timestamp_opt(secs, 0).single().map(|t| t.format("%b %-d, %Y").to_string()).unwrap_or_default()
+        Local
+            .timestamp_opt(secs, 0)
+            .single()
+            .map(|t| crate::prefs::appearance::custom_date(&t, false).unwrap_or_else(|| t.format("%b %-d, %Y").to_string()))
+            .unwrap_or_default()
     };
     let status = match (key.revoked, key.expired, key.expires) {
         (true, _, _) => "revoked".to_owned(),
