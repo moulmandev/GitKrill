@@ -4,6 +4,12 @@
 //! revert, squash, copy), "Compare with HEAD" on a commit and "Compare with
 //! <current branch>" on a branch or tag, and their command palette entries.
 //!
+//! Two commits are compared tree to tree, or from where they forked (their
+//! merge base: what the newer side adds on its own, git's `A...B`). A commit
+//! selected alone can also be compared with the working tree, uncommitted
+//! changes included; the panel then shows that comparison instead of the
+//! commit's details until another commit is selected.
+//!
 //! The graph calls [`click`] and [`arrow`] instead of selecting a row itself,
 //! asks [`Multi::contains`] whether a row looks selected, and lets [`menu`]
 //! draw the context menu of a selected commit. The panel calls [`panel`]
@@ -13,6 +19,8 @@
 pub mod pick;
 
 use std::sync::{Arc, Weak};
+
+use crate::git::repo::Loader;
 
 use eframe::egui::{
     self, Align, Button, Color32, Frame, Layout, Margin, Rect, Response, RichText,
@@ -47,12 +55,20 @@ pub struct Multi {
     pub picked: Picked,
     /// The selection generation in which the comparison was swapped round.
     swapped: Option<u64>,
+    /// The selection generation in which the two commits were set to be
+    /// compared from their merge base.
+    forked: Option<u64>,
+    /// A commit selected alone that the panel compares with the working
+    /// tree, while it stays the focus.
+    working_tree: Option<Oid>,
     facts: Option<(Stamp, Arc<Facts>)>,
-    /// The sides whose files were asked for, and the answer once it came.
-    asked: Option<(Oid, Oid)>,
-    files: Option<Result<Arc<Vec<FileChange>>, String>>,
-    /// Two commits to compare once both are in the graph.
-    pending: Option<(Oid, Oid)>,
+    /// The sides whose files were asked for, the snapshot they were asked
+    /// at, and the answer once it came.
+    asked: Option<Sides>,
+    asked_at: Weak<RepoSnapshot>,
+    files: Option<Result<Arc<Compared>, String>>,
+    /// A comparison to show once its commits are in the graph.
+    pending: Option<Pending>,
     /// The squash is being checked on the reader thread.
     squashing: bool,
 }
@@ -72,6 +88,7 @@ impl Multi {
     pub fn reset(&mut self, anchor: Option<Oid>) {
         self.picked.single(anchor);
         self.pending = None;
+        self.working_tree = None;
     }
 
     /// After a refresh; see [`Picked::retain`].
@@ -83,15 +100,78 @@ impl Multi {
         self.swapped == Some(self.picked.generation())
     }
 
+    fn is_forked(&self) -> bool {
+        self.forked == Some(self.picked.generation())
+    }
+
     /// The two sides the panel compares: two commits, older first unless
-    /// swapped, or for a line of more, the change they make together.
-    fn sides(&self, facts: &Facts) -> Option<(Oid, Oid)> {
+    /// swapped (from their merge base when forked), or for a line of more,
+    /// the change they make together.
+    fn sides(&self, facts: &Facts) -> Option<Sides> {
         match facts.commits.as_slice() {
-            [newer, older] if self.is_swapped() => Some((*newer, *older)),
-            [newer, older] => Some((*older, *newer)),
-            _ => facts.combined(),
+            [newer, older] => {
+                let (from, to) = if self.is_swapped() { (*newer, *older) } else { (*older, *newer) };
+                Some(if self.is_forked() { Sides::Forked { other: from, tip: to } } else { Sides::Trees { from, to } })
+            }
+            _ => facts.combined().map(|(from, to)| Sides::Trees { from, to }),
         }
     }
+
+    /// The commit the panel compares with the working tree, if it shows
+    /// that comparison: the focus, selected alone.
+    fn working_tree_side(&self, focus: Option<Oid>) -> Option<Oid> {
+        self.working_tree.filter(|oid| !self.is_active() && focus == Some(*oid))
+    }
+}
+
+/// What the panel compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sides {
+    /// One commit's tree with another's; `from` is shown as removed lines.
+    Trees { from: Oid, to: Oid },
+    /// What `tip` adds on its own since it forked from `other`: from their
+    /// merge base to `tip` (git's `other...tip`).
+    Forked { other: Oid, tip: Oid },
+    /// A commit with the working tree, uncommitted changes included.
+    WorkingTree { from: Oid },
+}
+
+/// The files that differ between two sides, and how their diffs are asked for.
+struct Compared {
+    files: Arc<Vec<FileChange>>,
+    source: DiffSource,
+    /// The merge base, for [`Sides::Forked`].
+    base: Option<Oid>,
+}
+
+/// Works out what differs between `sides`, on the reader thread.
+fn compared(loader: &Loader, sides: Sides) -> Result<Compared, String> {
+    Ok(match sides {
+        Sides::Trees { from, to } => Compared {
+            files: Arc::new(loader.compare_files(from, to)?),
+            source: DiffSource::Compare { from, to },
+            base: None,
+        },
+        Sides::Forked { other, tip } => {
+            let (base, files) = loader.forked_files(other, tip)?;
+            Compared { files: Arc::new(files), source: DiffSource::Compare { from: base, to: tip }, base: Some(base) }
+        }
+        Sides::WorkingTree { from } => Compared {
+            files: Arc::new(loader.working_tree_files(from)?),
+            source: DiffSource::WorkingTree { from },
+            base: None,
+        },
+    })
+}
+
+/// A comparison waiting for its commits to be loaded into the graph.
+#[derive(Clone, Copy, Debug)]
+enum Pending {
+    /// Two commits, the focus on `a`; with `forked`, what `a` adds since it
+    /// forked from `b`.
+    Two { a: Oid, b: Oid, forked: bool },
+    /// A commit with the working tree.
+    WorkingTree(Oid),
 }
 
 fn focused(tab: &RepoTab) -> Option<Oid> {
@@ -189,27 +269,62 @@ fn reveal(tab: &mut RepoTab, snap: &RepoSnapshot, oid: Oid) {
 /// Selects `a` and `b` as the two commits to compare, focused on `a`. When
 /// one of them is not in the graph yet, more history is loaded until it is.
 pub fn compare(tab: &mut RepoTab, shared: &mut Shared, a: Oid, b: Oid) {
-    tab.multi.pending = Some((a, b));
+    start(tab, shared, Pending::Two { a, b, forked: false });
+}
+
+/// Compares what `tip` adds on its own since it forked from `other`: from
+/// their merge base to `tip`. Both are selected, focused on `tip`.
+pub fn compare_forked(tab: &mut RepoTab, shared: &mut Shared, tip: Oid, other: Oid) {
+    start(tab, shared, Pending::Two { a: tip, b: other, forked: true });
+}
+
+/// Selects `oid` alone and compares it with the working tree.
+pub fn compare_with_working_tree(tab: &mut RepoTab, shared: &mut Shared, oid: Oid) {
+    start(tab, shared, Pending::WorkingTree(oid));
+}
+
+fn start(tab: &mut RepoTab, shared: &mut Shared, pending: Pending) {
+    tab.multi.pending = Some(pending);
     if let Some(snap) = tab.snap.clone() {
         finish_compare(tab, shared, &snap);
     }
 }
 
 fn finish_compare(tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSnapshot) {
-    let Some((a, b)) = tab.multi.pending else { return };
+    let Some(pending) = tab.multi.pending else { return };
     let history = &snap.history;
-    if selectable(history, a) && selectable(history, b) {
+    let wanted = match pending {
+        Pending::Two { a, b, .. } => vec![a, b],
+        Pending::WorkingTree(oid) => vec![oid],
+    };
+    let missing = wanted.into_iter().find(|oid| !selectable(history, *oid));
+    if missing.is_none() {
         tab.multi.pending = None;
-        tab.multi.picked.select(&[a, b]);
-        tab.focus(Selection::Commit(a));
-        tab.scroll_to = snap.row_of(a);
+        match pending {
+            Pending::Two { a, b, forked } => {
+                tab.multi.picked.select(&[a, b]);
+                tab.focus(Selection::Commit(a));
+                if forked {
+                    // `a` is the side whose changes are shown: the newer
+                    // one unless swapped.
+                    let generation = tab.multi.picked.generation();
+                    tab.multi.forked = Some(generation);
+                    tab.multi.swapped = (snap.row_of(a) > snap.row_of(b)).then_some(generation);
+                }
+                tab.scroll_to = snap.row_of(a);
+            }
+            Pending::WorkingTree(oid) => {
+                tab.select(Selection::Commit(oid));
+                tab.multi.working_tree = Some(oid);
+                tab.scroll_to = snap.row_of(oid);
+            }
+        }
         tab.diff = None;
     } else if history.has_more {
         // A no-op while a bigger page is already on its way.
         tab.load_more();
-    } else {
+    } else if let Some(missing) = missing {
         tab.multi.pending = None;
-        let missing = if selectable(history, a) { b } else { a };
         shared.toast(
             ToastKind::Error,
             "Cannot compare",
@@ -238,24 +353,51 @@ fn poll(tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSnapshot) {
             Err(e) => shared.toast(ToastKind::Error, "Cannot squash these commits", e),
         }
     }
-    if let Some((from, to, result)) = tab.take_result::<(Oid, Oid, Result<Vec<FileChange>, String>)>(FILES_JOB)
-        && tab.multi.asked == Some((from, to))
+    if let Some((sides, result)) = tab.take_result::<(Sides, Result<Compared, String>)>(FILES_JOB)
+        && tab.multi.asked == Some(sides)
     {
         tab.multi.files = Some(result.map(Arc::new));
     }
 }
 
 /// Asks the reader thread for the files that differ between `sides`, unless
-/// they are the ones already shown or asked for.
-fn load_files(tab: &mut RepoTab, sides: Option<(Oid, Oid)>) {
-    if tab.multi.asked == sides {
+/// they are the ones already shown or asked for. A comparison with the
+/// working tree is asked again with every new snapshot, since the files on
+/// disk may have changed; the files shown stay until the answer comes.
+fn load_files(tab: &mut RepoTab, snap: &Arc<RepoSnapshot>, sides: Option<Sides>) {
+    let same = tab.multi.asked == sides;
+    let fresh = std::ptr::eq(tab.multi.asked_at.as_ptr(), Arc::as_ptr(snap));
+    if same && (fresh || !matches!(sides, Some(Sides::WorkingTree { .. }))) {
         return;
     }
-    tab.multi.asked = sides;
-    tab.multi.files = None;
-    if let Some((from, to)) = sides {
-        tab.spawn_job(FILES_JOB, move |loader| (from, to, loader.compare_files(from, to)));
+    if !same {
+        tab.multi.files = None;
     }
+    tab.multi.asked = sides;
+    tab.multi.asked_at = Arc::downgrade(snap);
+    if let Some(sides) = sides {
+        tab.spawn_job(FILES_JOB, move |loader| (sides, compared(loader, sides)));
+    }
+}
+
+/// The comparison shown, once its files are in.
+fn shown(tab: &RepoTab) -> Option<&Compared> {
+    tab.multi.files.as_ref()?.as_ref().ok().map(|compared| &**compared)
+}
+
+/// Closes an open diff of the comparison shown, when its sides change.
+fn close_compared_diff(tab: &mut RepoTab) {
+    let source = shown(tab).map(|compared| compared.source);
+    if tab.diff.as_ref().is_some_and(|view| Some(view.target.source) == source) {
+        tab.diff = None;
+    }
+}
+
+/// Compares the two selected commits from their merge base, or tree to
+/// tree again.
+fn set_forked(tab: &mut RepoTab, on: bool) {
+    close_compared_diff(tab);
+    tab.multi.forked = on.then(|| tab.multi.picked.generation());
 }
 
 // ---- actions ------------------------------------------------------------------
@@ -368,6 +510,17 @@ pub fn menu(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, oid: Oid) -> bo
     if n == 2 && menu_item(ui, icons::ARROWS_DOWN_UP, "Swap the comparison") {
         swap(tab);
     }
+    if n == 2 {
+        let forked = tab.multi.is_forked();
+        let (icon, label) = fork_toggle(forked);
+        if menu_item(ui, icon, label) {
+            set_forked(tab, !forked);
+        }
+    }
+    if menu_item(ui, icons::PENCIL_SIMPLE, "Compare this commit with working tree") {
+        // Finished by the panel, which polls every frame (`finish_compare`).
+        tab.multi.pending = Some(Pending::WorkingTree(oid));
+    }
     ui.separator();
     if menu_item(ui, icons::COPY, &format!("Copy {n} SHAs")) {
         copy_shas(ui.ctx(), &facts);
@@ -378,14 +531,28 @@ pub fn menu(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, oid: Oid) -> bo
     true
 }
 
+/// The menu entry that turns comparing from the merge base on or off.
+fn fork_toggle(forked: bool) -> (&'static str, &'static str) {
+    if forked {
+        (icons::GIT_DIFF, "Compare tree to tree")
+    } else {
+        (icons::GIT_FORK, "Compare from the merge base")
+    }
+}
+
 fn swap(tab: &mut RepoTab) {
     let generation = tab.multi.picked.generation();
+    if tab.multi.is_forked() {
+        // The other side's changes have another merge base, maybe: the
+        // file open may not be in them.
+        close_compared_diff(tab);
+    }
     tab.multi.swapped = if tab.multi.is_swapped() { None } else { Some(generation) };
     // A file of the comparison that is open turns round with it. A renamed
     // file is found under its other name on the other side.
     if let Some(view) = &tab.diff
         && let DiffSource::Compare { from, to } = view.target.source
-        && tab.multi.asked == Some((from, to))
+        && tab.multi.asked == Some(Sides::Trees { from, to })
     {
         let mut target = view.target.clone();
         target.source = DiffSource::Compare { from: to, to: from };
@@ -396,11 +563,28 @@ fn swap(tab: &mut RepoTab) {
     }
 }
 
-/// "Compare with HEAD", for the menu of a commit selected alone.
+/// "Compare with HEAD" and "Compare with working tree", for the menu of a
+/// commit selected alone.
 pub fn compare_with_head(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSnapshot, oid: Oid) {
-    let Some(head) = snap.head.oid.filter(|head| *head != oid) else { return };
-    if menu_item(ui, icons::GIT_DIFF, "Compare with HEAD") {
+    if let Some(head) = snap.head.oid.filter(|head| *head != oid)
+        && menu_item(ui, icons::GIT_DIFF, "Compare with HEAD")
+    {
         compare(tab, shared, oid, head);
+    }
+    working_tree_item(ui, tab, shared, snap, oid);
+}
+
+/// "Compare with working tree": left out for HEAD while nothing is changed,
+/// where there would be nothing to show.
+fn working_tree_item(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSnapshot, oid: Oid) {
+    if snap.head.oid.is_none() || (snap.head.oid == Some(oid) && snap.status.is_clean()) {
+        return;
+    }
+    let item = ui
+        .button(format!("{}  Compare with working tree", icons::PENCIL_SIMPLE))
+        .on_hover_text("What differs between this commit and the files on disk, uncommitted changes included");
+    if item.clicked() {
+        compare_with_working_tree(tab, shared, oid);
     }
 }
 
@@ -418,27 +602,46 @@ pub fn compare_item(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &
     if menu_item(ui, icons::GIT_DIFF, &label) {
         compare(tab, shared, tip, head);
     }
+    let current = snap.head.branch.as_deref().filter(|_| !snap.head.detached).unwrap_or("HEAD");
+    let forked = ui
+        .button(format!("{}  {label} from the merge base", icons::GIT_FORK))
+        .on_hover_text(format!(
+            "What this adds on its own: its changes since it forked from {current} (git diff {current}...)"
+        ));
+    if forked.clicked() {
+        compare_forked(tab, shared, tip, head);
+    }
+    working_tree_item(ui, tab, shared, snap, tip);
 }
 
 // ---- command palette ----------------------------------------------------------
 
 /// Palette entries for the selection: the actions on several commits, or
-/// "Compare with HEAD" for one.
+/// "Compare with HEAD" and "Compare with working tree" for one.
 pub fn palette_entries(list: &mut Vec<Entry>, tab: &RepoTab, snap: &RepoSnapshot) {
     if !tab.multi.is_active() {
-        let Some(oid) = focused(tab).filter(|oid| Some(*oid) != snap.head.oid && selectable(&snap.history, *oid))
-        else {
-            return;
-        };
+        let Some(oid) = focused(tab).filter(|oid| selectable(&snap.history, *oid)) else { return };
         let Some(head) = snap.head.oid else { return };
         let summary = snap.row_of(oid).map(|row| snap.history.commits[row].summary.clone()).unwrap_or_default();
-        list.push(
-            Entry::on_tab("compare-head", icons::GIT_DIFF, "Compare with HEAD", move |tab, shared| {
-                compare(tab, shared, oid, head)
-            })
-            .detail(format!("{} {summary}", short(oid)))
-            .keywords("diff difference between commits"),
-        );
+        let detail = format!("{} {summary}", short(oid));
+        if oid != head {
+            list.push(
+                Entry::on_tab("compare-head", icons::GIT_DIFF, "Compare with HEAD", move |tab, shared| {
+                    compare(tab, shared, oid, head)
+                })
+                .detail(detail.clone())
+                .keywords("diff difference between commits"),
+            );
+        }
+        if oid != head || !snap.status.is_clean() {
+            list.push(
+                Entry::on_tab("compare-working-tree", icons::PENCIL_SIMPLE, "Compare with working tree", move |tab, shared| {
+                    compare_with_working_tree(tab, shared, oid)
+                })
+                .detail(detail)
+                .keywords("diff difference uncommitted changes files on disk wip"),
+            );
+        }
         return;
     }
 
@@ -476,6 +679,13 @@ pub fn palette_entries(list: &mut Vec<Entry>, tab: &RepoTab, snap: &RepoSnapshot
             Entry::on_tab("multi-swap", icons::ARROWS_DOWN_UP, "Swap the compared commits", |tab, _| swap(tab))
                 .keywords("compare direction reverse"),
         );
+        let forked = tab.multi.is_forked();
+        let (icon, label) = fork_toggle(forked);
+        list.push(
+            Entry::on_tab("multi-fork", icon, label, move |tab, _| set_forked(tab, !forked))
+                .detail(if forked { "what differs between the two trees" } else { "what the newer one adds on its own" })
+                .keywords("compare merge base fork diverged three dot ... branch adds"),
+        );
     }
     list.push(Entry::new(Kind::Action, "multi-copy", icons::COPY, format!("Copy {n} SHAs"), |env: &mut Env<'_>| {
         if let Some(tab) = env.tab.as_deref_mut()
@@ -501,17 +711,41 @@ enum Act {
     Reveal(Oid),
     Only(Oid),
     Swap,
+    Forked(bool),
     CherryPick,
     Revert,
     Squash,
     Copy,
 }
 
+/// What a comparison from the merge base shows, said in words.
+fn forked_text(other: Oid, tip: Oid, base: Option<Oid>) -> String {
+    let (other_s, tip_s) = (short(other), short(tip));
+    match base {
+        Some(base) if base == other => format!(
+            "From the merge base: what {tip_s} adds on its own. {other_s} is an ancestor of it, so this is the \
+             same as comparing the two."
+        ),
+        Some(base) => format!(
+            "From the merge base: what {tip_s} adds on its own, its changes since it forked from {other_s} at \
+             {} (git diff {other_s}...{tip_s}).",
+            short(base)
+        ),
+        None => format!("From the merge base: what {tip_s} adds on its own since it forked from {other_s}."),
+    }
+}
+
 /// The right panel while several commits are selected: how many, what they
-/// are, what differs, and buttons for what can be done with them. Returns
-/// false, drawing nothing, while only one is selected.
+/// are, what differs, and buttons for what can be done with them; or while
+/// a commit is compared with the working tree, that comparison. Returns
+/// false, drawing nothing, otherwise.
 pub fn panel(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<RepoSnapshot>) -> bool {
     poll(tab, shared, snap);
+    if let Some(from) = tab.multi.working_tree_side(focused(tab)) {
+        load_files(tab, snap, Some(Sides::WorkingTree { from }));
+        working_tree_panel(ui, tab, shared, snap, from);
+        return true;
+    }
     if !tab.multi.is_active() {
         return false;
     }
@@ -521,7 +755,8 @@ pub fn panel(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<Rep
         return false;
     }
     let sides = tab.multi.sides(&facts);
-    load_files(tab, sides);
+    load_files(tab, snap, sides);
+    let base = shown(tab).and_then(|compared| compared.base);
     let mut act = None;
 
     Frame::new().inner_margin(Margin::same(12)).show(ui, |ui| {
@@ -539,12 +774,21 @@ pub fn panel(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<Rep
             });
         });
         let what = match (n, sides) {
+            (2, Some(Sides::Forked { other, tip })) => forked_text(other, tip, base),
             (2, _) => "The files that differ between the two commits.".to_owned(),
-            (_, Some((from, _))) => format!("One unbroken line of history: what the {n} change together, from {}.", short(from)),
+            (_, Some(Sides::Trees { from, .. })) => format!("One unbroken line of history: what the {n} change together, from {}.", short(from)),
             _ if facts.line => "One unbroken line, starting at the repository's first commit: there is nothing before it to compare with.".to_owned(),
             _ => "Not one unbroken line of history, so there is no combined change to show.".to_owned(),
         };
         ui.add(egui::Label::new(RichText::new(what).size(12.0).color(theme::text_dim())).wrap());
+        if n == 2 {
+            // Tree to tree, or what one adds since they forked (`A...B`).
+            let mut forked = tab.multi.is_forked();
+            ui.horizontal(|ui| segmented(ui, &mut forked, (icons::GIT_DIFF, "Tree to tree"), (icons::GIT_FORK, "From merge base")));
+            if forked != tab.multi.is_forked() {
+                act = Some(Act::Forked(forked));
+            }
+        }
 
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
@@ -577,7 +821,9 @@ pub fn panel(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<Rep
     // Two commits: both rows. More: up to two fifths of the panel when a
     // file list follows, all of it otherwise.
     let rows: Vec<(Oid, Option<(&str, Color32)>)> = match (n, sides) {
-        (2, Some((from, to))) => vec![(from, Some(("from", theme::red()))), (to, Some(("to", theme::green())))],
+        (2, Some(Sides::Trees { from, to } | Sides::Forked { other: from, tip: to })) => {
+            vec![(from, Some(("from", theme::red()))), (to, Some(("to", theme::green())))]
+        }
         _ => facts.commits.iter().map(|oid| (*oid, None)).collect(),
     };
     let list_h = if sides.is_some() { (rows.len() as f32 * ROW_H).min((room * 0.4).max(ROW_H * 2.0)) } else { room };
@@ -609,8 +855,9 @@ pub fn panel(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<Rep
             }
         });
 
-    if let Some((from, to)) = sides {
-        files(ui, tab, shared, from, to);
+    if sides.is_some() {
+        let forked = matches!(sides, Some(Sides::Forked { .. }));
+        files(ui, tab, shared, if forked { "since the merge base" } else { "" });
     }
 
     match act {
@@ -620,6 +867,7 @@ pub fn panel(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<Rep
         Some(Act::Reveal(oid)) => reveal(tab, snap, oid),
         Some(Act::Only(oid)) => tab.select(Selection::Commit(oid)),
         Some(Act::Swap) => swap(tab),
+        Some(Act::Forked(on)) => set_forked(tab, on),
         Some(Act::CherryPick) => cherry_pick(tab, &facts),
         Some(Act::Revert) => revert(tab, &facts),
         Some(Act::Squash) => squash(tab, &facts),
@@ -627,6 +875,97 @@ pub fn panel(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<Rep
         None => {}
     }
     true
+}
+
+/// The panel while a commit is compared with the working tree: the commit,
+/// the working tree, and the files that differ between them.
+fn working_tree_panel(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSnapshot, from: Oid) {
+    let mut close = false;
+    let mut reveal_it = false;
+    Frame::new().inner_margin(Margin::same(12)).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 6.0;
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new(format!("{}  Compared with the working tree", icons::PENCIL_SIMPLE))
+                    .font(theme::bold(15.0))
+                    .color(theme::text_bright()),
+            );
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if icon_button(ui, icons::X, 13.0, "Back to the commit's details").clicked() {
+                    close = true;
+                }
+            });
+        });
+        let what = format!(
+            "What differs between {} and the files on disk: staged, unstaged and untracked changes included \
+             (git diff {}).",
+            short(from),
+            short(from)
+        );
+        ui.add(egui::Label::new(RichText::new(what).size(12.0).color(theme::text_dim())).wrap());
+    });
+
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let (top, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().hline(top.x_range(), top.top(), Stroke::new(1.0, theme::border()));
+    if let Some(row) = snap.row_of(from) {
+        let commit = &snap.history.commits[row];
+        let response = commit_row(ui, shared, commit, Some(("from", theme::red())), true)
+            .on_hover_text(format!("{}\n{}", commit.summary, commit.oid));
+        reveal_it = response.clicked();
+    }
+    working_tree_row(ui, snap, ("to", theme::green()));
+    files(ui, tab, shared, "");
+
+    if close {
+        close_compared_diff(tab);
+        tab.multi.working_tree = None;
+    } else if reveal_it {
+        tab.scroll_to = snap.row_of(from);
+    }
+}
+
+/// A tinted tag naming a side of a comparison, at `x` in `rect`. Returns
+/// where what follows it starts.
+fn paint_tag(painter: &egui::Painter, rect: Rect, x: f32, (text, color): (&str, Color32)) -> f32 {
+    let galley = painter.layout_no_wrap(text.to_uppercase(), theme::bold(10.0), color);
+    let chip = Rect::from_min_size(pos2(x, rect.center().y - 9.0), vec2(42.0, 18.0));
+    painter.rect(
+        chip,
+        3.0,
+        theme::mix(theme::bg_app(), color, 0.14),
+        Stroke::new(1.0, theme::mix(theme::bg_app(), color, 0.6)),
+        StrokeKind::Inside,
+    );
+    let at = chip.center() - galley.size() / 2.0;
+    painter.galley(pos2(at.x.round(), at.y.round()), galley, color);
+    chip.right() + 10.0
+}
+
+/// The working tree as a side of a comparison: what is changed in it.
+fn working_tree_row(ui: &mut Ui, snap: &RepoSnapshot, tag: (&str, Color32)) {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), ROW_H), Sense::hover());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    let x = paint_tag(&painter, rect, rect.left() + 12.0, tag);
+    let center = pos2(x + 12.0, rect.center().y);
+    painter.circle_filled(center, 12.0, theme::mix(theme::bg_app(), theme::yellow(), 0.18));
+    painter.text(center, egui::Align2::CENTER_CENTER, icons::PENCIL_SIMPLE, theme::font(13.0), theme::yellow());
+
+    let text_x = x + 32.0;
+    let width = (rect.right() - 10.0 - text_x).max(20.0);
+    let summary = elided(&painter, "Working tree", theme::font(13.0), theme::text(), width);
+    painter.galley(pos2(text_x, rect.top() + 4.0), summary, theme::text());
+    let changes = match snap.status.file_count() {
+        0 => "No uncommitted changes".to_owned(),
+        1 => "1 file with uncommitted changes".to_owned(),
+        n => format!("{n} files with uncommitted changes"),
+    };
+    let rest = format!("{changes}  ·  on {}", snap.head_label());
+    let rest = elided(&painter, &rest, theme::font(11.5), theme::text_dim(), width);
+    painter.galley(pos2(text_x, rect.top() + 22.0), rest, theme::text_dim());
 }
 
 /// A tinted button that is greyed out, saying why on hover, while `blocker`
@@ -658,19 +997,8 @@ fn commit_row(ui: &mut Ui, shared: &mut Shared, commit: &CommitInfo, tag: Option
     let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
     widgets::row_background(&painter, rect, focus, response.hovered());
     let mut x = rect.left() + 12.0;
-    if let Some((text, color)) = tag {
-        let galley = painter.layout_no_wrap(text.to_uppercase(), theme::bold(10.0), color);
-        let chip = Rect::from_min_size(pos2(x, rect.center().y - 9.0), vec2(42.0, 18.0));
-        painter.rect(
-            chip,
-            3.0,
-            theme::mix(theme::bg_app(), color, 0.14),
-            Stroke::new(1.0, theme::mix(theme::bg_app(), color, 0.6)),
-            StrokeKind::Inside,
-        );
-        let at = chip.center() - galley.size() / 2.0;
-        painter.galley(pos2(at.x.round(), at.y.round()), galley, color);
-        x = chip.right() + 10.0;
+    if let Some(tag) = tag {
+        x = paint_tag(&painter, rect, x, tag);
     }
     let picture = shared.avatars.get(&commit.email, shared.settings.fetch_avatars);
     widgets::avatar_picture(&painter, picture, pos2(x + 12.0, rect.center().y), 12.0, &commit.author, &commit.email, None);
@@ -690,14 +1018,23 @@ fn commit_row(ui: &mut Ui, shared: &mut Shared, commit: &CommitInfo, tag: Option
     response
 }
 
-/// The files that differ from `from` to `to`, with their header.
-fn files(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, from: Oid, to: Oid) {
+/// The files of the comparison shown, with their header; `since` follows
+/// the count ("since the merge base").
+fn files(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, since: &str) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
     ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, theme::border()));
-    let title = match &tab.multi.files {
+    let compared = tab.multi.files.clone();
+    let title = match &compared {
         None => "Comparing…".to_owned(),
-        Some(Ok(files)) if files.is_empty() => "No files differ".to_owned(),
-        Some(Ok(files)) => format!("{} file{} differ{}", files.len(), if files.len() == 1 { "" } else { "s" }, if files.len() == 1 { "s" } else { "" }),
+        Some(Ok(compared)) if compared.files.is_empty() => "No files differ".to_owned(),
+        Some(Ok(compared)) if !since.is_empty() => {
+            let n = compared.files.len();
+            format!("{n} file{} {since}", if n == 1 { "" } else { "s" })
+        }
+        Some(Ok(compared)) => {
+            let n = compared.files.len();
+            format!("{n} file{} differ{}", if n == 1 { "" } else { "s" }, if n == 1 { "s" } else { "" })
+        }
         Some(Err(_)) => "Could not compare".to_owned(),
     };
     // The sides are named above: the two rows, or the line's description.
@@ -708,11 +1045,15 @@ fn files(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, from: Oid, to: Oid
         |ui| segmented(ui, &mut shared.settings.tree_view, (icons::LIST, "Path"), (icons::TREE_VIEW, "Tree")),
     );
 
-    match tab.multi.files.clone() {
-        Some(Ok(files)) if !files.is_empty() => {
+    match compared {
+        Some(Ok(compared)) if !compared.files.is_empty() => {
             let height = ui.available_height();
-            file_list(ui, tab, shared, &files, DiffSource::Compare { from, to }, height);
+            file_list(ui, tab, shared, &compared.files, compared.source, height);
         }
+        Some(Ok(compared)) if matches!(compared.source, DiffSource::WorkingTree { .. }) => {
+            widgets::placeholder(ui, "The files on disk are as they are in this commit.")
+        }
+        Some(Ok(_)) if !since.is_empty() => widgets::placeholder(ui, "Nothing changed since they forked."),
         Some(Ok(_)) => widgets::placeholder(ui, "Both commits have the same files."),
         Some(Err(e)) => widgets::placeholder(ui, &e),
         None => {
@@ -747,7 +1088,7 @@ mod tests {
         tab.snap = Some(snap.clone());
 
         tab.select(Selection::Commit(base));
-        assert_eq!(labels(&tab, &snap), ["Compare with HEAD"]);
+        assert_eq!(labels(&tab, &snap), ["Compare with HEAD", "Compare with working tree"]);
         tab.select(Selection::Commit(c));
         assert!(labels(&tab, &snap).is_empty(), "HEAD has nothing to compare with itself");
 
@@ -756,7 +1097,14 @@ mod tests {
         tab.focus(Selection::Commit(c));
         assert_eq!(
             labels(&tab, &snap),
-            ["Revert 2 commits", "Squash 2 commits", "Swap the compared commits", "Copy 2 SHAs", "Select one commit only"]
+            [
+                "Revert 2 commits",
+                "Squash 2 commits",
+                "Swap the compared commits",
+                "Compare from the merge base",
+                "Copy 2 SHAs",
+                "Select one commit only"
+            ]
         );
         // The first commit of the repository cannot be squashed into.
         tab.multi.picked.select(&[b, base]);
@@ -764,7 +1112,13 @@ mod tests {
         // A plain selection again.
         tab.select(Selection::Commit(b));
         assert!(!tab.multi.is_active());
-        assert_eq!(labels(&tab, &snap), ["Compare with HEAD"]);
+        assert_eq!(labels(&tab, &snap), ["Compare with HEAD", "Compare with working tree"]);
+        // Something changed: HEAD can be compared with the working tree.
+        fx.write("c.txt", "changed\n");
+        let dirty = fx.snapshot();
+        tab.snap = Some(dirty.clone());
+        tab.select(Selection::Commit(c));
+        assert_eq!(labels(&tab, &dirty), ["Compare with working tree"]);
     }
 
     #[test]
@@ -781,11 +1135,141 @@ mod tests {
         let [newer, older] = [facts.commits[0], facts.commits[1]];
         let mut multi = Multi::default();
         multi.picked.select(&[newer, older]);
-        assert_eq!(multi.sides(&facts), Some((older, newer)));
+        assert_eq!(multi.sides(&facts), Some(Sides::Trees { from: older, to: newer }));
         multi.swapped = Some(multi.picked.generation());
-        assert_eq!(multi.sides(&facts), Some((newer, older)));
-        // Another selection compares older first again.
+        assert_eq!(multi.sides(&facts), Some(Sides::Trees { from: newer, to: older }));
+        // From the merge base: what the "to" side adds since it forked.
+        multi.forked = Some(multi.picked.generation());
+        assert_eq!(multi.sides(&facts), Some(Sides::Forked { other: newer, tip: older }));
+        // Another selection compares older first again, tree to tree.
         multi.picked.select(&[older, newer]);
-        assert_eq!(multi.sides(&facts), Some((older, newer)));
+        assert_eq!(multi.sides(&facts), Some(Sides::Trees { from: older, to: newer }));
+    }
+
+    fn head(fx: &Fixture) -> Oid {
+        Oid::from_str(&crate::tests::git(&fx.dir, &["rev-parse", "HEAD"])).unwrap()
+    }
+
+    fn compare_in(fx: &Fixture, sides: Sides) -> Result<Compared, String> {
+        fx.job(move |loader| compared(loader, sides))
+    }
+
+    fn kinds(compared: &Compared) -> Vec<(&str, crate::git::ChangeKind)> {
+        compared.files.iter().map(|file| (file.path.as_str(), file.kind)).collect()
+    }
+
+    fn diff_in(fx: &Fixture, source: DiffSource, path: &str, mode: crate::git::diff::Mode) -> crate::git::FileDiff {
+        let target = crate::git::DiffTarget { source, path: path.to_owned(), old_path: None };
+        fx.job(move |loader| loader.diff_with(&target, mode)).unwrap()
+    }
+
+    /// The changed lines of a diff worked out in `mode`, as `+text` and `-text`.
+    fn changes(fx: &Fixture, source: DiffSource, path: &str, mode: crate::git::diff::Mode) -> Vec<String> {
+        let diff = diff_in(fx, source, path, mode);
+        diff.hunks
+            .iter()
+            .flat_map(|h| &h.lines)
+            .filter(|l| l.origin != ' ')
+            .map(|l| format!("{}{}", l.origin, l.text))
+            .collect()
+    }
+
+    #[test]
+    fn a_commit_is_compared_with_the_working_tree_changes_included() {
+        use crate::git::ChangeKind::{Deleted, Modified, Untracked};
+        use crate::git::diff::Mode;
+        let fx = Fixture::new("multi-working-tree");
+        let numbered: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        fx.write("kept.txt", "same\n");
+        fx.write("staged ü.txt", "one\n");
+        fx.write("edited.txt", "fn main() {\nfoo();\n}\n");
+        fx.write("long.txt", &numbered);
+        fx.write("gone.txt", "bye\n");
+        fx.commit_all("first");
+        let first = head(&fx);
+        fx.write("staged ü.txt", "two\n");
+        fx.commit_all("second");
+
+        // Nothing uncommitted: the commit against what HEAD has.
+        let clean = compare_in(&fx, Sides::WorkingTree { from: first }).unwrap();
+        assert_eq!(kinds(&clean), [("staged ü.txt", Modified)]);
+        assert_eq!(clean.source, DiffSource::WorkingTree { from: first });
+
+        // Staged, unstaged, deleted on disk only, untracked in a new folder.
+        fx.write("staged ü.txt", "three\n");
+        crate::tests::git(&fx.dir, &["add", "staged ü.txt"]);
+        fx.write("edited.txt", "fn main() {\n    foo();\n    bar();\n}\n");
+        fx.write("long.txt", &numbered.replace("line 10\n", "line ten\n"));
+        std::fs::remove_file(fx.dir.join("gone.txt")).unwrap();
+        fx.write("new dir/new file.txt", "fresh\n");
+        let dirty = compare_in(&fx, Sides::WorkingTree { from: first }).unwrap();
+        assert_eq!(
+            kinds(&dirty),
+            [
+                ("edited.txt", Modified),
+                ("gone.txt", Deleted),
+                ("long.txt", Modified),
+                ("new dir/new file.txt", Untracked),
+                ("staged ü.txt", Modified)
+            ]
+        );
+
+        // Their diffs, in each mode.
+        let source = DiffSource::WorkingTree { from: first };
+        let plain = Mode::default();
+        assert_eq!(changes(&fx, source, "staged ü.txt", plain), ["-one", "+three"]);
+        assert_eq!(changes(&fx, source, "new dir/new file.txt", plain), ["+fresh"]);
+        assert_eq!(changes(&fx, source, "gone.txt", plain), ["-bye"]);
+        assert_eq!(changes(&fx, source, "edited.txt", plain), ["-foo();", "+    foo();", "+    bar();"]);
+        let ignoring = Mode { ignore_whitespace: true, ..plain };
+        assert_eq!(changes(&fx, source, "edited.txt", ignoring), ["+    bar();"]);
+        let whole = diff_in(&fx, source, "long.txt", Mode { whole_file: true, ..plain });
+        assert!(whole.hunks.iter().any(|h| h.gap), "the unchanged lines are there too");
+        assert_eq!(whole.hunks.iter().flat_map(|h| &h.lines).count(), 21);
+        // Read-only, and read from disk.
+        assert!(source.is_committed() && source.reads_working_tree());
+    }
+
+    #[test]
+    fn two_branches_are_compared_from_where_they_forked() {
+        use crate::git::ChangeKind::Added;
+        let fx = Fixture::new("multi-forked");
+        let git = |args: &[&str]| crate::tests::git(&fx.dir, args);
+        fx.write("base.txt", "base\n");
+        fx.commit_all("base");
+        let fork = head(&fx);
+        git(&["checkout", "-q", "-b", "feature"]);
+        fx.write("feature file.txt", "feature\n");
+        fx.commit_all("feature work");
+        let feature = head(&fx);
+        git(&["checkout", "-q", "main"]);
+        fx.write("main.txt", "main\n");
+        fx.commit_all("main work");
+        let main = head(&fx);
+
+        // Tree to tree, main's own change shows too.
+        let trees = compare_in(&fx, Sides::Trees { from: main, to: feature }).unwrap();
+        assert_eq!(trees.files.len(), 2);
+        // From the merge base: only what the feature adds.
+        let forked = compare_in(&fx, Sides::Forked { other: main, tip: feature }).unwrap();
+        assert_eq!(forked.base, Some(fork));
+        assert_eq!(kinds(&forked), [("feature file.txt", Added)]);
+        assert_eq!(forked.source, DiffSource::Compare { from: fork, to: feature });
+        // And the other way round, what main adds.
+        let back = compare_in(&fx, Sides::Forked { other: feature, tip: main }).unwrap();
+        assert_eq!(kinds(&back), [("main.txt", Added)]);
+        // An ancestor is its own merge base: the same as comparing the two.
+        let ancestor = compare_in(&fx, Sides::Forked { other: fork, tip: feature }).unwrap();
+        assert_eq!(ancestor.base, Some(fork));
+        assert!(forked_text(fork, feature, ancestor.base).contains("is an ancestor"));
+
+        // Histories that never met have no merge base.
+        git(&["checkout", "-q", "--orphan", "alone"]);
+        git(&["rm", "-rfq", "."]);
+        fx.write("alone.txt", "alone\n");
+        fx.commit_all("unrelated");
+        let alone = head(&fx);
+        let error = compare_in(&fx, Sides::Forked { other: main, tip: alone }).err().expect("no merge base");
+        assert!(error.contains("no commit in common"), "{error}");
     }
 }

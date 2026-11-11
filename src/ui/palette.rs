@@ -432,6 +432,8 @@ pub fn entries(tabs: &[RepoTab], active: usize, settings: &Settings) -> Vec<Entr
         crate::ui::remotes::palette_entries(&mut list, tab, snap);
         crate::ui::multi::palette_entries(&mut list, tab, snap);
         crate::ui::stash::palette_entries(&mut list, tab, snap);
+        crate::ui::browse::palette_entries(&mut list, tab);
+        crate::ui::versions::palette_entries(&mut list, tab);
     }
     if let Some(tab) = tab {
         external_tools(&mut list, tab, snap, settings);

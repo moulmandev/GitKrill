@@ -1,12 +1,14 @@
 //! User interface, one module per region of the window.
 
 pub mod branch_folder;
+pub mod browse;
 pub mod commit_button;
 pub mod conflict;
 pub mod dialogs;
 pub mod diff;
 pub mod diff_mode;
 pub mod diff_split;
+pub mod file_view;
 pub mod files;
 pub mod git_setup;
 pub mod gitflow;
@@ -28,6 +30,7 @@ pub mod stash;
 pub mod textsel;
 pub mod toolbar;
 pub mod update;
+pub mod versions;
 pub mod widgets;
 pub mod workspace;
 

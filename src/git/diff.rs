@@ -11,7 +11,7 @@ use super::text::{self, Encoding, display_text_in, source_text_in};
 use super::{DiffLine, DiffSource, DiffTarget, FileDiff, Hunk};
 
 /// Beyond this many lines the rest of the diff is not shown.
-const MAX_LINES: usize = 50_000;
+pub(super) const MAX_LINES: usize = 50_000;
 /// Binary files larger than this are not looked at as UTF-16 text.
 const MAX_TRANSCODED_BYTES: usize = 16 * 1024 * 1024;
 /// Lines of context around each change, as `git diff` has.
@@ -75,6 +75,9 @@ impl Loader {
         let repo = &self.repo;
         // How lines become text: the repository's encoding, the tab width.
         let format = text::format_for(repo.workdir().unwrap_or(repo.path()));
+        if let DiffSource::At(commit) = target.source {
+            return self.file_at(commit, &target.path, mode, format);
+        }
         let (mut out, blobs) = self.collect(target, mode, CONTEXT, format)?;
         out.mode = mode;
 
@@ -83,7 +86,7 @@ impl Loader {
         if out.binary && is_image && let Some((old, new)) = blobs {
             // An unstaged file has no blob yet: it is read from disk, unless
             // it is the deletion being shown.
-            let on_disk = (target.source == DiffSource::Unstaged && out.kind != Some(super::ChangeKind::Deleted))
+            let on_disk = (target.source.reads_working_tree() && out.kind != Some(super::ChangeKind::Deleted))
                 .then(|| repo.workdir().map(|dir| dir.join(&target.path)))
                 .flatten();
             let images = picture::load(repo, Some(old), Some(new), on_disk.as_deref());
@@ -157,6 +160,15 @@ impl Loader {
                 let to = repo.find_commit(to).and_then(|c| c.tree()).map_err(err)?;
                 repo.diff_tree_to_tree(Some(&from), Some(&to), Some(&mut opts)).map_err(err)?
             }
+            DiffSource::WorkingTree { from } => {
+                let tree = repo.find_commit(from).and_then(|c| c.tree()).map_err(err)?;
+                opts.include_untracked(true)
+                    .recurse_untracked_dirs(true)
+                    .show_untracked_content(true);
+                repo.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut opts)).map_err(err)?
+            }
+            // Not a diff: `diff_with` reads it with `file_at`.
+            DiffSource::At(_) => return Err("A file of a commit is not a diff.".to_owned()),
         };
 
         if target.old_path.is_some() {
@@ -276,7 +288,7 @@ impl Loader {
             (size <= MAX_TRANSCODED_BYTES).then(|| repo.find_blob(id).ok().map(|blob| blob.content().to_vec()))?
         };
         let new_bytes = match (target.source, out.kind) {
-            (DiffSource::Unstaged, kind) if kind != Some(super::ChangeKind::Deleted) => {
+            (source, kind) if source.reads_working_tree() && kind != Some(super::ChangeKind::Deleted) => {
                 let file = repo.workdir()?.join(&target.path);
                 let small = std::fs::metadata(&file).is_ok_and(|meta| meta.len() <= MAX_TRANSCODED_BYTES as u64);
                 small.then(|| std::fs::read(&file).ok()).flatten()

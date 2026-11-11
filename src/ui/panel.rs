@@ -18,6 +18,7 @@ use crate::ui::widgets::{self, icon_button, segmented, tint_button};
 
 pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
     commit_button::follow_up(ui.ctx(), tab, shared);
+    crate::ui::versions::poll(tab, shared);
     let Some(snap) = tab.snap.clone() else { return };
     // Several commits selected: see `ui::multi`.
     if crate::ui::multi::panel(ui, tab, shared, &snap) {
@@ -300,23 +301,15 @@ fn commit(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<RepoSn
     ui.spacing_mut().item_spacing.y = 0.0;
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::hover());
     ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, theme::border()));
-    let count = details.files.len();
-    ui.painter().text(
-        pos2(rect.left() + 12.0, rect.center().y),
-        Align2::LEFT_CENTER,
-        format!("{count} changed file{}", if count == 1 { "" } else { "s" }),
-        theme::font(13.0),
-        theme::text(),
-    );
-    ui.scope_builder(
-        egui::UiBuilder::new()
-            .max_rect(rect.shrink2(vec2(8.0, 0.0)))
-            .layout(Layout::right_to_left(Align::Center)),
-        |ui| segmented(ui, &mut shared.settings.tree_view, (icons::LIST, "Path"), (icons::TREE_VIEW, "Tree")),
-    );
+    // The files the commit changed, or all of its files (`ui::browse`).
+    crate::ui::browse::header(ui, rect, tab, shared, oid, details.files.len());
 
     let height = ui.available_height();
-    file_list(ui, tab, shared, &details.files, DiffSource::Commit(oid), height);
+    if tab.browse.on {
+        crate::ui::browse::list(ui, tab, shared, oid, &details.files, height);
+    } else {
+        file_list(ui, tab, shared, &details.files, DiffSource::Commit(oid), height);
+    }
 
     if let Some(parent) = jump {
         tab.jump_to(parent);
