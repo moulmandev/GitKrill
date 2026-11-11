@@ -10,7 +10,8 @@
 //!
 //! A hunk is all the parser gets to see, so it starts every hunk in the
 //! syntax's initial state: a hunk that begins inside a block comment or a
-//! multi-line string is coloured as if it did not. The old side (context and
+//! multi-line string is coloured as if it did not. (The unchanged stretches
+//! of a whole-file diff are hunks of their own, `Hunk::gap`.) The old side (context and
 //! removed lines) and the new side (context and added lines) are parsed as
 //! two separate streams, so a string opened on a removed line cannot leak
 //! into the added lines after it.

@@ -644,18 +644,19 @@ impl Metrics {
 pub(super) struct View<'a> {
     pub target: &'a DiffTarget,
     pub diff: &'a Arc<FileDiff>,
+    /// Sizes and fonts.
     pub m: Metrics,
     pub style: Arc<highlight::DiffStyle>,
     /// The lines picked for staging; `None` where lines cannot be staged.
     pub picking: Option<&'a mut LineSelection>,
 }
 
-/// Whether lines (and hunks) of `diff` can be staged, unstaged or
-/// discarded: working tree diffs of files that are not in the middle of a
-/// merge, with whitespace counted. With whitespace ignored the lines no
-/// longer match the files byte for byte, and `git apply` would refuse them
-/// or, worse, apply them somewhere else.
-fn can_apply_parts(target: &DiffTarget, diff: &FileDiff) -> bool {
+/// Whether lines of `diff` can be picked to stage, unstage or discard:
+/// working tree diffs of files that are not in the middle of a merge, with
+/// whitespace counted. With whitespace ignored the lines no longer match the
+/// files byte for byte, and `git apply` would refuse them or, worse, apply
+/// them somewhere else; the hunk buttons are left out then too.
+pub fn can_apply_parts(target: &DiffTarget, diff: &FileDiff) -> bool {
     !target.source.is_committed()
         && !diff.file_header.is_empty()
         && diff.kind != Some(ChangeKind::Conflicted)

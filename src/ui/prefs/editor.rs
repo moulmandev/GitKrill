@@ -127,7 +127,6 @@ pub fn show(ui: &mut Ui, page: &mut Page<'_>, state: &mut State) {
             "While it is on, hunks and lines cannot be staged or discarded one by one; whole files still can.",
         );
     });
-    form::help(ui, "The diff's title bar switches these too, and so does the command palette.");
 }
 
 /// The font drop-down: the default font, then the installed ones (only the

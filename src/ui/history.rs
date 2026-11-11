@@ -871,6 +871,9 @@ fn history_detail(
             {
                 *action = Some(Action::BlameAt(commit.oid, commit.path.clone()));
             }
+            // How the diff is shown, as in the diff view's title bar.
+            ui.add_space(4.0);
+            crate::ui::diff_mode::controls(ui, &mut shared.settings.editor, true);
             buttons_left = ui.min_rect().left();
         },
     );

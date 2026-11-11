@@ -12,6 +12,7 @@
 //! stays within the side it was started in.
 
 use std::any::Any;
+use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Weak};
 
 use eframe::egui::{self, CursorIcon, PointerButton, Pos2, Rect, ScrollArea, Sense, Stroke, Ui, pos2, vec2};
@@ -30,7 +31,7 @@ use crate::ui::textsel::{Lines, Pos};
 /// Comparing every removed line of a block with every added one is
 /// quadratic, and the rows are worked out on the UI thread: past this many
 /// comparisons in one diff, the remaining blocks pair line for line.
-const PAIRING_BUDGET: usize = 16_384;
+const PAIRING_BUDGET: usize = 4_096;
 
 /// The two sides, as indices into per-side arrays.
 pub const LEFT: usize = 0;
@@ -135,23 +136,39 @@ fn block(rows: &mut Vec<Row>, start: usize, removed: usize, added: usize, pairs:
 }
 
 /// [`rows`] of `diff`, kept from frame to frame under `id`: worked out again
-/// only for another diff.
+/// only for a diff with other lines. A reload that changed nothing (a file
+/// was saved, a fetch finished) is a new diff with the same lines.
 pub fn cached(ui: &Ui, id: egui::Id, diff: &Arc<FileDiff>) -> Arc<Rows> {
     #[derive(Clone)]
     struct Cache {
         /// Held weakly so the address stays taken: "same address" then
         /// reliably means "same diff".
         owner: Weak<dyn Any + Send + Sync>,
+        lines: u64,
         rows: Arc<Rows>,
     }
-    if let Some(cache) = ui.data(|data| data.get_temp::<Cache>(id))
+    let owner = || Arc::downgrade(diff) as Weak<dyn Any + Send + Sync>;
+    let cache = ui.data(|data| data.get_temp::<Cache>(id));
+    if let Some(cache) = &cache
         && std::ptr::addr_eq(cache.owner.as_ptr(), Arc::as_ptr(diff))
     {
-        return cache.rows;
+        return cache.rows.clone();
     }
-    let rows = Arc::new(rows(diff));
-    let owner: Weak<dyn Any + Send + Sync> = Arc::downgrade(diff) as Weak<dyn Any + Send + Sync>;
-    ui.data_mut(|data| data.insert_temp(id, Cache { owner, rows: rows.clone() }));
+    let lines = {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for hunk in &diff.hunks {
+            (hunk.gap, hunk.lines.len()).hash(&mut hasher);
+            for line in &hunk.lines {
+                (line.origin, &line.text).hash(&mut hasher);
+            }
+        }
+        hasher.finish()
+    };
+    let rows = match cache {
+        Some(cache) if cache.lines == lines => cache.rows,
+        _ => Arc::new(rows(diff)),
+    };
+    ui.data_mut(|data| data.insert_temp(id, Cache { owner: owner(), lines, rows: rows.clone() }));
     rows
 }
 
@@ -403,8 +420,13 @@ pub(super) fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, mut view
         for x in numbers_right {
             painter.vline(x, clip.y_range(), faint);
         }
-        // Between the two sides, over everything but the hunk bars' text.
-        painter.vline(mid - 0.5, clip.y_range(), Stroke::new(1.0, theme::border()));
+        // Between the two sides, up to the hunk bars, which span both.
+        let divider = Stroke::new(1.0, theme::border());
+        for h in geometry.hunks_between(viewport.min.y, viewport.max.y) {
+            let from = content.top() + geometry.top(h) + geometry.header(h);
+            let to = content.top() + geometry.bottom(h);
+            painter.vline(mid - 0.5, from.max(clip.top())..=to.min(clip.bottom()), divider);
+        }
 
         anchoring.keep(ui, &geometry, viewport.min.y, |flat| {
             let row = rows.rows.get(flat)?;
@@ -594,5 +616,26 @@ mod tests {
         assert_eq!(shape[edit].1.as_deref(), Some("line ten"));
         assert_eq!(shape[edit + 1], (None, Some("line ten and a half".to_owned())));
         assert_eq!(shape[edit + 2].0, shape[edit + 2].1);
+    }
+
+    /// Not a check, a measurement: `cargo test split_rows_speed -- --ignored --nocapture`.
+    /// The worst case for pairing: 50,000 lines in blocks of uneven size.
+    #[test]
+    #[ignore]
+    fn split_rows_speed() {
+        let source = include_str!("diff.rs");
+        let mut lines = Vec::new();
+        for (k, line) in source.lines().cycle().take(50_000).enumerate() {
+            let origin = match k % 12 {
+                0..3 => ' ',
+                3..7 => '-',
+                _ => '+',
+            };
+            lines.push((origin, line));
+        }
+        let diff = of(vec![hunk(&lines)]);
+        let started = std::time::Instant::now();
+        let rows = rows(&diff);
+        println!("{} lines, {} rows in {:.0} ms", lines.len(), rows.rows.len(), started.elapsed().as_secs_f32() * 1000.0);
     }
 }
