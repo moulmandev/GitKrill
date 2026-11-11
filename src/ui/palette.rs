@@ -432,11 +432,13 @@ pub fn entries(tabs: &[RepoTab], active: usize, settings: &Settings) -> Vec<Entr
         crate::ui::remotes::palette_entries(&mut list, tab, snap);
         crate::ui::multi::palette_entries(&mut list, tab, snap);
         crate::ui::stash::palette_entries(&mut list, tab, snap);
+        crate::ui::bisect::palette_entries(&mut list, tab, snap);
+        crate::ui::solo::palette_entries(&mut list, tab, snap);
     }
     if let Some(tab) = tab {
         external_tools(&mut list, tab, snap, settings);
     }
-    if tab.is_some_and(|tab| !tab.hidden.is_empty()) {
+    if tab.is_some_and(|tab| !tab.hidden.is_empty() && tab.solo.is_none()) {
         list.push(
             Entry::on_tab("show-hidden", icons::EYE, "Show everything hidden from the graph", |tab, shared| {
                 tab.set_hidden(&mut shared.settings, "refs/", false)
@@ -512,6 +514,7 @@ fn repository_actions(list: &mut Vec<Entry>, tab: &RepoTab, snap: Option<&RepoSn
         list.push(Entry::on_tab("redo", icons::ARROW_CLOCKWISE, "Redo", |tab, _| tab.redo()).detail(last.label.clone()));
     }
     list.push(Entry::on_tab("search", icons::MAGNIFYING_GLASS, "Search commits", |tab, _| graph::open_search(tab)).shortcut("Ctrl+F"));
+    graph::search::palette_entries(list);
     list.push(Entry::on_tab("refresh", icons::ARROWS_CLOCKWISE, "Refresh", |tab, _| tab.refresh()).shortcut("F5"));
     list.push(
         Entry::on_tab("terminal", icons::TERMINAL_WINDOW, "Open a terminal here", |tab, shared| {

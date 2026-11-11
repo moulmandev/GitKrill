@@ -528,10 +528,11 @@ fn local_row(
         }
         trailing.push_str(&format!("{}{}", branch.behind, icons::ARROW_DOWN));
     }
-    // The graph always shows the checked out branch, so it has no eye.
-    let is_hidden = !branch.is_head && tab.hidden.hides_local(&branch.name);
+    // The graph always shows the checked out branch, so it has no eye
+    // (unless another branch is shown alone, `ui::solo`).
+    let is_hidden = (!branch.is_head || tab.hidden.hides_head()) && tab.hidden.hides_local(&branch.name);
     let (icon, color) = if branch.is_head {
-        (icons::CHECK, theme::text_bright())
+        (icons::CHECK, if is_hidden { theme::text_faint() } else { theme::text_bright() })
     } else if is_hidden {
         (icons::GIT_BRANCH, theme::text_faint())
     } else {
@@ -626,6 +627,7 @@ pub fn local_branch_menu(
     crate::ui::gitflow::branch_menu(ui, tab, shared, snap, branch);
     ui.separator();
     hide_items(ui, tab, shared, HEADS, &branch.name, !branch.is_head);
+    crate::ui::solo::menu_item_for(ui, tab, shared, &hidden::local(&branch.name), &branch.name);
     if menu_item(ui, icons::COPY, "Copy branch name") {
         ui.ctx().copy_text(branch.name.clone());
     }
@@ -712,6 +714,7 @@ pub fn remote_branch_menu(
     }
     ui.separator();
     hide_items(ui, tab, shared, &hidden::folder(REMOTES, &branch.remote), &branch.name, true);
+    crate::ui::solo::menu_item_for(ui, tab, shared, &hidden::remote(&branch.full), &branch.full);
     if menu_item(ui, icons::COPY, "Copy branch name") {
         ui.ctx().copy_text(branch.full.clone());
     }

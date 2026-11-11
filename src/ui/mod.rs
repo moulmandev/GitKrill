@@ -1,5 +1,6 @@
 //! User interface, one module per region of the window.
 
+pub mod bisect;
 pub mod branch_folder;
 pub mod commit_button;
 pub mod conflict;
@@ -24,6 +25,7 @@ pub mod prefs;
 pub mod rebase;
 pub mod remotes;
 pub mod sidebar;
+pub mod solo;
 pub mod stash;
 pub mod textsel;
 pub mod toolbar;

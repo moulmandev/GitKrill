@@ -374,6 +374,15 @@ pub struct RepoTab {
     pub search_hits: Vec<u32>,
     /// The query and history the hits were computed for.
     pub search_stamp: (String, usize),
+    /// The search's filters, and the `git log` answering its file and code
+    /// ones: `ui::graph::search`.
+    pub search_state: crate::ui::graph::search::SearchState,
+    /// Where a bisect in progress stands: `ui::bisect`.
+    pub bisect: crate::ui::bisect::Bisect,
+    /// One branch shown alone in the graph (`ui::solo`). Meanwhile `hidden`
+    /// holds the rules that do it, and the settings keep the ones to go
+    /// back to.
+    pub solo: Option<crate::ui::solo::Solo>,
     /// Collapsed sidebar sections, branch folders and file tree folders.
     pub collapsed: HashSet<String>,
     /// Refs left out of the graph; change them with [`RepoTab::set_hidden`].
@@ -422,6 +431,9 @@ impl RepoTab {
             search_focus: false,
             search_hits: Vec::new(),
             search_stamp: (String::new(), 0),
+            search_state: Default::default(),
+            bisect: Default::default(),
+            solo: None,
             collapsed: HashSet::new(),
             hidden: Hidden::default(),
             last_fs_refresh: Instant::now(),
@@ -512,11 +524,20 @@ impl RepoTab {
     /// the graph without it.
     pub fn set_hidden(&mut self, settings: &mut Settings, path: &str, hide: bool) {
         self.hidden.set(path, hide);
-        if self.hidden.is_empty() {
-            settings.hidden_refs.remove(&self.path);
-        } else {
-            settings.hidden_refs.insert(self.path.clone(), self.hidden.clone());
+        // While one branch is shown alone, the rules to remember are the
+        // ones from before (`ui::solo`).
+        if self.solo.is_none() {
+            if self.hidden.is_empty() {
+                settings.hidden_refs.remove(&self.path);
+            } else {
+                settings.hidden_refs.insert(self.path.clone(), self.hidden.clone());
+            }
         }
+        self.apply_hidden();
+    }
+
+    /// Redraws the graph without what `hidden` hides now.
+    pub fn apply_hidden(&mut self) {
         if let Some(handle) = &self.handle {
             handle.set_hidden(self.hidden.clone());
         }

@@ -54,7 +54,7 @@ impl Loader {
 
     /// Everything the UI shows about the repository now. Refs that `hidden`
     /// hides are listed but not walked and not labelled; the checked out
-    /// branch is never hidden.
+    /// branch is hidden only when `hidden` hides HEAD too.
     pub fn snapshot(&mut self, limit: usize, hidden: &Hidden) -> Result<RepoSnapshot, String> {
         let workdir = self.repo.workdir().ok_or("Repository has no working directory")?.to_path_buf();
         let head = read_head(&self.repo);
@@ -103,7 +103,7 @@ impl Loader {
                     Some((fp, base, more)) if *fp == fingerprint => (base.clone(), *more),
                     _ => {
                         let mut tips: Vec<Oid> = Vec::new();
-                        tips.extend(head.oid);
+                        tips.extend(head.oid.filter(|_| !hidden.hides_head()));
                         tips.extend(shown.branches(&branches).filter_map(|b| b.oid));
                         tips.extend(shown.remotes(&remote_branches).map(|b| b.oid));
                         tips.extend(shown.tags(&tags).map(|t| t.oid));
@@ -116,9 +116,16 @@ impl Loader {
 
                 let mut commits = Vec::with_capacity(base.len() + 1);
                 if has_wip {
+                    // With HEAD hidden its commit may be missing: no line
+                    // then, rather than one running down the whole graph.
+                    let parents = head
+                        .oid
+                        .filter(|oid| !hidden.hides_head() || base.iter().any(|c| c.oid == *oid))
+                        .into_iter()
+                        .collect();
                     commits.push(CommitInfo {
                         oid: Oid::ZERO_SHA1,
-                        parents: head.oid.into_iter().collect(),
+                        parents,
                         summary: "// WIP".to_owned(),
                         body_preview: String::new(),
                         author: String::new(),
@@ -660,7 +667,10 @@ struct Shown {
 impl Shown {
     fn new(hidden: &Hidden, branches: &[BranchInfo], remotes: &[RemoteBranch], tags: &[TagInfo]) -> Self {
         Shown {
-            branches: branches.iter().map(|b| b.is_head || !hidden.hides_local(&b.name)).collect(),
+            branches: branches
+                .iter()
+                .map(|b| (b.is_head && !hidden.hides_head()) || !hidden.hides_local(&b.name))
+                .collect(),
             remotes: remotes.iter().map(|b| !hidden.hides_remote(&b.full)).collect(),
             tags: tags.iter().map(|t| !hidden.hides_tag(&t.name)).collect(),
         }

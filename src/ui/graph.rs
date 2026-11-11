@@ -4,12 +4,13 @@
 pub mod drag;
 mod ghost;
 pub mod reach;
+pub mod search;
 
 use std::sync::Arc;
 
 use eframe::egui::{
     self, Align, Align2, Color32, CursorIcon, Key, Painter, Popup, PopupCloseBehavior, Pos2,
-    Rangef, Rect, Response, ScrollArea, Sense, Shape, Stroke, StrokeKind, TextEdit, Ui, pos2, vec2,
+    Rangef, Rect, Response, ScrollArea, Sense, Shape, Stroke, StrokeKind, Ui, pos2, vec2,
 };
 
 use crate::git::graph::SegKind;
@@ -19,7 +20,7 @@ use crate::prefs::graph::Description;
 use crate::state::{AppAction, Dialog, RepoTab, Settings, Shared, format_time};
 use crate::theme::{self, icons};
 use crate::ui::sidebar;
-use crate::ui::widgets::{self, elided, elided_pair, icon_button, menu_item};
+use crate::ui::widgets::{self, elided, elided_pair, menu_item};
 
 use self::drag::{Branch, Target};
 
@@ -95,8 +96,10 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
     tab.set_initial_limit(prefs.limit());
 
     ui.spacing_mut().item_spacing.y = 0.0;
+    crate::ui::bisect::banner(ui, tab, shared, &snap);
+    crate::ui::solo::bar(ui, tab, shared, &snap);
     if tab.search_open {
-        search_bar(ui, tab, &snap);
+        search::bar(ui, tab, &snap);
     }
 
     let avail = ui.available_rect_before_wrap();
@@ -132,7 +135,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
         }
     }
 
-    let query = !tab.search.trim().is_empty() && tab.search_open;
+    let query = search::is_active(tab);
     let selected_row = tab.selected_row();
     let file_count = snap.status.file_count();
     // A branch being dragged, from here or from the sidebar.
@@ -262,6 +265,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                     picture,
                     landing,
                     lifted,
+                    bisect: crate::ui::bisect::badge(tab, &snap, commit.oid),
                 };
                 paint_row(&painter, rect, &cols, &snap, i, &pills, &look);
 
@@ -416,7 +420,8 @@ fn header(ui: &mut Ui, rect: Rect, cols: &Columns, shared: &mut Shared, refs_w: 
     if cols.show_refs {
         label(cols.refs.min + 10.0, "BRANCH  /  TAG");
     }
-    if cols.show_tree {
+    // A single lane leaves no room for the word.
+    if cols.show_tree && cols.graph.span() >= 56.0 {
         label(cols.graph.min + 8.0, "GRAPH");
     }
     if let Some(range) = cols.message {
@@ -527,6 +532,8 @@ struct RowLook {
     landing: Landing,
     /// The shown label that is being dragged away.
     lifted: Option<usize>,
+    /// What the commit is to a bisect in progress (good, bad, testing...).
+    bisect: Option<crate::ui::bisect::Badge>,
 }
 
 /// The COMMIT MESSAGE column: the summary, then the description when the
@@ -540,8 +547,8 @@ fn paint_message(painter: &Painter, rect: Rect, cols: &Columns, commit: &CommitI
         0.0,
         color,
     );
-    let text_x = x0 + 12.0;
-    let max_w = message.max - text_x - 8.0;
+    let mut text_x = x0 + 12.0;
+    let mut max_w = message.max - text_x - 8.0;
     let mp = painter.with_clip_rect(
         Rect::from_x_y_ranges(message, rect.y_range()).intersect(painter.clip_rect()),
     );
@@ -564,6 +571,11 @@ fn paint_message(painter: &Painter, rect: Rect, cols: &Columns, commit: &CommitI
             widgets::galley_left(&mp, rect, text_x, galley);
         }
         RowKind::Commit => {
+            if let Some(badge) = &look.bisect {
+                let used = crate::ui::bisect::paint_badge(&mp, rect, text_x, badge) + 6.0;
+                text_x += used;
+                max_w -= used;
+            }
             let summary_color = if look.selected || look.bright { theme::text_bright() } else { theme::text() };
             let body = if look.description { commit.body_preview.as_str() } else { "" };
             let galley = elided_pair(
@@ -1100,6 +1112,7 @@ fn row_menu(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<Repo
             }
         });
     }
+    crate::ui::bisect::menu_items(ui, tab, snap, commit.oid);
     ui.separator();
 
     if menu_item(ui, icons::COPY, "Copy commit SHA") {
@@ -1127,96 +1140,4 @@ pub fn open_search(tab: &mut RepoTab) {
     tab.search_open = true;
     tab.search_focus = true;
     tab.diff = None;
-}
-
-fn search_bar(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot) {
-    // Recompute matches only when the query or the history changes.
-    let query = tab.search.trim().to_lowercase();
-    let stamp = (query.clone(), Arc::as_ptr(&snap.history) as usize);
-    if tab.search_stamp != stamp {
-        tab.search_hits.clear();
-        if !query.is_empty() {
-            let hexish = query.len() >= 4 && query.bytes().all(|b| b.is_ascii_hexdigit());
-            for (i, commit) in snap.history.commits.iter().enumerate() {
-                if commit.kind == RowKind::Wip {
-                    continue;
-                }
-                let hit = commit.summary.to_lowercase().contains(&query)
-                    || commit.author.to_lowercase().contains(&query)
-                    || commit.body_preview.to_lowercase().contains(&query)
-                    || (hexish && commit.oid.to_string().starts_with(&query));
-                if hit {
-                    tab.search_hits.push(i as u32);
-                }
-            }
-        }
-        tab.search_stamp = stamp;
-    }
-
-    let mut jump: i32 = 0;
-    let mut close = false;
-    egui::Frame::new()
-        .fill(theme::bg_panel())
-        .inner_margin(egui::Margin::symmetric(8, 5))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
-                ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
-                    if icon_button(ui, icons::X, 13.0, "Close search (Esc)").clicked() {
-                        close = true;
-                    }
-                    if icon_button(ui, icons::CARET_DOWN, 13.0, "Next match (Enter)").clicked() {
-                        jump = 1;
-                    }
-                    if icon_button(ui, icons::CARET_UP, 13.0, "Previous match (Shift+Enter)").clicked() {
-                        jump = -1;
-                    }
-                    let position = tab
-                        .selected_row()
-                        .and_then(|row| tab.search_hits.binary_search(&(row as u32)).ok())
-                        .map(|i| i + 1)
-                        .unwrap_or(0);
-                    let count = if query.is_empty() {
-                        String::new()
-                    } else {
-                        format!("{position} / {}", tab.search_hits.len())
-                    };
-                    ui.label(egui::RichText::new(count).color(theme::text_dim()).size(12.0));
-
-                    let response = ui.add(
-                        TextEdit::singleline(&mut tab.search)
-                            .hint_text(format!(
-                                "{}  Search commits by message, author or SHA",
-                                icons::MAGNIFYING_GLASS
-                            ))
-                            .desired_width(f32::INFINITY),
-                    );
-                    if std::mem::take(&mut tab.search_focus) {
-                        response.request_focus();
-                    }
-                    if response.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter)) {
-                        jump = if ui.input(|i| i.modifiers.shift) { -1 } else { 1 };
-                        response.request_focus();
-                    }
-                });
-            });
-        });
-
-    if close {
-        tab.search_open = false;
-        return;
-    }
-    if jump != 0 && !tab.search_hits.is_empty() {
-        let current = tab.selected_row().map(|r| r as u32);
-        let hits = &tab.search_hits;
-        let target = match (current, jump > 0) {
-            (Some(row), true) => hits.iter().copied().find(|h| *h > row).unwrap_or(hits[0]),
-            (Some(row), false) => {
-                hits.iter().rev().copied().find(|h| *h < row).unwrap_or(hits[hits.len() - 1])
-            }
-            (None, _) => hits[0],
-        };
-        tab.select_row(target as usize);
-        tab.scroll_to = Some(target as usize);
-    }
 }

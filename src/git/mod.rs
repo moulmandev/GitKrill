@@ -5,6 +5,7 @@
 //! talks to a remote goes through the `git` CLI so hooks, signing, credential
 //! helpers, LFS and the user's config behave exactly as they do in a terminal.
 
+pub mod bisect;
 pub mod blame;
 pub mod branch_folder;
 pub mod cli;
@@ -22,6 +23,7 @@ pub mod picture;
 pub mod rebase;
 pub mod remotes;
 pub mod repo;
+pub mod search;
 pub mod stash;
 pub mod text;
 
