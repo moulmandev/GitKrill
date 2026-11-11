@@ -222,14 +222,27 @@ be installed.
 - GitHub, GitHub Enterprise and GitLab (gitlab.com or your own server): open
   pull requests (merge requests on GitLab), issues and CI runs (Actions,
   pipelines) in the sidebar, each request with the CI status of its head;
-  check out a pull or merge request as a local branch
+  check out a pull or merge request as a local branch, from a fork too
+- What the reviewers say, at the right of each pull request: approved,
+  changes requested, or review required (GitHub's review decision, and the
+  reviews themselves where no rule requires any); on GitLab the approvals,
+  `1/2` while some are missing. The tooltip says how many approved
+- Pull requests from forks have a fork mark, and their tooltip names the
+  fork and its branch (`grace:main`)
 - A remote on a server other than github.com or gitlab.com is offered as
   "Connect <server>…": say whether it runs GitLab or GitHub Enterprise and
-  its lists appear; right-click the remote to disconnect it again
+  its lists appear; right-click the remote to disconnect it again. A GitLab
+  installed under a path (`example.com/gitlab`) is added with that path in
+  Preferences > Integrations > GitLab Self-Managed; its HTTPS and SSH
+  remotes are then recognised
 - Open a pull or merge request: drop a branch on the list, right-click it,
   or use the list's + button. Title and description are filled in from
   the commits, the branch is pushed first when the remote lacks it, and
   "Open on GitHub" (or GitLab) works without signing in
+- In a fork (the service says so, or a remote is called `upstream`), the
+  pull request goes into the parent repository by default (Repository in
+  the dialog), from `owner:branch`. A branch on another remote of the same
+  server, such as your fork of the repository shown, can be proposed too
 
 **Profiles, SSH and signing** (File > Preferences)
 - Profiles: an author name and email, an SSH key and signing settings each;
@@ -283,7 +296,7 @@ in the **Help** menu, the others in the **View** menu.
 | Feature | What is sent | Where |
 | --- | --- | --- |
 | Author pictures | SHA-256 of each author's email address, or the GitHub user id from a `noreply` address | gravatar.com, avatars.githubusercontent.com |
-| Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, and the requests you open, with a token when one is found for that host (below). While Preferences > Integrations shows an account: whose token it is, its SSH keys, and the public keys you add there | api.github.com, gitlab.com, and only the servers you connected |
+| Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, and the requests you open, with a token when one is found for that host (below). Then, for the requests that changed since: their review states (one GraphQL request on GitHub, signed in only; each merge request's approvals on GitLab), the projects GitLab merge requests come from, and once whether the repository is a fork. While Preferences > Integrations shows an account: whose token it is, its SSH keys, and the public keys you add there | api.github.com, gitlab.com, and only the servers you connected |
 | Automatic fetch | `git fetch --prune --all` (without `--prune` when Auto-Prune is off), as you would run it | your remotes |
 | Updates | A request for the latest release shortly after start and every six hours; the download when there is a newer one | api.github.com, github.com and its download host |
 
@@ -298,6 +311,10 @@ host's API over HTTPS. They are never stored, logged or shown.
 | GitHub Enterprise | `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` (unless `GH_HOST` names another server), `gh auth token --hostname <server>`, git's credential helper for the server |
 | gitlab.com | `GITLAB_TOKEN` (unless `GITLAB_HOST` names another server), `glab config get token --host gitlab.com`, git's credential helper for gitlab.com |
 | Your GitLab | `GITLAB_TOKEN` only when `GITLAB_HOST` names the server, `glab config get token --host <server>`, git's credential helper for the server |
+
+A server installed under a path is asked about by its name alone
+(`example.com` for `example.com/gitlab`, as git's credential helper and
+`glab` know it); `GITLAB_HOST` may name it either way.
 
 A github.com token never goes to an Enterprise server, nor the other way
 round. `gh` and `glab` are run without the token variables, so they answer
@@ -397,10 +414,10 @@ build.rs         the Windows executable's icon and version details
 
 - Undo does not cover a rebase that stopped on conflicts and was continued, or
   drag actions that switch branches first (`git reflog` still has them)
-- Pull request review state and merge request approvals
-- Pull and merge requests from a fork of the repository
-- Bitbucket, Gitea, Azure DevOps and other hosts; GitLab installed under a
-  path (`example.com/gitlab`)
+- Bitbucket, Gitea, Azure DevOps and other hosts
+- In a fork, the sidebar lists the fork's own pull requests, issues and CI,
+  not its parent's (pull requests are opened into the parent all the same);
+  review states on GitHub need a sign-in
 - Interactive rebase refuses ranges that contain merge commits
 - File history and blame always start from HEAD
 - No ancestor pane or syntax colours in the conflict resolver, and text in

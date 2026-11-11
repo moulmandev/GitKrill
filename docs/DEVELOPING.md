@@ -49,6 +49,8 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Hand a file or folder to the user's merge tool, diff tool, editor or terminal | `crate::external`: `merge(tools, file)` gives a `GitCmd` for `tab.run`; `diff`, `edit` and `terminal` start the program on a short-lived thread. Pass `&shared.settings.tools`. Failures come back as toasts; a `GITKRILL_SHOT` run prints the command instead. To support another tool, add it to `KNOWN` (where to look, its command lines). |
 | Give every git command an environment variable | `git::cli::set_session_env` (the SSH key and author of the profile in use). It replaces the whole set and `prefs::identity::apply` owns it: add what you need to `identity::session_env` rather than calling it from elsewhere. |
 | Change what the commit button does | `src/ui/commit_button.rs`: the split button (`show`), what runs once a commit succeeded (`follow_up`), the commit template in the message fields (`prefill`). |
+| Know how a pull request stands with its reviewers, or where it comes from | `PullRequest::review` (`hosting::Review`, `Unknown` until the service has said) and `approvals`; `head_repo` and `is_from(repo)` for forks. A backend learns them in `Backend::details`, called after the three lists each round: return what changed (`Details`), and apply what is already known to a fresh list in `pulls()` so it does not flicker. `View::parent` is the repository's parent when it is a fork. |
+| Open a pull request between forks | `HostingState::create_pull_across(new, Across { from, into })` (`Backend::create_pull_across`); `hosting::related(remotes, servers, repo)` lists the remotes on the same server that point at other repositories. `ui::new_pull::{targets, route}` decide where a pull request goes and which remote its branch is pushed to. |
 | Ask a hosting account something (who is signed in, its SSH keys) | `hosting::account::AccountSession::start(account, ctx)`, polled from the UI; `account::local_keys`, `parse_public_key` and `fingerprint` read `.pub` files. A host in `settings.hosting_disconnected` is never signed in to. |
 | Know who commits | `prefs::identity`: `settings.identity.current()` is the profile in use; `identity::generation()` changes whenever the identity git commands get may have changed (ask git again then, as `ui::prefs::profiles::commit_author` does). |
 | Show the text of a file (not git's own data) | Decode it in the background with `git::text::format_for(workdir)` (the repository's encoding and the tab width: `display_text_in`, `decode_file`), keep the `Format` with the result, and load again when `text::generation()` has moved on (`ui/diff.rs` does). |
@@ -219,7 +221,15 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   connects a made-up server without clicking through the offer.
 - Opening a pull request is answered from `create.json` (and `create.head`
   for another status), the request body is written to `create.sent.json`,
-  and `pulls.after.json` replaces `pulls.json` once one was opened. An empty
+  and `pulls.after.json` replaces `pulls.json` once one was opened.
+- Review states and forks: GitHub's GraphQL answer (review decisions) comes
+  from `graphql.json` and the repository itself (a fork's `parent`) from
+  `repo.json`; on GitLab each merge request's approvals from
+  `approvals-<iid>.json`, the project (`forked_from_project`) from
+  `project.json`, and a fork's project by id from `project-<id>.json`.
+- A server installed under a path is the key `example.com/gitlab` in
+  `hosting_servers`; point the demo's origin at
+  `https://example.com/gitlab/group/app.git` to show one. An empty
   file named `signed-in` stands in for a token; without it the fixture is
   signed out. Browser links clicked during a `GITKRILL_SHOT` run are
   printed, not opened.

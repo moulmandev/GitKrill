@@ -32,6 +32,12 @@
 //!
 //! An account the user disconnected there ([`Disconnected`]) is not
 //! signed in to: its repositories are asked about without a token.
+//!
+//! After the three lists, each round asks the backend for [`Details`]:
+//! review states, the forks pull requests come from and the repository's
+//! parent, only for what changed since it last asked. A self-managed
+//! server may be installed under a path (`example.com/gitlab`); that is
+//! then its name in [`Servers`] and [`RepoId::host`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -178,15 +184,19 @@ pub type Disconnected = BTreeSet<String>;
 /// A repository on a hosting service, as named by a remote URL.
 ///
 /// `host` only ever contains lower-case letters, digits, `.` and `-`, and a
-/// `:port`; `owner` and `name` only letters, digits, `.`, `_` and `-`, with
-/// `/` between the groups of a GitLab path. The parsers reject everything
-/// else, so the links built here are safe to hand to the operating system
-/// as they are, and `host` is safe in a credential-helper query.
+/// `:port`, then for a server installed under a path (`example.com/gitlab`)
+/// that path, made like `owner`; `owner` and `name` only letters, digits,
+/// `.`, `_` and `-`, with `/` between the groups of a GitLab path. The
+/// parsers reject everything else, so the links built here are safe to hand
+/// to the operating system as they are, and [`server_name`] of `host` is
+/// safe in a credential-helper query.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoId {
     pub service: Service,
     /// `github.com`, `gitlab.com`, or the self-hosted server's name, with
-    /// `:port` when an HTTPS remote names a port other than 443.
+    /// `:port` when an HTTPS remote names a port other than 443, and the
+    /// path the server is installed under when it is not at the root
+    /// (`example.com/gitlab`): the key of [`Servers`].
     pub host: String,
     /// The account or organisation; on GitLab the whole group path, which
     /// may have subgroups (`group/subgroup`).
@@ -271,6 +281,65 @@ impl RepoId {
             )),
         }
     }
+
+    /// [`RepoId::compare_url`] for a pull request into this repository from
+    /// `head` in `from`, which may be a fork of it (or its parent). GitHub
+    /// compares across forks as `base...owner:head` on the base repository;
+    /// GitLab starts a merge request on the project the branch is in, and
+    /// its form offers the project it was forked from as the target.
+    pub fn compare_url_from(&self, base: &str, from: &RepoId, head: &str) -> String {
+        if from == self {
+            return self.compare_url(base, head);
+        }
+        match self.service {
+            Service::GitHub | Service::GitHubEnterprise => self.page(&format!(
+                "compare/{}...{}:{}?expand=1",
+                url_escape(base),
+                url_escape(&from.owner),
+                url_escape(head)
+            )),
+            Service::GitLab => from.compare_url(base, head),
+        }
+    }
+
+    /// Another repository on the same service and server, from the
+    /// `owner/name` (the whole path on GitLab) a service answered with.
+    /// `None` unless the path is one a remote URL could have named, so
+    /// links built from it are as safe as this repository's.
+    pub fn sibling(&self, path: &str) -> Option<RepoId> {
+        let parts: Vec<&str> = path.split('/').collect();
+        let fits = match self.service {
+            Service::GitHub | Service::GitHubEnterprise => parts.len() == 2,
+            Service::GitLab => (2..=32).contains(&parts.len()) && parts.iter().all(|part| !part.starts_with('-')),
+        };
+        if !fits || !parts.iter().all(|part| path_part(part)) {
+            return None;
+        }
+        let (name, owner) = parts.split_last()?;
+        Some(RepoId { service: self.service, host: self.host.clone(), owner: owner.join("/"), name: (*name).to_owned() })
+    }
+
+    /// The same repository, whatever the capitalisation of its path.
+    pub fn same(&self, other: &RepoId) -> bool {
+        self.service == other.service && self.host == other.host && self.slug().eq_ignore_ascii_case(&other.slug())
+    }
+}
+
+/// One part of a repository path: letters, digits, `-`, `_` and `.`, and
+/// not `.` or `..` alone.
+fn path_part(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && part.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// The server's own name in a [`RepoId::host`], with its port but without
+/// the path it may be installed under: `example.com` of
+/// `example.com/gitlab`. What git's credential helper and the services'
+/// command line tools know the server by.
+pub fn server_name(host: &str) -> &str {
+    host.split('/').next().unwrap_or(host)
 }
 
 /// Percent-encodes everything but `A-Z a-z 0-9 . _ - /`.
@@ -308,6 +377,9 @@ struct Address {
     /// The path's parts with `.git` taken off the last: at least two, each
     /// made only of letters, digits, `.`, `_` and `-`.
     path: Vec<String>,
+    /// An `http(s)://` URL: its path starts with the one the server is
+    /// installed under, if any. SSH paths never have it.
+    web: bool,
 }
 
 impl Address {
@@ -326,6 +398,7 @@ impl Address {
 /// with characters a hosted repository's cannot have are `None`.
 fn address(url: &str) -> Option<Address> {
     let url = url.trim();
+    let mut web = false;
     let (https, host, path) = match url.split_once("://") {
         Some((scheme, rest)) => {
             let scheme = scheme.to_ascii_lowercase();
@@ -333,6 +406,7 @@ fn address(url: &str) -> Option<Address> {
             if !known.contains(&scheme.as_str()) {
                 return None;
             }
+            web = scheme.starts_with("http");
             let (authority, path) = rest.split_once('/')?;
             (scheme == "https", authority.rsplit_once('@').map_or(authority, |(_, host)| host), path)
         }
@@ -373,7 +447,7 @@ fn address(url: &str) -> Option<Address> {
         return None;
     }
     let port = port.filter(|port| https && *port != 443);
-    Some(Address { name, port, path })
+    Some(Address { name, port, path, web })
 }
 
 /// A plausible DNS name, already lower-case.
@@ -429,24 +503,55 @@ fn guess(name: &str) -> Option<ServerKind> {
 /// of those, is `None`.
 pub fn parse_remote(url: &str, servers: &Servers) -> Option<RepoId> {
     let address = address(url)?;
-    let (service, host) = match public(&address.name) {
-        Some((service, host)) => (service, host.to_owned()),
-        None => {
-            let host = address.host();
-            (servers.get(&host)?.service()?, host)
-        }
+    let (service, host, skip) = match public(&address.name) {
+        Some((service, host)) => (service, host.to_owned(), 0),
+        None => server_for(servers, &address)?,
     };
+    // Past the path the server is installed under, if any.
+    let path = &address.path[skip..];
     let fits = match service {
-        Service::GitHub | Service::GitHubEnterprise => address.path.len() == 2,
+        Service::GitHub | Service::GitHubEnterprise => path.len() == 2,
         // GitLab paths never start with `-`, which also keeps the `/-/` of
         // its web addresses from passing for a group.
-        Service::GitLab => address.path.iter().all(|part| !part.starts_with('-')),
+        Service::GitLab => path.len() >= 2 && path.iter().all(|part| !part.starts_with('-')),
     };
     if !fits {
         return None;
     }
-    let (name, owner) = address.path.split_last()?;
+    let (name, owner) = path.split_last()?;
     Some(RepoId { service, host, owner: owner.join("/"), name: name.clone() })
+}
+
+/// The server in `servers` that a remote on a host other than github.com
+/// and gitlab.com is on: the service it runs, the server as `servers` names
+/// it, and how many parts of the address's path are the server's own.
+///
+/// That is the server named by the host alone, or one installed under a
+/// path (`example.com/gitlab`, a GitLab with a relative URL root). An HTTPS
+/// address has that path in front of the repository's; an SSH address
+/// never does, so on a host with both kinds of entry it goes to the one
+/// under a path (one host's SSH cannot lead to two servers).
+fn server_for(servers: &Servers, address: &Address) -> Option<(Service, String, usize)> {
+    let host = address.host();
+    let under = servers.iter().filter_map(|(key, kind)| {
+        let (name, root) = key.split_once('/')?;
+        let root: Vec<&str> = root.split('/').collect();
+        if name != host || !root.iter().all(|part| path_part(part)) {
+            return None;
+        }
+        let service = kind.service()?;
+        if !address.web {
+            return Some((key, service, 0));
+        }
+        // The server's path first, then at least an owner and a name.
+        let leads = address.path.len() >= root.len() + 2 && address.path.iter().zip(&root).all(|(a, b)| a == b);
+        leads.then_some((key, service, root.len()))
+    });
+    // The longest path that fits, should two servers share a host.
+    if let Some((key, service, skip)) = under.max_by_key(|(_, _, skip)| *skip) {
+        return Some((service, key.clone(), skip));
+    }
+    Some((servers.get(&host)?.service()?, host, 0))
 }
 
 /// Picks the remote to show: `origin` when it is hosted, else the first
@@ -458,6 +563,22 @@ pub fn detect(remotes: &[RemoteInfo], servers: &Servers) -> Option<(String, Repo
         .find(|remote| remote.name == "origin")
         .and_then(hosted)
         .or_else(|| remotes.iter().find_map(hosted))
+}
+
+/// The remotes pointing at other repositories of `repo`'s service and
+/// server than `repo` itself, in the order of `remotes`: a fork's parent
+/// (`upstream`, by convention) or forks of `repo` the user pushes to. What a
+/// pull request between forks can go from or into.
+pub fn related(remotes: &[RemoteInfo], servers: &Servers, repo: &RepoId) -> Vec<(String, RepoId)> {
+    let mut found: Vec<(String, RepoId)> = Vec::new();
+    for remote in remotes {
+        let Some(other) = parse_remote(&remote.url, servers) else { continue };
+        let elsewhere = other.service == repo.service && other.host == repo.host && !other.same(repo);
+        if elsewhere && !found.iter().any(|(name, _)| *name == remote.name) {
+            found.push((remote.name.clone(), other));
+        }
+    }
+    found
 }
 
 /// A remote on a server that may run GitHub Enterprise or GitLab.
@@ -493,7 +614,11 @@ pub fn offer_for(remote: &RemoteInfo) -> Option<Offer> {
 /// said what it is; otherwise, while no remote is on a service we can show,
 /// every such server the remotes point at. Asking sends nothing anywhere.
 pub fn offers(remotes: &[RemoteInfo], servers: &Servers) -> Vec<Offer> {
-    let unknown = |remote: &RemoteInfo| offer_for(remote).filter(|offer| !servers.contains_key(&offer.host));
+    // A remote on a server installed under a path is known by the path.
+    let unknown = |remote: &RemoteInfo| {
+        offer_for(remote)
+            .filter(|offer| !servers.contains_key(&offer.host) && parse_remote(&remote.url, servers).is_none())
+    };
     if let Some(offer) = remotes.iter().find(|remote| remote.name == "origin").and_then(unknown) {
         return vec![offer];
     }
@@ -525,12 +650,19 @@ pub struct PullRequest {
     pub head_ref: String,
     pub head_sha: String,
     /// `owner/name` of the repository the head branch lives in. `None` when
-    /// the fork it came from has been deleted, and for a GitLab merge
-    /// request from a fork (its list does not name the fork).
+    /// the fork it came from has been deleted or cannot be seen, and for a
+    /// GitLab merge request from a fork until the fork's path has been
+    /// looked up ([`Backend::details`]; its list names the fork by id only).
     pub head_repo: Option<String>,
     pub base_ref: String,
     /// Seconds since the epoch; 0 when unknown.
     pub updated: i64,
+    /// What the reviewers say. [`Review::Unknown`] (shown as nothing) until
+    /// the service has told, and for services that do not.
+    pub review: Review,
+    /// Approvals given and still needed, where the service counts them;
+    /// `None` when unknown.
+    pub approvals: Option<Approvals>,
 }
 
 impl PullRequest {
@@ -538,6 +670,72 @@ impl PullRequest {
     pub fn is_from(&self, repo: &RepoId) -> bool {
         self.head_repo.as_deref().is_some_and(|full| full.eq_ignore_ascii_case(&repo.slug()))
     }
+}
+
+/// What the reviewers have said about a pull request: GitHub's review
+/// decision, or what a GitLab merge request's approvals come to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Review {
+    /// Not known: not asked (GitHub without a sign-in), not answered yet,
+    /// or a service that does not say. Nothing is shown for it.
+    #[default]
+    Unknown,
+    /// Nobody has approved it or asked for changes, and no rule requires it.
+    Unreviewed,
+    /// Approved: by the reviews the rules require, or by someone when no
+    /// rule requires any.
+    Approved,
+    /// A reviewer asked for changes.
+    ChangesRequested,
+    /// The rules require reviews (approvals) that have not been given yet.
+    Required,
+}
+
+/// A pull request's approvals: given so far and, where the rules require
+/// some, how many more are needed. GitHub only says how many were given.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Approvals {
+    pub given: u32,
+    /// Still needed before the rules are met; 0 when met or unknown.
+    pub left: u32,
+}
+
+impl Approvals {
+    /// `1/2`: approvals given out of those the rules ask for, while some
+    /// are still missing.
+    pub fn fraction(&self) -> Option<String> {
+        (self.left > 0).then(|| format!("{}/{}", self.given, self.given + self.left))
+    }
+}
+
+/// What a backend learns after the lists, at the end of a round
+/// ([`Backend::details`]): how the open pull requests stand with their
+/// reviewers, which forks they come from, and the repository's parent.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Details {
+    /// Pull requests whose [`PullRequest::review`], `approvals` or
+    /// `head_repo` changed, by number; the other fields are not used.
+    pub pulls: Vec<PullRequest>,
+    /// The repository this one is a fork of, once the service has said.
+    pub parent: Option<Parent>,
+}
+
+/// The repository a fork was made from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Parent {
+    pub repo: RepoId,
+    /// Its default branch: where a pull request into it merges unless told
+    /// otherwise. Empty when the service did not say.
+    pub default_branch: String,
+}
+
+/// A pull request between two repositories of the same service: from a
+/// branch of `from` into `into`. One of them is the repository shown (a
+/// fork's pull request into its parent, or one from a fork of it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Across {
+    pub from: RepoId,
+    pub into: RepoId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -720,6 +918,13 @@ pub fn sign_in_advice(service: Service) -> &'static str {
     }
 }
 
+/// A branch name a service answered with, when git could have it: no
+/// spaces or control characters, at most 255 bytes. Empty otherwise.
+fn branch_name(text: &str) -> String {
+    let fits = text.len() <= 255 && text.chars().all(|c| !c.is_control() && !c.is_whitespace());
+    if fits { text.to_owned() } else { String::new() }
+}
+
 /// One line, no control characters, bounded length: fit for a sidebar row.
 fn tidy(text: &str) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -822,6 +1027,8 @@ pub struct View {
     pub busy: bool,
     /// When the last refresh finished, seconds since the epoch.
     pub updated: Option<u64>,
+    /// The repository this one is a fork of, when the service says so.
+    pub parent: Option<Parent>,
 }
 
 // ---- time -----------------------------------------------------------------
@@ -935,12 +1142,14 @@ fn env_names(secrets: &dyn Secrets, repo: &RepoId) -> &'static [&'static str] {
 }
 
 /// Whether a `GH_HOST` / `GITLAB_HOST` value (`git.example.com`, or a URL
-/// such as `https://git.example.com/`) names `host`.
+/// such as `https://git.example.com/`) names `host`. A server installed
+/// under a path is named with its path or by its name alone.
 fn same_host(value: &str, host: &str) -> bool {
     let value = value.trim();
     let value = value.strip_prefix("https://").or_else(|| value.strip_prefix("http://")).unwrap_or(value);
     let value = value.trim_end_matches('/').to_ascii_lowercase();
-    !value.is_empty() && (value == host || value.strip_suffix(":443") == Some(host))
+    let names = |host: &str| value == host || value.strip_suffix(":443") == Some(host);
+    !value.is_empty() && (names(host) || (host.contains('/') && names(server_name(host))))
 }
 
 /// Looks for a token for `repo`'s host, cheapest and most explicit source
@@ -957,10 +1166,12 @@ pub fn find_token(secrets: &dyn Secrets, repo: &RepoId, rejected: &[Token]) -> O
             return Some((token, TokenSource::Env(name)));
         }
     }
-    if let Some(token) = usable(secrets.cli(repo.service, &repo.host)) {
+    // Both know a server by its name, not by the path it is installed under.
+    let server = server_name(&repo.host);
+    if let Some(token) = usable(secrets.cli(repo.service, server)) {
         return Some((token, TokenSource::Cli));
     }
-    usable(secrets.credential_helper(&repo.host)).map(|token| (token, TokenSource::CredentialHelper))
+    usable(secrets.credential_helper(server)).map(|token| (token, TokenSource::CredentialHelper))
 }
 
 /// No token from anywhere: for the offline fixture.
@@ -1212,8 +1423,17 @@ impl Wire {
     /// (`https_only` refuses anything else before it is sent).
     fn authorization(&self, request: &HttpRequest<'_>) -> Option<String> {
         let token = request.token?;
-        (self.api.starts_with("https://") && within(&self.api, request.url)).then(|| token.authorization())
+        let allowed = within(&self.api, request.url) || beside(&self.api).as_deref() == Some(request.url);
+        (self.api.starts_with("https://") && allowed).then(|| token.authorization())
     }
+}
+
+/// The one address outside an API's own that its token may go to: GitHub
+/// Enterprise Server answers GraphQL at `/api/graphql`, beside its REST API
+/// at `/api/v3` rather than below it. github.com's (and `*.ghe.com`'s) is
+/// below the REST API's address already.
+pub fn beside(api: &str) -> Option<String> {
+    api.strip_suffix("/api/v3").map(|root| format!("{root}/api/graphql"))
 }
 
 impl Transport for Wire {
@@ -1282,6 +1502,12 @@ fn explain(error: ureq::Error) -> String {
 /// was sent is left in `create.sent.json` to check what the dialog asked for.
 /// Once one has been opened, `pulls.after.json` (if present) takes the place
 /// of `pulls.json`, so the list can be seen to pick it up.
+///
+/// What [`Backend::details`] asks comes from more files: GitHub's GraphQL
+/// (review decisions) from `graphql.json`, its repository (a fork's parent)
+/// from `repo.json`; on GitLab a merge request's approvals from
+/// `approvals-<iid>.json`, the project (its parent) from `project.json` and
+/// another project by id (a fork) from `project-<id>.json`.
 struct Canned {
     dir: PathBuf,
     created: bool,
@@ -1312,6 +1538,9 @@ impl Canned {
 impl Transport for Canned {
     fn get(&mut self, request: &HttpRequest<'_>) -> Result<HttpResponse, String> {
         let path = request.url.split('?').next().unwrap_or_default();
+        if let Some(name) = detail_fixture(path) {
+            return Ok(self.answer(&name, 200));
+        }
         let endpoints = ["pulls", "issues", "runs", "merge_requests", "pipelines"];
         let list = endpoints.into_iter().find(|list| path.rsplit('/').next() == Some(*list));
         let list = list.ok_or("no fixture for this address")?;
@@ -1322,6 +1551,9 @@ impl Transport for Canned {
     }
 
     fn post(&mut self, request: &HttpRequest<'_>, body: &str) -> Result<HttpResponse, String> {
+        if request.url.ends_with("/graphql") {
+            return Ok(self.answer("graphql", 200));
+        }
         if !request.url.ends_with("/pulls") && !request.url.ends_with("/merge_requests") {
             return Err("no fixture for this address".to_owned());
         }
@@ -1329,6 +1561,19 @@ impl Transport for Canned {
         let response = self.answer("create", 201);
         self.created |= response.status == 201;
         Ok(response)
+    }
+}
+
+/// The fixture file (without `.json`) answering one of the requests of
+/// [`Backend::details`], if `path` is one: see [`Canned`].
+fn detail_fixture(path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('/').collect();
+    match parts.as_slice() {
+        [.., "merge_requests", iid, "approvals"] => Some(format!("approvals-{iid}")),
+        [.., "projects", id] if id.bytes().all(|b| b.is_ascii_digit()) => Some(format!("project-{id}")),
+        [.., "projects", _] => Some("project".to_owned()),
+        [.., "repos", _, _] => Some("repo".to_owned()),
+        _ => None,
     }
 }
 
@@ -1455,6 +1700,25 @@ pub trait Backend: Send {
         let _ = (new, now);
         Err(Problem::Failed("Opening pull requests is not supported here yet".to_owned()))
     }
+    /// Open a pull request from `new.head` in `across.from` into
+    /// `new.base` in `across.into`: a fork's into its parent, or one from a
+    /// fork of the repository. Blocking, like [`Backend::create_pull`].
+    fn create_pull_across(&mut self, new: &NewPull, across: &Across, now: u64) -> Result<PullRequest, Problem> {
+        let _ = (new, across, now);
+        Err(Problem::Failed("Pull requests between forks are not supported here yet".to_owned()))
+    }
+    /// What there is to learn after the lists, asked at the end of each
+    /// round: review states of the open pull requests, the forks they come
+    /// from, the repository's parent ([`Details`]). Only what changed since
+    /// the last call; `None` when nothing did, or the service tells nothing
+    /// more. A failure here is not a failed round: what is not known stays
+    /// unknown. The lists it is about are the last [`Backend::pulls`] gave,
+    /// which should carry what this found out before, so a fresh list does
+    /// not lose it.
+    fn details(&mut self, now: u64) -> Option<Details> {
+        let _ = now;
+        None
+    }
 }
 
 /// What the "Create pull request" dialog asks the service for.
@@ -1515,7 +1779,8 @@ enum Order {
         manual: bool,
     },
     /// Open a pull request; answered with [`Event::Created`] under `id`.
-    CreatePull { id: u64, new: NewPull },
+    /// Between two repositories when `across` says so.
+    CreatePull { id: u64, new: NewPull, across: Option<Box<Across>> },
 }
 
 enum Event {
@@ -1526,6 +1791,7 @@ enum Event {
     /// The round is over; refresh again by itself after `next`.
     Done { next: Duration },
     Created { id: u64, result: Result<PullRequest, Problem> },
+    Details(Details),
 }
 
 fn troubled<T>(outcome: &Outcome<T>) -> bool {
@@ -1554,11 +1820,14 @@ fn worker(
         };
         let mut manual = match order {
             Order::Refresh { manual } => manual,
-            Order::CreatePull { id, new } => {
+            Order::CreatePull { id, new, across } => {
                 if stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let result = backend.create_pull(&new, epoch_now());
+                let result = match across.as_deref() {
+                    Some(across) => backend.create_pull_across(&new, across, epoch_now()),
+                    None => backend.create_pull(&new, epoch_now()),
+                };
                 if events.send(Event::Auth(backend.auth())).is_err()
                     || events.send(Event::Created { id, result }).is_err()
                 {
@@ -1609,6 +1878,16 @@ fn worker(
             }
             wake();
         }
+        // Then what the lists do not say, once they are on screen.
+        if stop.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(details) = backend.details(epoch_now()) {
+            if events.send(Event::Details(details)).is_err() {
+                return;
+            }
+            wake();
+        }
 
         failures = if trouble { failures + 1 } else { 0 };
         let now = epoch_now();
@@ -1648,6 +1927,9 @@ struct Session {
     creating: Vec<u64>,
     /// Answers to those, until collected with [`HostingState::take_created`].
     created: Vec<(u64, Result<PullRequest, Problem>)>,
+    /// Those of `creating` opened in another repository (a fork's parent),
+    /// which this list does not show.
+    elsewhere: Vec<u64>,
     last_id: u64,
     /// A pull request was opened during a refresh round: refresh once more
     /// when it ends, so the list has it for certain.
@@ -1687,6 +1969,7 @@ impl Session {
             next_auto: None,
             creating: Vec::new(),
             created: Vec::new(),
+            elsewhere: Vec::new(),
             last_id: 0,
             refresh_after: false,
             signed_out: false,
@@ -1695,11 +1978,15 @@ impl Session {
         session
     }
 
-    fn create(&mut self, new: NewPull) -> u64 {
+    fn create(&mut self, new: NewPull, across: Option<Across>) -> u64 {
         self.last_id += 1;
         let id = self.last_id;
-        if self.orders.send(Order::CreatePull { id, new }).is_ok() {
+        let elsewhere = across.as_ref().is_some_and(|across| !across.into.same(&self.repo));
+        if self.orders.send(Order::CreatePull { id, new, across: across.map(Box::new) }).is_ok() {
             self.creating.push(id);
+            if elsewhere {
+                self.elsewhere.push(id);
+            }
         } else {
             self.created.push((id, Err(stopped_problem())));
         }
@@ -1746,7 +2033,9 @@ impl Session {
                         }
                         Event::Created { id, result } => {
                             self.creating.retain(|pending| *pending != id);
-                            if let Ok(pull) = &result {
+                            let listed = !self.elsewhere.contains(&id);
+                            self.elsewhere.retain(|other| *other != id);
+                            if let (Ok(pull), true) = (&result, listed) {
                                 // Listed at once; the refresh below confirms it.
                                 if !view.pulls.items.iter().any(|known| known.number == pull.number) {
                                     view.pulls.items.insert(0, pull.clone());
@@ -1754,6 +2043,22 @@ impl Session {
                                 self.refresh_after = true;
                             }
                             self.created.push((id, result));
+                        }
+                        Event::Details(details) => {
+                            for pull in &mut view.pulls.items {
+                                let Some(known) = details.pulls.iter().find(|known| known.number == pull.number)
+                                else {
+                                    continue;
+                                };
+                                pull.review = known.review;
+                                pull.approvals = known.approvals;
+                                if known.head_repo.is_some() {
+                                    pull.head_repo = known.head_repo.clone();
+                                }
+                            }
+                            if details.parent.is_some() {
+                                view.parent = details.parent;
+                            }
                         }
                     }
                 }
@@ -1931,7 +2236,14 @@ impl HostingState {
     /// Returns the id to collect the answer with, or `None` when the
     /// integration is not running.
     pub fn create_pull(&mut self, new: NewPull) -> Option<u64> {
-        Some(self.session.as_mut()?.create(new))
+        Some(self.session.as_mut()?.create(new, None))
+    }
+
+    /// [`HostingState::create_pull`] between two repositories: from a fork
+    /// into its parent. Answered the same way; a pull request opened in a
+    /// repository other than the one shown is not added to its list.
+    pub fn create_pull_across(&mut self, new: NewPull, across: Across) -> Option<u64> {
+        Some(self.session.as_mut()?.create(new, Some(across)))
     }
 
     /// The answer to [`HostingState::create_pull`] once it has arrived.
@@ -2005,6 +2317,9 @@ pub fn checkout_pull(remote: &str, service: Service, number: u64, on_branch: boo
             .done(format!("Checked out {what} as {branch}"))
     }
 }
+
+#[cfg(test)]
+mod review_fork_tests;
 
 #[cfg(test)]
 mod tests {

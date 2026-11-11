@@ -12,6 +12,12 @@
 //! * What the commits between the branches are is read on the reader thread
 //!   ([`compare`]); the prefill and the push decision are pure functions of
 //!   that and the snapshot, tested below.
+//! * Forks: the pull request can go into the repository's parent when it is
+//!   a fork ([`targets`]: the parent the service names, else the one a
+//!   remote called `upstream` points at), and its branch can be on another
+//!   remote of the same server, a fork of the repository. [`route`] works
+//!   out which remote the branch is on or pushed to, and the dialog asks
+//!   the service for a pull request across the two (`owner:branch`).
 
 use std::path::PathBuf;
 use std::time::Instant;
@@ -21,7 +27,7 @@ use eframe::egui::{self, Align, Button, ComboBox, Key, Layout, RichText, TextEdi
 use crate::git::ops;
 use crate::git::repo::lossy;
 use crate::git::{BranchInfo, RemoteBranch, RepoSnapshot};
-use crate::hosting::{self, NewPull, PullRequest, RepoId};
+use crate::hosting::{self, Across, NewPull, Parent, PullRequest, RepoId, Servers};
 use crate::state::{BusyOp, Dialog, RepoTab, Shared, ToastKind};
 use crate::theme::{self, icons};
 use crate::ui::graph::drag::Branch;
@@ -51,8 +57,10 @@ pub fn open(tab: &mut RepoTab, shared: &mut Shared, branch: Option<Branch>) {
         );
         return;
     };
+    let related = hosting::related(&snap.remotes, &shared.settings.hosting_servers, &shown.repo);
+    let hosted = hosted_remotes(&shown.remote, &related);
     let head = branch
-        .filter(|branch| usable_head(&snap, &shown.remote, branch))
+        .filter(|branch| usable_head(&snap, &hosted, branch))
         .or_else(|| snap.head.branch.as_deref().map(Branch::local))
         .or_else(|| snap.branches.first().map(|branch| Branch::local(&branch.name)));
     let Some(head) = head else {
@@ -60,15 +68,17 @@ pub fn open(tab: &mut RepoTab, shared: &mut Shared, branch: Option<Branch>) {
         return;
     };
 
-    let on_remote = remote_names(&snap, &shown.remote);
-    let local: Vec<String> = snap.branches.iter().map(|branch| branch.name.clone()).collect();
-    let base = default_base(None, &on_remote, &local).unwrap_or_default();
+    let targets = targets(&shown.remote, &shown.repo, shown.view.parent.as_ref(), &related);
     let mut form = NewPullForm {
         repo_path: tab.path.clone(),
         remote: shown.remote.clone(),
         repo: shown.repo.clone(),
+        related,
+        targets,
+        into: 0,
+        into_chosen: false,
         head,
-        base,
+        base: String::new(),
         base_chosen: false,
         title: String::new(),
         body: String::new(),
@@ -79,23 +89,36 @@ pub fn open(tab: &mut RepoTab, shared: &mut Shared, branch: Option<Branch>) {
         step: Step::Editing,
         problem: None,
     };
+    form.base = form.first_base(&snap);
     form.title = readable(&form.head_name());
     form.compare(tab, true);
     shared.show(Dialog::NewPull(Box::new(form)));
 }
 
+/// The remote shown first, then the others of `related`.
+fn hosted_remotes(remote: &str, related: &[(String, RepoId)]) -> Vec<String> {
+    std::iter::once(remote.to_owned()).chain(related.iter().map(|(name, _)| name.clone())).collect()
+}
+
+/// The remotes a pull request's branch can be on: the one the hosting
+/// sidebar shows, and those pointing at other repositories of the same
+/// service and server (forks of it, or its parent).
+pub fn head_remotes(snap: &RepoSnapshot, servers: &Servers, remote: &str, repo: &RepoId) -> Vec<String> {
+    hosted_remotes(remote, &hosting::related(&snap.remotes, servers, repo))
+}
+
 /// Whether a pull request can come from `branch`: a local branch, or a
-/// branch on the hosted remote itself.
-fn usable_head(snap: &RepoSnapshot, remote: &str, branch: &Branch) -> bool {
+/// branch on one of the `hosted` remotes.
+fn usable_head(snap: &RepoSnapshot, hosted: &[String], branch: &Branch) -> bool {
     match branch {
         Branch::Local(name) => snap.branches.iter().any(|known| &known.name == name),
-        Branch::Remote { remote: owner, name } => owner == remote && name != "HEAD",
+        Branch::Remote { remote: owner, name } => hosted.contains(owner) && name != "HEAD",
     }
 }
 
 /// Whether dropping `branch` on the pull request list can open the dialog.
 pub fn accepts(snap: &RepoSnapshot, remote: &str, branch: &Branch) -> bool {
-    usable_head(snap, remote, branch)
+    usable_head(snap, &[remote.to_owned()], branch)
 }
 
 fn remote_names(snap: &RepoSnapshot, remote: &str) -> Vec<String> {
@@ -181,6 +204,120 @@ pub fn prefill(branch: &str, commits: &Commits) -> (String, String) {
             (readable(branch), lines.join("\n"))
         }
     }
+}
+
+/// A repository a pull request can be opened in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub repo: RepoId,
+    /// A remote pointing at it: its branches are those to merge into. `None`
+    /// for a parent that no remote points at.
+    pub remote: Option<String>,
+    /// Its default branch, when the service said.
+    pub default_branch: Option<String>,
+    /// The repository shown is a fork of it.
+    pub parent: bool,
+}
+
+/// Where a pull request can be opened, the default first: the parent the
+/// service names when the repository shown is a fork, else the repository
+/// a remote called `upstream` points at; then the repository shown itself.
+/// `related` are the other remotes on the same server
+/// ([`hosting::related`]).
+pub fn targets(remote: &str, repo: &RepoId, parent: Option<&Parent>, related: &[(String, RepoId)]) -> Vec<Target> {
+    let remote_for = |target: &RepoId| related.iter().find(|(_, other)| other.same(target)).map(|(name, _)| name.clone());
+    let parent = match parent {
+        Some(parent) => Some(Target {
+            repo: parent.repo.clone(),
+            remote: remote_for(&parent.repo),
+            default_branch: Some(parent.default_branch.clone()).filter(|branch| !branch.is_empty()),
+            parent: true,
+        }),
+        None => related.iter().find(|(name, _)| name == "upstream").map(|(name, upstream)| Target {
+            repo: upstream.clone(),
+            remote: Some(name.clone()),
+            default_branch: None,
+            parent: true,
+        }),
+    };
+    let own = Target { repo: repo.clone(), remote: Some(remote.to_owned()), default_branch: None, parent: false };
+    parent.into_iter().chain([own]).collect()
+}
+
+/// Where a pull request's branch is and where the pull request goes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Route {
+    /// The remote the branch is on, or is pushed to first.
+    pub push: String,
+    /// The repository that remote points at.
+    pub from: RepoId,
+    pub into: RepoId,
+    /// The remote whose branches are those to merge into: the target's, or
+    /// the one shown when no remote points at the target.
+    pub base_remote: String,
+}
+
+impl Route {
+    /// The pull request is between two repositories rather than within
+    /// the one shown: what the service is asked for then.
+    pub fn across(&self, shown: &RepoId) -> Option<Across> {
+        let within = self.from.same(shown) && self.into.same(shown);
+        (!within).then(|| Across { from: self.from.clone(), into: self.into.clone() })
+    }
+
+    /// The branch `name` as the service shows it across repositories:
+    /// `owner:branch` when it is in another than the target.
+    pub fn head_label(&self, name: &str) -> String {
+        if self.from.same(&self.into) { name.to_owned() } else { format!("{}:{name}", self.from.owner) }
+    }
+}
+
+/// The route of a pull request from `head` into `target`. A branch of a
+/// remote comes from that remote's repository. A local branch goes to the
+/// remote it tracks a branch of the same name on, when that is the remote
+/// shown or one of `related` (a fork the user pushes to); otherwise to the
+/// remote shown, which is the fork when the target is its parent.
+pub fn route(
+    branches: &[BranchInfo],
+    head: &Branch,
+    (remote, repo): (&str, &RepoId),
+    related: &[(String, RepoId)],
+    target: &Target,
+) -> Route {
+    let hosted = hosted_remotes(remote, related);
+    let push = match head {
+        Branch::Remote { remote: owner, .. } => owner.clone(),
+        Branch::Local(name) => branches
+            .iter()
+            .find(|branch| &branch.name == name)
+            .and_then(|branch| branch.upstream.as_deref())
+            .and_then(|upstream| hosted.iter().find(|hosted| upstream == format!("{hosted}/{name}")))
+            .cloned()
+            .unwrap_or_else(|| remote.to_owned()),
+    };
+    let from = related.iter().find(|(name, _)| *name == push).map_or_else(|| repo.clone(), |(_, from)| from.clone());
+    Route {
+        push,
+        from,
+        into: target.repo.clone(),
+        base_remote: target.remote.clone().unwrap_or_else(|| remote.to_owned()),
+    }
+}
+
+/// The open pull request that already does what `head` into `base` along
+/// `route` would, among `open` (the list of the repository shown, so only
+/// when that is where it goes).
+pub fn existing<'a>(open: &'a [PullRequest], shown: &RepoId, route: &Route, head: &str, base: &str) -> Option<&'a PullRequest> {
+    if !route.into.same(shown) {
+        return None;
+    }
+    open.iter().find(|pull| {
+        let from = match route.from.same(shown) {
+            true => pull.is_from(shown),
+            false => pull.head_repo.as_deref().is_some_and(|fork| fork.eq_ignore_ascii_case(&route.from.slug())),
+        };
+        pull.head_ref == head && pull.base_ref == base && from
+    })
 }
 
 /// How the head branch gets onto the remote.
@@ -312,8 +449,17 @@ fn walk(repo: &git2::Repository, remote: &str, head: &Branch, base: &str) -> Res
 pub struct NewPullForm {
     /// The repository the dialog belongs to.
     repo_path: PathBuf,
+    /// The remote and hosted repository the sidebar shows.
     remote: String,
     repo: RepoId,
+    /// The other remotes on the same server ([`hosting::related`]).
+    related: Vec<(String, RepoId)>,
+    /// Where the pull request can go ([`targets`]), and the one chosen.
+    targets: Vec<Target>,
+    into: usize,
+    /// The user picked the repository, so a parent learnt later does not
+    /// replace it.
+    into_chosen: bool,
     head: Branch,
     base: String,
     /// The user picked the base, so the remote's default no longer replaces it.
@@ -336,12 +482,13 @@ enum Step {
     /// The head branch is being pushed by the git command labelled `label`;
     /// `then` is what comes once it is there.
     Pushing { label: String, since: Instant, then: Then },
-    /// The service has the request; its answer comes back under `id`.
-    Sending { id: u64 },
+    /// The service has the request; its answer comes back under `id`, about
+    /// a pull request in `into`.
+    Sending { id: u64, into: RepoId },
 }
 
 enum Then {
-    Create(NewPull),
+    Create(NewPull, Option<Box<Across>>),
     /// Open the service's own form at this address.
     Browse(String),
 }
@@ -365,12 +512,64 @@ impl NewPullForm {
         !matches!(self.step, Step::Editing)
     }
 
+    fn target(&self) -> &Target {
+        &self.targets[self.into.min(self.targets.len() - 1)]
+    }
+
+    fn route(&self, snap: &RepoSnapshot) -> Route {
+        route(&snap.branches, &self.head, (&self.remote, &self.repo), &self.related, self.target())
+    }
+
+    /// The branches the pull request can merge into: those of the target's
+    /// remote; its default branch alone when no remote points at it; the
+    /// local branches when there is nothing else.
+    fn bases(&self, snap: &RepoSnapshot) -> Vec<String> {
+        let target = self.target();
+        let names = match (&target.remote, &target.default_branch) {
+            (Some(remote), _) => remote_names(snap, remote),
+            (None, Some(default)) => vec![default.clone()],
+            (None, None) => remote_names(snap, &self.remote),
+        };
+        if names.is_empty() { snap.branches.iter().map(|branch| branch.name.clone()).collect() } else { names }
+    }
+
+    /// The base to show before the reader has looked up the remote's own
+    /// default.
+    fn first_base(&self, snap: &RepoSnapshot) -> String {
+        if let Some(default) = &self.target().default_branch {
+            return default.clone();
+        }
+        let local: Vec<String> = snap.branches.iter().map(|branch| branch.name.clone()).collect();
+        default_base(None, &self.bases(snap), &local).unwrap_or_default()
+    }
+
+    /// Takes in the targets as they are now: the service may have named the
+    /// parent since the dialog opened. Until the user picks one, the default
+    /// follows, and the base with it.
+    fn retarget(&mut self, tab: &mut RepoTab, snap: &RepoSnapshot, parent: Option<&Parent>) {
+        let targets = targets(&self.remote, &self.repo, parent, &self.related);
+        if targets == self.targets {
+            return;
+        }
+        let chosen = self.target().repo.clone();
+        self.into = match self.into_chosen {
+            true => targets.iter().position(|target| target.repo.same(&chosen)).unwrap_or(0),
+            false => 0,
+        };
+        self.targets = targets;
+        if !self.target().repo.same(&chosen) {
+            self.base_chosen = false;
+            self.base = self.first_base(snap);
+            self.compare(tab, self.target().default_branch.is_none());
+        }
+    }
+
     /// Asks the reader for the commits of the current pair; `default_base`
     /// lets it pick the base as well.
     fn compare(&mut self, tab: &mut RepoTab, default_base: bool) {
         let Some(snap) = tab.snap.clone() else { return };
         self.compared = None;
-        let (remote, head) = (self.remote.clone(), self.head.clone());
+        let (remote, head) = (self.route(&snap).base_remote, self.head.clone());
         let base = (!default_base).then(|| self.base.clone());
         let on_remote = remote_names(&snap, &remote);
         let local: Vec<String> = snap.branches.iter().map(|branch| branch.name.clone()).collect();
@@ -407,17 +606,15 @@ impl NewPullForm {
     /// Why there is no pull request to open for this pair, if there is not:
     /// neither Create nor the service's own form can help.
     fn blocker(&self, snap: &RepoSnapshot, open: &[PullRequest]) -> Option<String> {
-        let plan = push_plan(&snap.branches, &snap.remote_branches, &self.remote, &self.head);
+        let route = self.route(snap);
+        let plan = push_plan(&snap.branches, &snap.remote_branches, &route.push, &self.head);
         if self.base.is_empty() {
             return Some("Pick the branch to merge into.".to_owned());
         }
-        if plan.head == self.base {
+        if plan.head == self.base && route.from.same(&route.into) {
             return Some(format!("{} cannot be merged into itself: pick another branch.", self.base));
         }
-        if let Some(existing) = open
-            .iter()
-            .find(|pull| pull.head_ref == plan.head && pull.base_ref == self.base && pull.is_from(&self.repo))
-        {
+        if let Some(existing) = existing(open, &self.repo, &route, &plan.head, &self.base) {
             return Some(format!(
                 "{} {} already merges {} into {}.",
                 self.repo.service.pull_word_title(),
@@ -444,20 +641,24 @@ impl NewPullForm {
     /// address): push first when the remote needs it. True when the dialog
     /// has done its job already.
     fn submit(&mut self, tab: &mut RepoTab, snap: &RepoSnapshot, browse: Option<String>) -> bool {
-        let plan = push_plan(&snap.branches, &snap.remote_branches, &self.remote, &self.head);
+        let route = self.route(snap);
+        let plan = push_plan(&snap.branches, &snap.remote_branches, &route.push, &self.head);
         let then = match browse {
             Some(url) => Then::Browse(url),
-            None => Then::Create(NewPull {
-                head: plan.head.clone(),
-                base: self.base.clone(),
-                title: self.title.trim().to_owned(),
-                body: self.body.trim_end().to_owned(),
-                draft: self.draft,
-            }),
+            None => Then::Create(
+                NewPull {
+                    head: plan.head.clone(),
+                    base: self.base.clone(),
+                    title: self.title.trim().to_owned(),
+                    body: self.body.trim_end().to_owned(),
+                    draft: self.draft,
+                },
+                route.across(&self.repo).map(Box::new),
+            ),
         };
         self.problem = None;
         if plan.push {
-            let cmd = ops::push_branch(&self.remote, &self.head_name());
+            let cmd = ops::push_branch(&route.push, &self.head_name());
             let label = cmd.label.clone();
             tab.run(cmd);
             self.step = Step::Pushing { label, since: Instant::now(), then };
@@ -471,8 +672,8 @@ impl NewPullForm {
     /// has done its job.
     fn then(&mut self, tab: &mut RepoTab, then: Then) -> bool {
         match then {
-            Then::Create(new) => {
-                self.send(tab, new);
+            Then::Create(new, across) => {
+                self.send(tab, new, across);
                 false
             }
             Then::Browse(url) => {
@@ -483,11 +684,16 @@ impl NewPullForm {
         }
     }
 
-    fn send(&mut self, tab: &mut RepoTab, new: NewPull) {
-        match tab.hosting.create_pull(new) {
+    fn send(&mut self, tab: &mut RepoTab, new: NewPull, across: Option<Box<Across>>) {
+        let into = across.as_ref().map_or_else(|| self.repo.clone(), |across| across.into.clone());
+        let sent = match across {
+            Some(across) => tab.hosting.create_pull_across(new, *across),
+            None => tab.hosting.create_pull(new),
+        };
+        match sent {
             Some(id) => {
                 tab.busy.push(BusyOp { label: CREATING.to_owned(), quiet: false, since: Instant::now() });
-                self.step = Step::Sending { id };
+                self.step = Step::Sending { id, into };
             }
             None => {
                 self.step = Step::Editing;
@@ -510,16 +716,14 @@ impl NewPullForm {
                 Some(false) => {
                     // git's own message is already in a toast.
                     self.step = Step::Editing;
-                    self.problem = Some(format!(
-                        "Pushing {} to {} failed, so nothing was opened.",
-                        self.head_name(),
-                        self.remote
-                    ));
+                    let remote = tab.snap.as_ref().map_or_else(|| self.remote.clone(), |snap| self.route(snap).push);
+                    self.problem =
+                        Some(format!("Pushing {} to {remote} failed, so nothing was opened.", self.head_name()));
                 }
                 None => {}
             },
-            Step::Sending { id } => {
-                let id = *id;
+            Step::Sending { id, into } => {
+                let (id, into) = (*id, into.clone());
                 tab.hosting.poll();
                 let answer = tab.hosting.take_created(id).or_else(|| {
                     (!tab.hosting.is_creating(id)).then(|| {
@@ -531,15 +735,13 @@ impl NewPullForm {
                 self.step = Step::Editing;
                 match answer {
                     Ok(pull) => {
-                        let url = self.repo.pull_url(pull.number);
-                        let (site, service) = (self.repo.site(), self.repo.service);
-                        shared.toast_link(
-                            ToastKind::Success,
-                            format!("Opened {} {}", service.pull_word(), service.pull_number(pull.number)),
-                            pull.title.clone(),
-                            format!("Open on {site}"),
-                            url,
-                        );
+                        let url = into.pull_url(pull.number);
+                        let (site, service) = (into.site(), into.service);
+                        let mut title = format!("Opened {} {}", service.pull_word(), service.pull_number(pull.number));
+                        if !into.same(&self.repo) {
+                            title.push_str(&format!(" in {}", into.slug()));
+                        }
+                        shared.toast_link(ToastKind::Success, title, pull.title.clone(), format!("Open on {site}"), url);
                         return true;
                     }
                     Err(problem) => self.problem = Some(hosting::create_problem(&problem, self.repo.service)),
@@ -579,19 +781,31 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
     let shown = tab.hosting.connected();
     let open_pulls: Vec<PullRequest> = shown.as_ref().map(|shown| shown.view.pulls.items.clone()).unwrap_or_default();
     let auth = shown.as_ref().map(|shown| shown.view.auth).unwrap_or_default();
+    if !form.busy() {
+        let parent = shown.as_ref().and_then(|shown| shown.view.parent.clone());
+        form.retarget(tab, &snap, parent.as_ref());
+    }
     let service = form.repo.site();
     let word = form.repo.service.pull_word();
 
     ui.set_width(520.0);
     ui.label(RichText::new(format!("Create {word}")).font(theme::bold(16.0)).color(theme::text_bright()));
-    ui.label(RichText::new(format!("{} on {service}", form.repo.slug())).color(theme::text_dim()));
+    ui.label(RichText::new(format!("{} on {service}", form.target().repo.slug())).color(theme::text_dim()));
     ui.add_space(4.0);
 
-    let (head_before, base_before) = (form.head.clone(), form.base.clone());
+    let (head_before, base_before, into_before) = (form.head.clone(), form.base.clone(), form.into);
     ui.add_enabled_ui(!form.busy(), |ui| {
+        target_picker(ui, form);
         branch_pickers(ui, form, &snap);
     });
-    if form.head != head_before || form.base != base_before {
+    if form.into != into_before {
+        // Another repository: its own branches, from its default one.
+        form.into_chosen = true;
+        form.base_chosen = false;
+        form.base = form.first_base(&snap);
+        let unknown = form.target().default_branch.is_none();
+        form.compare(tab, unknown);
+    } else if form.head != head_before || form.base != base_before {
         if form.base != base_before {
             form.base_chosen = true;
         }
@@ -599,7 +813,8 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
     }
 
     // What will happen: how many commits, and whether a push comes first.
-    let plan = push_plan(&snap.branches, &snap.remote_branches, &form.remote, &form.head);
+    let route = form.route(&snap);
+    let plan = push_plan(&snap.branches, &snap.remote_branches, &route.push, &form.head);
     let mut summary = match (form.commits(), &form.compared) {
         (Some(commits), _) => match (commits.count, commits.more) {
             (_, true) => format!("More than {COUNT_LIMIT} commits"),
@@ -612,16 +827,16 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
         (None, Some(_)) => String::new(),
     };
     if !summary.is_empty() && form.commits().is_some_and(|commits| commits.count > 0) {
-        summary.push_str(&format!(" from {} into {}", form.head_name(), form.base));
+        summary.push_str(&format!(" from {} into {}", route.head_label(&form.head_name()), form.base));
     }
-    if plan.head == form.base {
+    if plan.head == form.base && route.from.same(&route.into) {
         // The warning below says what is wrong; nothing would happen.
         summary.clear();
     } else if plan.push {
         let push = match plan.ahead {
-            0 => format!("{} will be pushed to {} first", form.head_name(), form.remote),
-            1 => format!("1 new commit will be pushed to {} first", form.remote),
-            n => format!("{n} new commits will be pushed to {} first", form.remote),
+            0 => format!("{} will be pushed to {} first", form.head_name(), route.push),
+            1 => format!("1 new commit will be pushed to {} first", route.push),
+            n => format!("{n} new commits will be pushed to {} first", route.push),
         };
         summary = if summary.is_empty() { push } else { format!("{summary}  ·  {push}") };
     }
@@ -654,14 +869,13 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
     let untitled = form.title.trim().is_empty();
     // Known to have no usable sign-in: Create would only be refused.
     let signed_out = matches!(auth, hosting::Auth::Anonymous | hosting::Auth::Rejected);
-    let existing = open_pulls.iter().find(|pull| {
-        pull.head_ref == plan.head && pull.base_ref == form.base && pull.is_from(&form.repo)
-    });
+    let existing = existing(&open_pulls, &form.repo, &route, &plan.head, &form.base);
+    let site = form.target().repo.site();
     ui.add_space(2.0);
     let mut check_again = false;
     match &form.step {
-        Step::Pushing { .. } => working(ui, &format!("Pushing {} to {}…", form.head_name(), form.remote)),
-        Step::Sending { .. } => working(ui, &format!("Opening the {word} on {service}…")),
+        Step::Pushing { .. } => working(ui, &format!("Pushing {} to {}…", form.head_name(), route.push)),
+        Step::Sending { .. } => working(ui, &format!("Opening the {word} on {site}…")),
         Step::Editing => {
             if let Some(problem) = &form.problem {
                 ui.label(RichText::new(format!("{}  {problem}", icons::WARNING_CIRCLE)).color(theme::red()));
@@ -700,7 +914,7 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
         match existing {
             Some(pull) => {
                 let url = form.repo.pull_url(pull.number);
-                let label = format!("{}  Open #{}", icons::ARROW_SQUARE_OUT, pull.number);
+                let label = format!("{}  Open {}", icons::ARROW_SQUARE_OUT, form.repo.service.pull_number(pull.number));
                 let button = Button::new(label).min_size(vec2(0.0, 28.0));
                 if ui.add(button).on_hover_text(&url).clicked() {
                     open_link(&url);
@@ -711,14 +925,14 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
                 // is pushed first, as for Create.
                 let enabled = blocker.is_none() && !form.busy();
                 let label = match plan.push {
-                    true => format!("{}  Push and open on {service}", icons::ARROW_SQUARE_OUT),
-                    false => format!("{}  Open on {service}", icons::ARROW_SQUARE_OUT),
+                    true => format!("{}  Push and open on {site}", icons::ARROW_SQUARE_OUT),
+                    false => format!("{}  Open on {site}", icons::ARROW_SQUARE_OUT),
                 };
-                let tip = format!("Opens the form on {service} in the browser: no sign-in needed here");
+                let tip = format!("Opens the form on {site} in the browser: no sign-in needed here");
                 let response = ui.add_enabled(enabled, Button::new(label).min_size(vec2(0.0, 28.0)));
                 let response = if enabled { response.on_hover_text(tip) } else { response };
                 if response.clicked() {
-                    let compare = form.repo.compare_url(&form.base, &plan.head);
+                    let compare = route.into.compare_url_from(&form.base, &route.from, &plan.head);
                     if form.submit(tab, &snap, Some(compare)) {
                         next = Next::Close;
                     } else {
@@ -768,9 +982,33 @@ fn working(ui: &mut Ui, text: &str) {
     });
 }
 
+/// "Repository [owner/name]", when the pull request can go into the
+/// repository's parent as well as into the repository itself.
+fn target_picker(ui: &mut Ui, form: &mut NewPullForm) {
+    if form.targets.len() < 2 {
+        return;
+    }
+    let text = |target: &Target| match target.parent {
+        true => format!("{}  {}  (parent)", icons::GIT_FORK, target.repo.slug()),
+        false => format!("{}  {}", icons::GIT_BRANCH, target.repo.slug()),
+    };
+    let selected = text(form.target());
+    ui.horizontal(|ui| {
+        let word = if form.repo.service.is_gitlab() { "Project" } else { "Repository" };
+        ui.label(RichText::new(word).color(theme::text_dim()))
+            .on_hover_text(format!("Where the {} is opened", form.repo.service.pull_word()));
+        ComboBox::from_id_salt("new-pull-into").selected_text(selected).width(300.0).show_ui(ui, |ui| {
+            for (index, target) in form.targets.iter().enumerate() {
+                ui.selectable_value(&mut form.into, index, text(target));
+            }
+        });
+    });
+}
+
 /// "From [branch] → Into [branch]".
 fn branch_pickers(ui: &mut Ui, form: &mut NewPullForm, snap: &RepoSnapshot) {
-    let remote = form.remote.clone();
+    let hosted = hosted_remotes(&form.remote, &form.related);
+    let bases = form.bases(snap);
     ui.horizontal(|ui| {
         ui.label(RichText::new("From").color(theme::text_dim()));
         let head_text = match &form.head {
@@ -785,12 +1023,14 @@ fn branch_pickers(ui: &mut Ui, form: &mut NewPullForm, snap: &RepoSnapshot) {
                     let text = format!("{}  {}", icons::LAPTOP, branch.name);
                     ui.selectable_value(&mut form.head, value, text);
                 }
-                // Branches only the remote has.
-                for branch in snap.remote_branches.iter().filter(|branch| {
-                    branch.remote == remote
-                        && branch.name != "HEAD"
-                        && !snap.branches.iter().any(|local| local.name == branch.name)
-                }) {
+                // Branches only the remotes have: the one shown, then forks.
+                let only_there = |branch: &&RemoteBranch| {
+                    branch.name != "HEAD" && !snap.branches.iter().any(|local| local.name == branch.name)
+                };
+                let remotes = hosted.iter().flat_map(|remote| {
+                    snap.remote_branches.iter().filter(move |branch| &branch.remote == remote)
+                });
+                for branch in remotes.filter(only_there) {
                     let text = format!("{}  {}", icons::CLOUD, branch.full);
                     ui.selectable_value(&mut form.head, Branch::remote(branch), text);
                 }
@@ -798,10 +1038,6 @@ fn branch_pickers(ui: &mut Ui, form: &mut NewPullForm, snap: &RepoSnapshot) {
         );
         ui.label(RichText::new(icons::ARROW_RIGHT).color(theme::text_dim()));
         ui.label(RichText::new("Into").color(theme::text_dim()));
-        let mut bases = remote_names(snap, &remote);
-        if bases.is_empty() {
-            bases = snap.branches.iter().map(|branch| branch.name.clone()).collect();
-        }
         let base_text = if form.base.is_empty() { "Pick a branch".to_owned() } else { form.base.clone() };
         ComboBox::from_id_salt("new-pull-base").selected_text(base_text).width(190.0).height(320.0).show_ui(
             ui,
@@ -1009,5 +1245,117 @@ mod tests {
         assert_eq!(found.commits.unwrap_err(), "gone is not a branch here");
         let found = compare(&repo, "origin", Branch::local("main"), Some("nowhere".to_owned()), vec![], vec![]);
         assert_eq!(found.commits.unwrap_err(), "nowhere is not a branch here");
+    }
+
+    // ---- forks ----
+
+    fn hub(owner: &str) -> RepoId {
+        RepoId {
+            service: crate::hosting::Service::GitHub,
+            host: "github.com".to_owned(),
+            owner: owner.to_owned(),
+            name: "app".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_fork_offers_its_parent_first_and_itself_second() {
+        let fork = hub("ada");
+        let parent = Parent { repo: hub("octo"), default_branch: "trunk".to_owned() };
+        let related = vec![("upstream".to_owned(), hub("octo")), ("grace".to_owned(), hub("grace"))];
+
+        // Named by the service, with a remote pointing at it.
+        let found = targets("origin", &fork, Some(&parent), &related);
+        assert_eq!(found.len(), 2);
+        assert_eq!(
+            (found[0].repo.slug(), found[0].remote.as_deref(), found[0].default_branch.as_deref(), found[0].parent),
+            ("octo/app".to_owned(), Some("upstream"), Some("trunk"), true)
+        );
+        assert_eq!(
+            (found[1].repo.slug(), found[1].remote.as_deref(), found[1].parent),
+            ("ada/app".to_owned(), Some("origin"), false)
+        );
+        // Named by the service only: no remote, its default branch.
+        let found = targets("origin", &fork, Some(&parent), &[]);
+        assert_eq!((found[0].remote.as_deref(), found[0].default_branch.as_deref()), (None, Some("trunk")));
+        let unnamed = Parent { default_branch: String::new(), ..parent };
+        assert_eq!(targets("origin", &fork, Some(&unnamed), &[])[0].default_branch, None);
+        // A remote called upstream alone.
+        let found = targets("origin", &fork, None, &related);
+        assert_eq!((found[0].repo.slug(), found[0].remote.as_deref()), ("octo/app".to_owned(), Some("upstream")));
+        // Neither: the repository itself only. A fork of it is no target.
+        let found = targets("origin", &fork, None, &[("grace".to_owned(), hub("grace"))]);
+        assert_eq!(found.iter().map(|target| target.repo.slug()).collect::<Vec<_>>(), ["ada/app"]);
+    }
+
+    #[test]
+    fn the_branch_goes_from_the_remote_it_lives_on() {
+        let shown = hub("octo");
+        let related = vec![("mine".to_owned(), hub("ada"))];
+        let own = Target { repo: shown.clone(), remote: Some("origin".to_owned()), default_branch: None, parent: false };
+        let branches = [
+            local("feature", 1, Some("mine/feature"), 0),
+            local("topic", 1, None, 0),
+            local("fix", 1, Some("origin/main"), 0),
+            local("work", 1, Some("mine/main"), 0),
+        ];
+        // Tracking a branch of its own name on a fork: from the fork.
+        let found = route(&branches, &Branch::local("feature"), ("origin", &shown), &related, &own);
+        assert_eq!((found.push.as_str(), found.from.slug(), found.base_remote.as_str()), ("mine", "ada/app".to_owned(), "origin"));
+        assert_eq!(found.head_label("feature"), "ada:feature");
+        assert_eq!(found.across(&shown), Some(Across { from: hub("ada"), into: shown.clone() }));
+        // Not tracking, or tracking another branch it started from: the
+        // remote shown, and nothing across.
+        for name in ["topic", "fix", "work"] {
+            let found = route(&branches, &Branch::local(name), ("origin", &shown), &related, &own);
+            assert_eq!(found.push, "origin", "{name}");
+            assert_eq!(found.across(&shown), None);
+            assert_eq!(found.head_label(name), name);
+        }
+        // A branch of a fork's remote.
+        let theirs = Branch::Remote { remote: "mine".to_owned(), name: "work".to_owned() };
+        let found = route(&branches, &theirs, ("origin", &shown), &related, &own);
+        assert_eq!((found.push.as_str(), found.from.slug()), ("mine", "ada/app".to_owned()));
+
+        // The repository shown is the fork, the target its parent that no
+        // remote points at: pushed to the fork, compared with its branches.
+        let fork = hub("ada");
+        let parent = Target { repo: hub("octo"), remote: None, default_branch: Some("trunk".to_owned()), parent: true };
+        let found = route(&branches, &Branch::local("topic"), ("origin", &fork), &[], &parent);
+        assert_eq!((found.push.as_str(), found.base_remote.as_str()), ("origin", "origin"));
+        assert_eq!(found.across(&fork), Some(Across { from: fork.clone(), into: hub("octo") }));
+        assert_eq!(found.head_label("topic"), "ada:topic");
+        // A branch of the parent itself: within the parent, still across
+        // from where the sidebar stands.
+        let upstream = vec![("upstream".to_owned(), hub("octo"))];
+        let parent = Target { remote: Some("upstream".to_owned()), ..parent };
+        let theirs = Branch::Remote { remote: "upstream".to_owned(), name: "next".to_owned() };
+        let found = route(&branches, &theirs, ("origin", &fork), &upstream, &parent);
+        assert_eq!((found.from.slug(), found.base_remote.as_str()), ("octo/app".to_owned(), "upstream"));
+        assert_eq!(found.head_label("next"), "next");
+        assert_eq!(found.across(&fork), Some(Across { from: hub("octo"), into: hub("octo") }));
+    }
+
+    #[test]
+    fn an_open_pull_request_counts_only_along_the_same_route() {
+        let shown = hub("octo");
+        let pull = |number, head_repo: Option<&str>| PullRequest {
+            number,
+            head_ref: "feature".to_owned(),
+            base_ref: "main".to_owned(),
+            head_repo: head_repo.map(str::to_owned),
+            ..Default::default()
+        };
+        let open = [pull(1, Some("octo/app")), pull(2, Some("ada/app")), pull(3, None)];
+        let within = Route { push: "origin".to_owned(), from: shown.clone(), into: shown.clone(), base_remote: "origin".to_owned() };
+        let number = |found: Option<&PullRequest>| found.map(|pull| pull.number);
+        assert_eq!(number(existing(&open, &shown, &within, "feature", "main")), Some(1));
+        assert_eq!(number(existing(&open, &shown, &within, "feature", "develop")), None);
+        assert_eq!(number(existing(&open, &shown, &within, "other", "main")), None);
+        let from_fork = Route { from: hub("Ada"), ..within.clone() };
+        assert_eq!(number(existing(&open, &shown, &from_fork, "feature", "main")), Some(2));
+        // Into another repository: the list shown says nothing about it.
+        let elsewhere = Route { into: hub("upstream"), ..within };
+        assert_eq!(number(existing(&open, &shown, &elsewhere, "feature", "main")), None);
     }
 }

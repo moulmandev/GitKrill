@@ -691,8 +691,12 @@ pub fn remote_branch_menu(
             }
     }
     crate::ui::multi::compare_item(ui, tab, shared, snap, Some(branch.oid));
-    // Only for the hosted remote: a fork's branch would need its owner too.
-    if let Some(shown) = tab.hosting.connected().filter(|shown| shown.remote == branch.remote) {
+    // For the hosted remote, and the others on its server (forks of it).
+    let servers = &shared.settings.hosting_servers;
+    let hosted = |shown: &crate::hosting::Shown| {
+        crate::ui::new_pull::head_remotes(snap, servers, &shown.remote, &shown.repo).contains(&branch.remote)
+    };
+    if let Some(shown) = tab.hosting.connected().filter(hosted) {
         ui.separator();
         if menu_item(ui, icons::GIT_PULL_REQUEST, &format!("Create {}…", shown.repo.service.pull_word())) {
             crate::ui::new_pull::open(tab, shared, Some(Branch::remote(branch)));
