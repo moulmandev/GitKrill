@@ -102,6 +102,11 @@ pub enum Dialog {
     GitSetup,
     /// Add a pattern to `.gitignore`; see `ui::ignore`.
     Ignore(Box<crate::ui::ignore::IgnoreForm>),
+    /// Add a submodule; see `ui::submodules`.
+    Submodule(Box<crate::ui::submodules::AddForm>),
+    /// Add or remove a worktree, or a branch that is in another; see
+    /// `ui::worktrees`.
+    Worktree(Box<crate::ui::worktrees::Form>),
 }
 
 impl Dialog {
@@ -860,6 +865,8 @@ impl RepoTab {
                 let conflicts = message.contains("CONFLICT") || message.contains("could not apply");
                 if rejected {
                     shared.show(Dialog::PushRejected);
+                } else if crate::ui::worktrees::refused(shared, &message) {
+                    // A branch checked out in another worktree: explained.
                 } else if conflicts {
                     let note = cmd.conflict_note.as_deref().map(|note| format!(" {note}")).unwrap_or_default();
                     shared.toast(

@@ -108,6 +108,12 @@ pub fn status(workdir: &Path) -> Status {
     Status { version, initialized, patterns, problem }
 }
 
+/// Whether the repository at `workdir` uses LFS and git-lfs is installed,
+/// found out without running git-lfs in it (see [`status`]). Blocks.
+pub fn in_use(workdir: &Path) -> bool {
+    version(workdir).is_ok() && (has_local_filter(workdir) || has_hooks(workdir) || has_lfs_attributes(workdir))
+}
+
 /// A `.gitattributes` in the working tree (committed or not) that sends
 /// files through LFS: a cloned LFS repository.
 fn has_lfs_attributes(workdir: &Path) -> bool {

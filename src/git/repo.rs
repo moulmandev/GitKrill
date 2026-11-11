@@ -13,7 +13,7 @@ use super::hidden::Hidden;
 use super::{
     BranchInfo, ChangeKind, CommitDetails, CommitInfo, FileChange, Head, History, Oid, RefKind,
     RefLabel, RemoteBranch, RemoteInfo, RepoSnapshot, RepoState, RowKind, StashInfo,
-    SubmoduleInfo, TagInfo, WorkingStatus,
+    TagInfo, WorkingStatus,
 };
 
 pub fn lossy(bytes: &[u8]) -> String {
@@ -73,8 +73,8 @@ impl Loader {
         let remotes = self.remotes();
         let Refs { branches, remote_branches, tags } = self.refs(&head, &remotes);
         let stashes = self.stashes();
-        let submodules = self.submodules();
         let status = self.status()?;
+        let submodules = super::submodule::read(&self.repo, &status);
 
         let mut hasher = DefaultHasher::new();
         limit.hash(&mut hasher);
@@ -155,6 +155,7 @@ impl Loader {
             tags,
             stashes,
             submodules,
+            worktrees: super::worktree::read(&self.repo),
             status,
             head_message,
             history,
@@ -301,16 +302,6 @@ impl Loader {
             true
         });
         out
-    }
-
-    fn submodules(&self) -> Vec<SubmoduleInfo> {
-        let Ok(subs) = self.repo.submodules() else { return Vec::new() };
-        subs.iter()
-            .map(|s| SubmoduleInfo {
-                name: lossy(s.name_bytes()),
-                path: s.path().to_string_lossy().replace('\\', "/"),
-            })
-            .collect()
     }
 
     fn status(&self) -> Result<WorkingStatus, String> {

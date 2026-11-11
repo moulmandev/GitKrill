@@ -16,6 +16,7 @@ pub mod hidden;
 pub mod ignore;
 pub mod internal;
 pub mod lfs;
+pub mod lfs_lock;
 pub mod multi;
 pub mod ops;
 pub mod picture;
@@ -23,13 +24,16 @@ pub mod rebase;
 pub mod remotes;
 pub mod repo;
 pub mod stash;
+pub mod submodule;
 pub mod text;
+pub mod worktree;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use git2::Oid;
+pub use submodule::SubmoduleInfo;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowKind {
@@ -107,12 +111,6 @@ pub struct StashInfo {
     pub index: usize,
     pub message: String,
     pub oid: Oid,
-}
-
-#[derive(Clone, Debug)]
-pub struct SubmoduleInfo {
-    pub name: String,
-    pub path: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -221,6 +219,8 @@ pub struct RepoSnapshot {
     pub tags: Vec<TagInfo>,
     pub stashes: Vec<StashInfo>,
     pub submodules: Vec<SubmoduleInfo>,
+    /// The repository's working trees, the main one first (`git::worktree`).
+    pub worktrees: Vec<worktree::WorktreeInfo>,
     pub status: WorkingStatus,
     /// Full message of the HEAD commit, used to prefill an amend.
     pub head_message: String,
@@ -339,6 +339,9 @@ pub struct FileDiff {
     /// The whole file was asked for, but it is too long to show: only the
     /// hunks are there.
     pub too_long_for_whole_file: bool,
+    /// The path is a submodule: the commits it moved between, instead of
+    /// lines (`git::submodule::Change`).
+    pub submodule: Option<submodule::Change>,
 }
 
 impl FileDiff {

@@ -77,6 +77,13 @@ impl Loader {
         let format = text::format_for(repo.workdir().unwrap_or(repo.path()));
         let (mut out, blobs) = self.collect(target, mode, CONTEXT, format)?;
         out.mode = mode;
+        if let Some(change) = &mut out.submodule {
+            // git writes "Subproject commit <id>-dirty" for the working tree
+            // of a submodule whose own files changed.
+            change.dirty = out.hunks.iter().flat_map(|h| &h.lines).any(|l| l.origin == '+' && l.text.trim_end().ends_with("-dirty"));
+            change.describe(repo, &target.path);
+            return Ok(out);
+        }
 
         let is_image = picture::is_image_path(&target.path)
             || target.old_path.as_deref().is_some_and(picture::is_image_path);
@@ -191,6 +198,10 @@ impl Loader {
                     out.old_path = old_path
                         .filter(|old| Some(*old) != new_path)
                         .map(lossy);
+                    // A submodule: the "file" is the commit it is at.
+                    if [delta.old_file().mode(), delta.new_file().mode()].contains(&git2::FileMode::Commit) {
+                        out.submodule = Some(super::submodule::Change::between(delta.old_file().id(), delta.new_file().id()));
+                    }
                 }
                 return true;
             }

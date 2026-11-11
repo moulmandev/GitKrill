@@ -80,6 +80,11 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
         None => widgets::placeholder(ui, "Loading diff…"),
         Some(Err(e)) => widgets::placeholder(ui, &e),
         Some(Ok(diff)) if diff.mode != wanted => widgets::placeholder(ui, "Loading diff…"),
+        Some(Ok(diff)) if diff.submodule.is_some() => {
+            if let Some(change) = &diff.submodule {
+                crate::ui::submodules::diff_view(ui, tab, shared, &target, change);
+            }
+        }
         Some(Ok(diff)) if diff.binary => match &diff.images {
             Some(images) => crate::ui::image_diff::show(ui, images),
             None => widgets::placeholder(ui, "Binary file - no text diff to show"),
@@ -96,6 +101,9 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
 /// history. `target` must have a commit as its source. A diff that
 /// ignoring whitespace left empty gets the placeholder that says so.
 pub fn read_only(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget, diff: &Arc<FileDiff>) {
+    if let Some(change) = &diff.submodule {
+        return crate::ui::submodules::diff_view(ui, tab, shared, target, change);
+    }
     if diff.hunks.is_empty() && diff.only_whitespace {
         return only_whitespace(ui, shared);
     }
@@ -140,6 +148,7 @@ fn title_bar(
                         tab.run(ops::stage(std::slice::from_ref(&target.path)));
                     }
                     if kind != Some(ChangeKind::Conflicted)
+                        && !diff.is_some_and(|diff| diff.submodule.is_some())
                         && tint_button(ui, "Discard", theme::red()).clicked()
                     {
                         shared.show(Dialog::confirm(
@@ -157,13 +166,13 @@ fn title_bar(
                 }
                 DiffSource::Commit(_) | DiffSource::Compare { .. } => {}
             }
-            if let Some(diff) = diff.filter(|diff| !diff.binary) {
+            if let Some(diff) = diff.filter(|diff| !diff.binary && diff.submodule.is_none()) {
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new(format!("-{}", diff.deletions)).color(theme::red()).font(theme::mono(12.0)));
                 ui.label(egui::RichText::new(format!("+{}", diff.additions)).color(theme::green()).font(theme::mono(12.0)));
             }
             // Images have modes of their own.
-            if !diff.is_some_and(|diff| diff.binary) {
+            if !diff.is_some_and(|diff| diff.binary || diff.submodule.is_some()) {
                 ui.add_space(8.0);
                 crate::ui::diff_mode::controls(ui, &mut shared.settings.editor, rect.width() < COMPACT_BELOW);
             }
