@@ -9,6 +9,7 @@ mod external;
 mod git;
 mod git_setup;
 mod hosting;
+mod notification;
 mod platform;
 mod prefs;
 mod shot;
@@ -26,6 +27,12 @@ use std::path::PathBuf;
 use eframe::egui;
 
 fn main() -> eframe::Result {
+    // Started by git or ssh to ask the user something (GIT_ASKPASS,
+    // SSH_ASKPASS, gpg.program): answer and leave before any window opens.
+    if let Some(code) = git::prompt::helper::dispatch() {
+        std::process::exit(code);
+    }
+
     let mut args = std::env::args().skip(1);
     let first = args.next();
 

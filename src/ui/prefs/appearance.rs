@@ -13,6 +13,7 @@ use eframe::egui::{self, Label, RichText, Sense, Ui, vec2};
 
 use super::{Page, form};
 use crate::prefs::appearance::{self as prefs, Corner, DateFormat, ThemeFile};
+use crate::prefs::system_date::{self, SystemFormat};
 use crate::state::ToastKind;
 use crate::theme::{self, Choice};
 
@@ -28,6 +29,9 @@ pub struct State {
     reading: Option<Receiver<Read>>,
     /// The date pattern being typed, kept aside until the field loses focus.
     date: Option<String>,
+    /// The system's date formats, read when the page first shows (the
+    /// inner `None` when they cannot be read).
+    system: Option<Option<SystemFormat>>,
 }
 
 /// One read of the themes folder.
@@ -226,6 +230,38 @@ fn theme_row(ui: &mut Ui, page: &mut Page<'_>, state: &mut State) {
 }
 
 fn date_row(ui: &mut Ui, page: &mut Page<'_>, state: &mut State) {
+    // Read once per visit to the page; the region settings may have
+    // changed since GitKrill started, which this puts into effect.
+    let system = match &state.system {
+        Some(system) => system.clone(),
+        None => {
+            let system = system_date::read();
+            prefs::refresh_system_dates(page.ctx, &page.shared.settings.appearance);
+            state.system = Some(system.clone());
+            system
+        }
+    };
+    let now = chrono::Local::now();
+    let appearance = &mut page.shared.settings.appearance;
+    let label = match &system {
+        Some(format) => format!("Follow the system: {}", DateFormat::system(format.clone()).format(&now, true)),
+        None => "Follow the system".to_owned(),
+    };
+    ui.add_enabled_ui(system.is_some() || appearance.system_dates, |ui| {
+        form::checkbox(ui, &mut appearance.system_dates, &label)
+    });
+    if system.is_none() {
+        form::help(ui, "The system's date format could not be read here, so the pattern below is used.");
+    } else if appearance.system_dates {
+        form::help(
+            ui,
+            "Dates and times everywhere in GitKrill follow the short date and time formats of your region \
+             settings. Clear the box to type a pattern of your own.",
+        );
+        return;
+    }
+    ui.add_space(4.0);
+
     let stored = page.shared.settings.appearance.date_format.clone();
     let mut text = state.date.take().unwrap_or_else(|| stored.clone());
     let response = form::text(ui, &mut text, "MMM D, YYYY");

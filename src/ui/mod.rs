@@ -21,6 +21,7 @@ pub mod palette;
 pub mod new_pull;
 pub mod panel;
 pub mod prefs;
+pub mod prompt;
 pub mod rebase;
 pub mod remotes;
 pub mod sidebar;

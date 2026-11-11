@@ -11,12 +11,16 @@
 //!   writes every colour of both sets as a starting point. The chosen file
 //!   is read once, in [`apply`]; `crate::theme` keeps its colours in a
 //!   static that the colour functions read.
-//! - **Dates** follow a short pattern of tokens ([`DateFormat`]), compiled
-//!   once in [`apply`]; `state::format_time` and the history view's dates
-//!   ask [`custom_date`] first.
+//! - **Dates** follow a short pattern of tokens ([`DateFormat`]), or the
+//!   system's own short formats ([`Appearance::system_dates`], read by
+//!   `prefs::system_date`), compiled once in [`apply`];
+//!   `state::format_time` and the history view's dates ask [`custom_date`]
+//!   first, clocks [`custom_clock`].
 //! - **Desktop notifications** ask the window manager for attention (the
 //!   taskbar button flashes, the dock icon bounces) when a toast is raised
-//!   while the window is in the background; see `ui::dialogs::toasts`.
+//!   while the window is in the background, and show its message in a
+//!   system notification (`crate::notification`); see
+//!   `ui::dialogs::toasts`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -26,6 +30,7 @@ use chrono::{DateTime, Local};
 use eframe::egui::{self, Color32};
 use serde::{Deserialize, Serialize};
 
+use crate::prefs::system_date::{Names, SystemFormat};
 use crate::state::Settings;
 use crate::theme::{self, DARK, LIGHT, Palette};
 
@@ -42,6 +47,10 @@ pub struct Appearance {
     /// A [`DateFormat`] pattern (`M/D/YYYY`); empty for the built-in
     /// `Nov 10, 2026`.
     pub date_format: String,
+    /// Dates in the system's short date and time formats, in place of
+    /// `date_format`. Off for settings saved before it existed, so their
+    /// dates do not change; on for new installs (`Settings::load`).
+    pub system_dates: bool,
     /// Labels under the toolbar's icons. Off makes the toolbar shorter.
     pub toolbar_labels: bool,
     /// "workspace › repository › branch" in the toolbar for a repository of
@@ -50,6 +59,9 @@ pub struct Appearance {
     /// Ask for attention when an operation ends while the window is in the
     /// background.
     pub desktop_notifications: bool,
+    /// With `desktop_notifications`, also show the message in a system
+    /// notification.
+    pub system_notifications: bool,
 }
 
 impl Default for Appearance {
@@ -58,9 +70,11 @@ impl Default for Appearance {
             custom_theme: None,
             toast_corner: Corner::default(),
             date_format: String::new(),
+            system_dates: false,
             toolbar_labels: true,
             workspace_breadcrumb: true,
             desktop_notifications: false,
+            system_notifications: true,
         }
     }
 }
@@ -95,6 +109,7 @@ struct Applied {
     /// The custom set in use, to tell whether a file read again changed.
     palette: Option<Palette>,
     date_format: String,
+    system_dates: bool,
 }
 
 static APPLIED: Mutex<Option<Applied>> = Mutex::new(None);
@@ -106,7 +121,12 @@ pub fn apply(ctx: &egui::Context, settings: &Settings) {
     let prefs = &settings.appearance;
     let mut applied = APPLIED.lock().unwrap_or_else(PoisonError::into_inner);
     let first = applied.is_none();
-    let last = applied.get_or_insert_with(|| Applied { theme: None, palette: None, date_format: String::new() });
+    let last = applied.get_or_insert_with(|| Applied {
+        theme: None,
+        palette: None,
+        date_format: String::new(),
+        system_dates: false,
+    });
 
     if first || last.theme != prefs.custom_theme {
         last.theme = prefs.custom_theme.clone();
@@ -123,9 +143,31 @@ pub fn apply(ctx: &egui::Context, settings: &Settings) {
         ctx.request_repaint();
     }
 
-    if first || last.date_format != prefs.date_format {
+    if first || last.date_format != prefs.date_format || last.system_dates != prefs.system_dates {
         last.date_format = prefs.date_format.clone();
-        set_date_format(DateFormat::compile(&prefs.date_format));
+        last.system_dates = prefs.system_dates;
+        set_date_format(chosen_format(prefs));
+        ctx.request_repaint();
+    }
+}
+
+/// The format `prefs` choose: the system's when it can be read (else the
+/// pattern), or the pattern (`None` for the built-in one).
+fn chosen_format(prefs: &Appearance) -> Option<DateFormat> {
+    let system = prefs.system_dates.then(crate::prefs::system_date::read).flatten();
+    system.map(DateFormat::system).or_else(|| DateFormat::compile(&prefs.date_format))
+}
+
+/// The system's formats may have changed while GitKrill runs (the
+/// preferences page reads them again): use the new ones when they are in
+/// use.
+pub fn refresh_system_dates(ctx: &egui::Context, prefs: &Appearance) {
+    if !prefs.system_dates {
+        return;
+    }
+    let format = chosen_format(prefs);
+    if current_format() != format {
+        set_date_format(format);
         ctx.request_repaint();
     }
 }
@@ -386,8 +428,13 @@ pub struct DateFormat {
     /// The same with the time of day added (`HH:mm`), unless the pattern
     /// prints one itself: for the places that show a time.
     date_time: String,
+    /// The time of day alone, for clocks (`HH:mm` for patterns).
+    time: String,
     /// Whether the pattern prints any part of a date or time.
     pub has_tokens: bool,
+    /// Month and day names in the system's language; chrono's English
+    /// ones when `None`.
+    names: Option<std::sync::Arc<Names>>,
 }
 
 impl DateFormat {
@@ -420,13 +467,80 @@ impl DateFormat {
             }
         }
         let date_time = if has_time { date.clone() } else { format!("{date} %H:%M") };
-        Some(DateFormat { date, date_time, has_tokens })
+        Some(DateFormat { date, date_time, time: "%H:%M".to_owned(), has_tokens, names: None })
+    }
+
+    /// The system's short formats: the date, and the date followed by the
+    /// time where a time of day is shown.
+    pub fn system(format: SystemFormat) -> DateFormat {
+        DateFormat {
+            date_time: format!("{} {}", format.date, format.time),
+            date: format.date,
+            time: format.time,
+            has_tokens: true,
+            names: format.names.map(std::sync::Arc::new),
+        }
     }
 
     /// `time` in this format; with the time of day when `with_time`.
     pub fn format(&self, time: &DateTime<Local>, with_time: bool) -> String {
-        time.format(if with_time { &self.date_time } else { &self.date }).to_string()
+        self.print(time, if with_time { &self.date_time } else { &self.date })
     }
+
+    /// The time of day alone (`14:32`, `2:32 PM`).
+    pub fn clock(&self, time: &DateTime<Local>) -> String {
+        self.print(time, &self.time)
+    }
+
+    fn print(&self, time: &DateTime<Local>, spec: &str) -> String {
+        match &self.names {
+            Some(names) => time.format(&localise(spec, names, time)).to_string(),
+            None => time.format(spec).to_string(),
+        }
+    }
+}
+
+/// `spec` with the month and day names and AM / PM it prints written out
+/// in `names`' language, since chrono only knows English ones.
+fn localise(spec: &str, names: &Names, time: &DateTime<Local>) -> String {
+    use chrono::{Datelike, Timelike};
+    let month = time.month0() as usize;
+    let day = time.weekday().num_days_from_sunday() as usize;
+    let noon = if time.hour() < 12 { names.am.as_str() } else { names.pm.as_str() };
+    let lower_noon = noon.to_lowercase();
+    let mut out = String::with_capacity(spec.len() + 16);
+    let mut chars = spec.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        // Padding flags apply to numbers only.
+        let mut flags = String::new();
+        while let Some(&flag) = chars.peek().filter(|c| matches!(c, '-' | '_' | '0')) {
+            flags.push(flag);
+            chars.next();
+        }
+        let Some(letter) = chars.next() else { break };
+        let name = match letter {
+            'B' => Some(names.months[month].as_str()),
+            'b' | 'h' => Some(names.short_months[month].as_str()),
+            'A' => Some(names.days[day].as_str()),
+            'a' => Some(names.short_days[day].as_str()),
+            'p' if !noon.is_empty() => Some(noon),
+            'P' if !noon.is_empty() => Some(lower_noon.as_str()),
+            _ => None,
+        };
+        match name {
+            Some(name) => out.push_str(&name.replace('%', "%%")),
+            None => {
+                out.push('%');
+                out.push_str(&flags);
+                out.push(letter);
+            }
+        }
+    }
+    out
 }
 
 // The format in use. Tests get one per thread, like the theme, so a test of
@@ -440,6 +554,14 @@ thread_local! {
     static DATE_FORMAT: std::cell::RefCell<Option<DateFormat>> = const { std::cell::RefCell::new(None) };
 }
 
+/// The format in use.
+fn current_format() -> Option<DateFormat> {
+    #[cfg(not(test))]
+    return DATE_FORMAT.read().unwrap_or_else(PoisonError::into_inner).clone();
+    #[cfg(test)]
+    DATE_FORMAT.with(|current| current.borrow().clone())
+}
+
 fn set_date_format(format: Option<DateFormat>) {
     #[cfg(not(test))]
     {
@@ -448,6 +570,21 @@ fn set_date_format(format: Option<DateFormat>) {
     }
     #[cfg(test)]
     DATE_FORMAT.with(|current| *current.borrow_mut() = format);
+}
+
+/// The time of day alone in the user's format (the system's 12-hour clock,
+/// say); `None` while the built-in format is in use (one atomic load).
+pub fn custom_clock(time: &DateTime<Local>) -> Option<String> {
+    #[cfg(not(test))]
+    {
+        if !CUSTOM_DATE.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let format = DATE_FORMAT.read().unwrap_or_else(PoisonError::into_inner);
+        format.as_ref().map(|format| format.clock(time))
+    }
+    #[cfg(test)]
+    DATE_FORMAT.with(|format| format.borrow().as_ref().map(|format| format.clock(time)))
 }
 
 /// `time` in the user's date format, with the time of day when `with_time`;
@@ -519,6 +656,49 @@ mod tests {
         assert_eq!(custom_date(&at(2026, 3, 5, 14, 9), false).as_deref(), Some("05/03/2026"));
         set_date_format(None);
         assert_eq!(custom_date(&at(2026, 3, 5, 14, 9), false), None);
+    }
+
+    #[test]
+    fn system_formats_print_the_names_of_their_language() {
+        let names = Names {
+            months: std::array::from_fn(|i| format!("mois{}", i + 1)),
+            short_months: std::array::from_fn(|i| format!("m{}%", i + 1)),
+            days: ["dimanche", "lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi"].map(String::from),
+            short_days: ["dim.", "lun.", "mar.", "mer.", "jeu.", "ven.", "sam."].map(String::from),
+            am: "vorm.".to_owned(),
+            pm: "nachm.".to_owned(),
+        };
+        let format = DateFormat::system(SystemFormat {
+            date: "%a %-d %b %Y".to_owned(),
+            time: "%-I:%M %p".to_owned(),
+            names: Some(names),
+        });
+        let time = at(2026, 3, 5, 14, 9);
+        assert_eq!(format.format(&time, false), "jeu. 5 m3% 2026");
+        assert_eq!(format.format(&time, true), "jeu. 5 m3% 2026 2:09 nachm.");
+        assert_eq!(format.clock(&time), "2:09 nachm.");
+        assert_eq!(format.clock(&at(2026, 3, 5, 9, 30)), "9:30 vorm.");
+
+        // Without names (or an empty AM), chrono's own.
+        let plain = DateFormat::system(SystemFormat { date: "%d.%m.%Y".into(), time: "%H:%M".into(), names: None });
+        assert_eq!(plain.format(&time, true), "05.03.2026 14:09");
+        set_date_format(Some(plain));
+        assert_eq!(crate::state::format_time(time.timestamp()), "05.03.2026 14:09");
+        assert_eq!(custom_clock(&time).as_deref(), Some("14:09"));
+        set_date_format(None);
+        assert_eq!(custom_clock(&time), None);
+    }
+
+    #[test]
+    fn the_system_choice_falls_back_to_the_pattern() {
+        let prefs = Appearance { system_dates: true, date_format: "DD/MM".into(), ..Default::default() };
+        let chosen = chosen_format(&prefs);
+        match crate::prefs::system_date::read() {
+            Some(system) => assert_eq!(chosen, Some(DateFormat::system(system))),
+            None => assert_eq!(chosen, DateFormat::compile("DD/MM")),
+        }
+        let off = Appearance { system_dates: false, date_format: String::new(), ..Default::default() };
+        assert_eq!(chosen_format(&off), None);
     }
 
     #[test]
@@ -614,5 +794,11 @@ mod tests {
         assert_eq!(settings.theme, theme::Choice::System);
         assert_eq!(settings.appearance.toast_corner, Corner::TopRight);
         assert!(settings.appearance.toolbar_labels);
+        // Dates stay as they were for settings saved before the system
+        // choice existed; a first start follows the system.
+        assert!(!settings.appearance.system_dates && settings.appearance.system_notifications);
+        assert!(!Settings::from_saved(Some(br#"{"theme": "Dark"}"#)).appearance.system_dates);
+        assert!(!Settings::from_saved(Some(b"not json")).appearance.system_dates);
+        assert!(Settings::from_saved(None).appearance.system_dates);
     }
 }

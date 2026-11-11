@@ -35,6 +35,8 @@ impl App {
 
         let settings = Settings::load();
         crate::prefs::apply(&cc.egui_ctx, &settings);
+        // What git, ssh and gpg ask is asked in the app from now on.
+        crate::git::prompt::install(&cc.egui_ctx);
         let mut app = App {
             tabs: Vec::new(),
             active: 0,
@@ -738,6 +740,7 @@ impl eframe::App for App {
 
         self.palette.show(&ctx, &mut self.tabs, self.active, &mut self.shared);
         ui::dialogs::show(&ctx, &mut self.shared, self.tabs.get_mut(self.active));
+        ui::prompt::show(&ctx, &self.shared.settings);
         ui::dialogs::toasts(&ctx, &mut self.shared, self.tabs.get(self.active));
 
         // Spinners and progress bars need frames while work is in flight.

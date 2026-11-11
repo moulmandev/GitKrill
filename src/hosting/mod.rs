@@ -834,7 +834,7 @@ pub fn epoch_now() -> u64 {
 pub fn clock(epoch: u64) -> String {
     use chrono::{Local, TimeZone};
     match Local.timestamp_opt(epoch as i64, 0).single() {
-        Some(time) => time.format("%H:%M").to_string(),
+        Some(time) => crate::prefs::appearance::custom_clock(&time).unwrap_or_else(|| time.format("%H:%M").to_string()),
         None => "later".to_owned(),
     }
 }

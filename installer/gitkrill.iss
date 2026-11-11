@@ -72,6 +72,12 @@ Source: "gitkrill-installed"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{autoprograms}\GitKrill"; Filename: "{app}\gitkrill.exe"
 Name: "{autodesktop}\GitKrill"; Filename: "{app}\gitkrill.exe"; Tasks: desktopicon
 
+[Registry]
+; System notifications are shown under this application id (see
+; src/notification.rs). GitKrill writes its name and icon there itself,
+; which also covers the portable download; uninstalling removes the key.
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\Moulman.GitKrill"; ValueType: string; ValueName: "DisplayName"; ValueData: "GitKrill"; Flags: uninsdeletekey
+
 [Run]
 ; After installing by hand: offer to start it.
 Filename: "{app}\gitkrill.exe"; Description: "{cm:LaunchProgram,GitKrill}"; Flags: nowait postinstall skipifsilent
