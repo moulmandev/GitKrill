@@ -335,8 +335,13 @@ pub struct RepoTab {
     pub multi: crate::ui::multi::Multi,
     pub details: Option<Result<Arc<CommitDetails>, String>>,
     details_for: Option<Oid>,
+    /// A commit selected from outside the graph that the graph does not
+    /// show; see [`RepoTab::select_outside`].
+    outside: Option<Oid>,
     pub diff: Option<DiffView>,
     pub overlay: Option<Overlay>,
+    /// The reflog panel under the graph, while it is open (`ui::reflog`).
+    pub reflog: Option<Box<crate::ui::reflog::ReflogDock>>,
     /// Finished [`RepoTab::spawn_job`] results, by key, until collected.
     results: HashMap<String, Box<dyn Any + Send>>,
     /// Jobs submitted and not yet answered.
@@ -400,8 +405,10 @@ impl RepoTab {
             multi: Default::default(),
             details: None,
             details_for: None,
+            outside: None,
             diff: None,
             overlay: None,
+            reflog: None,
             results: HashMap::new(),
             jobs_pending: 0,
             outcomes: Vec::new(),
@@ -552,6 +559,7 @@ impl RepoTab {
 
     /// Selects one commit, or the WIP row, on its own.
     pub fn select(&mut self, selection: Selection) {
+        self.outside = None;
         self.multi.reset(match selection {
             Selection::Commit(oid) => Some(oid),
             _ => None,
@@ -575,6 +583,14 @@ impl RepoTab {
                     handle.details(oid, is_stash);
                 }
             }
+    }
+
+    /// Selects a commit that the graph may not show, such as a reflog entry
+    /// no branch reaches any more: the details panel shows it, and it stays
+    /// selected across refreshes until something else is selected.
+    pub fn select_outside(&mut self, oid: Oid) {
+        self.select(Selection::Commit(oid));
+        self.outside = Some(oid);
     }
 
     pub fn select_row(&mut self, row: usize) {
@@ -752,7 +768,7 @@ impl RepoTab {
             Selection::None => fallback,
             // The working tree became clean (commit, stash, discard).
             Selection::Wip if !dirty => fallback,
-            Selection::Commit(oid) if snap.row_of(oid).is_none() => fallback,
+            Selection::Commit(oid) if snap.row_of(oid).is_none() && self.outside != Some(oid) => fallback,
             keep => keep,
         };
 
@@ -931,5 +947,34 @@ pub fn relative_time(secs: i64) -> String {
         plural(delta.num_hours(), "hour")
     } else {
         plural(delta.num_days(), "day")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::{Fixture, git};
+
+    #[test]
+    fn a_commit_selected_from_outside_the_graph_stays_selected() {
+        let fx = Fixture::new("state-outside");
+        fx.write("a.txt", "a\n");
+        fx.commit_all("one");
+        fx.write("a.txt", "b\n");
+        fx.commit_all("two");
+        let two = fx.snapshot().head.oid.unwrap();
+        git(&fx.dir, &["reset", "-q", "--hard", "HEAD~1"]);
+        let snap = fx.snapshot();
+        assert!(snap.row_of(two).is_none());
+
+        let mut tab = RepoTab::new(fx.dir.clone());
+        tab.on_snapshot(snap.clone());
+        tab.select_outside(two);
+        tab.on_snapshot(snap.clone());
+        assert_eq!(tab.selection, Selection::Commit(two));
+        // Selected the ordinary way, a commit the graph lacks gives way to HEAD.
+        tab.select(Selection::Commit(two));
+        tab.on_snapshot(snap.clone());
+        assert_eq!(tab.selection, Selection::Commit(snap.head.oid.unwrap()));
     }
 }

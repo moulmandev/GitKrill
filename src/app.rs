@@ -387,6 +387,7 @@ impl App {
                     if ui.add(egui::Button::new("Refresh").shortcut_text("F5")).clicked() {
                         tab.refresh();
                     }
+                    ui::reflog::view_menu_item(ui, tab);
                 }
                 ui.menu_button("Theme", |ui| {
                     let appearance = &mut shared.settings.appearance;
@@ -722,6 +723,10 @@ impl eframe::App for App {
                 .show(ui, |ui| ui::panel::show(ui, tab, shared));
 
             egui::CentralPanel::default().frame(Frame::new().fill(theme::bg_app())).show(ui, |ui| {
+                // Under the graph or the diff; overlays have the whole space.
+                if tab.overlay.is_none() {
+                    ui::reflog::dock(ui, tab, shared);
+                }
                 if tab.overlay.is_some() {
                     ui::overlay(ui, tab, shared);
                 } else if tab.diff.is_some() {

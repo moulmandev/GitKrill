@@ -21,6 +21,7 @@ pub mod multi;
 pub mod ops;
 pub mod picture;
 pub mod rebase;
+pub mod reflog;
 pub mod remotes;
 pub mod repo;
 pub mod stash;

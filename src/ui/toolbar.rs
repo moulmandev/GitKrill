@@ -75,6 +75,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                     if menu_item(ui, icons::PLUS, "Create branch…") {
                         shared.show(new_branch_dialog());
                     }
+                    crate::ui::reflog::head_item(ui, tab);
                     ui.menu_button(format!("{}  Gitflow", icons::ARROWS_SPLIT), |ui| {
                         crate::ui::gitflow::menu(ui, tab, shared, snap);
                     });
