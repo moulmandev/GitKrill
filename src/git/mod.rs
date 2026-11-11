@@ -8,6 +8,7 @@
 pub mod bisect;
 pub mod blame;
 pub mod branch_folder;
+pub mod carry;
 pub mod cli;
 pub mod conflict;
 pub mod diff;
@@ -23,6 +24,7 @@ pub mod multi;
 pub mod ops;
 pub mod picture;
 pub mod rebase;
+pub mod reflog;
 pub mod remotes;
 pub mod repo;
 pub mod search;

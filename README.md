@@ -227,7 +227,12 @@ be installed.
   into the commit it names (`git rebase -i --autosquash`, no editor): commits
   another branch has are never rewritten, a conflict stops it like any
   rebase, and undo puts the branch back
-- Interactive rebase: pick, reword, squash, fixup, drop and reorder
+- Interactive rebase: pick, reword, squash, fixup, drop and reorder, also
+  over merge commits (`--rebase-merges`). A merge is a row of its own: keep,
+  reword or drop it (with the commits it brought in, which its tooltip
+  lists), or fold later commits into it; what it brought in is replayed as
+  it is, and merges whose parents change are made again with their own
+  message. Commits and merges that do not change keep their SHAs
 - Several selected commits at once, from their right-click menu, the panel
   or the command palette: cherry-pick them (oldest first) or revert them
   (newest first) in one git command, so a conflict stops at the commit that
@@ -270,7 +275,19 @@ be installed.
   fast-forward, tags releases and hotfixes, and can be undone; one that stops
   on a conflict carries on from there when run again
 - Undo / redo for commits, checkouts, merges, resets, rebases, branch create
-  and delete, and adding, editing and removing remotes
+  and delete, and adding, editing and removing remotes. A rebase, merge,
+  cherry-pick or revert that stopped on conflicts is undone as a whole once
+  Continue (or the commit that concludes a merge) finishes it, and a drag
+  action that checks out another branch first is undone in one step, back
+  on the branch you were on
+- Reflog (**View > Reflog**, "Show reflog" in the toolbar's branch menu or on
+  a branch's right-click menu, or the command palette): a panel under the
+  graph lists where HEAD, or a branch, pointed after every commit,
+  checkout, reset, rebase and merge, newest first. Click an entry to find
+  its commit in the graph; a commit nothing reaches any more (amended or
+  rebased away) is marked unreachable and shows in the details panel.
+  Right-click an entry to check it out, create a branch there (to keep a
+  lost commit), reset the current branch to it or cherry-pick it
 
 **Remotes**
 - Fetch, pull (default / ff-only / rebase), push, force push with lease
@@ -429,6 +446,8 @@ src/
     gitflow.rs   Gitflow setup, start and finish as plain git commands
     conflict.rs  three-way conflict regions and resolutions
     rebase.rs    interactive rebase plans
+    reflog.rs    reading reflogs, finding unreachable commits
+    carry.rs     undo for operations that stopped on conflicts
     multi.rs     cherry-pick, revert and squash several commits
     merge.rs     merge modes, the squash merge's prepared message
     fixup.rs     fixup commits and autosquash plans
@@ -448,6 +467,7 @@ src/
     history.rs   file history, blame
     browse.rs    every file of a commit   file_view.rs  one of them, whole
     versions.rs  opening, saving and restoring a file as it was
+    reflog.rs    the reflog panel
     toolbar.rs   toolbar             dialogs.rs  modals and toasts
     gitflow.rs   Gitflow dialogs, menus and palette entries
     multi/       several selected commits: selecting (pick.rs), their
@@ -471,13 +491,16 @@ build.rs         the Windows executable's icon and version details
 
 ## Known gaps
 
-- Undo does not cover a rebase that stopped on conflicts and was continued, or
-  drag actions that switch branches first (`git reflog` still has them)
+- Undo does not cover an operation that stopped on conflicts and was then
+  continued or finished in a terminal (the reflog still has it)
 - Pull request review state and merge request approvals
 - Pull and merge requests from a fork of the repository
 - Bitbucket, Gitea, Azure DevOps and other hosts; GitLab installed under a
   path (`example.com/gitlab`)
-- Interactive rebase refuses ranges that contain merge commits
+- The interactive rebase plans a branch's own line of history: the commits
+  a merge brought in are replayed as they are, not edited one by one, a
+  merge cannot be squashed into another commit, and a base on a merged-in
+  branch is refused (with the nearest base that works offered instead)
 - No ancestor pane or syntax colours in the conflict resolver, and text in
   its two side panes cannot be selected (the result can, in its editor)
 - Long lines do not wrap in the conflict resolver, and its tabs keep a fixed
@@ -493,7 +516,6 @@ build.rs         the Windows executable's icon and version details
   (ssh-agent, gpg-agent); there is no passphrase prompt
 - Submodule management, worktrees, Git LFS file locking; SVG changes show
   as text
-- No reflog view
 - Autosquash only folds fixups whose commit comes after the last merge
   commit on the branch
 - No creating or applying patch files, and no exporting a commit as an

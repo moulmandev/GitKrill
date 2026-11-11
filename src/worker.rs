@@ -223,8 +223,12 @@ fn operator(
     req_tx: Sender<Request>,
     ctx: &egui::Context,
 ) {
+    // Undo entries of operations that stopped on conflicts, until finished.
+    let mut carry = crate::git::carry::Carry::default();
     while let Ok((mut cmd, origin)) = op_rx.recv() {
-        let wants_undo = matches!(origin, Origin::User) && !matches!(cmd.undo, UndoKind::None);
+        let by_user = matches!(origin, Origin::User);
+        let wants_undo = by_user && !matches!(cmd.undo, UndoKind::None);
+        let continues = by_user && carry.start(workdir);
 
         let (before, deleted_at) = if wants_undo {
             match git2::Repository::open(workdir) {
@@ -286,14 +290,21 @@ fn operator(
             }
         }
 
-        let undo = match (&result, before) {
+        // A command that finishes an operation which stopped earlier (Continue)
+        // gets that operation's undo; one that stops keeps its own for later.
+        let carried = if by_user {
+            carry.end(workdir, &cmd, result.is_ok(), before.as_ref(), deleted_at, continues)
+        } else {
+            None
+        };
+        let undo = carried.or_else(|| match (&result, before) {
             (Ok(()), Some(before)) => git2::Repository::open(workdir).ok().and_then(|repo| {
                 note_refs(&repo, &mut cmd.undo, true);
                 crate::git::internal::note_files(&mut cmd.undo, true);
                 build_undo(&cmd, &before, &read_head(&repo), deleted_at)
             }),
             _ => None,
-        };
+        });
 
         // Preferences > General > Keep submodules up to date. It runs while
         // the operation still shows as busy; only a failure is reported, on

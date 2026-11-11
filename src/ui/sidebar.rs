@@ -626,6 +626,7 @@ pub fn local_branch_menu(
         ));
     }
     crate::ui::gitflow::branch_menu(ui, tab, shared, snap, branch);
+    crate::ui::reflog::branch_item(ui, tab, &branch.name);
     ui.separator();
     hide_items(ui, tab, shared, HEADS, &branch.name, !branch.is_head);
     crate::ui::solo::menu_item_for(ui, tab, shared, &hidden::local(&branch.name), &branch.name);
