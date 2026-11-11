@@ -968,13 +968,10 @@ fn tag_menu(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSnap
         }
     let tip = snap.tags.iter().find(|t| t.name == name).map(|t| t.oid);
     crate::ui::multi::compare_item(ui, tab, shared, snap, tip);
+    crate::ui::archive::item(ui, tab, &format!("refs/tags/{name}"), name);
+    crate::ui::tags::remote_items(ui, shared, snap, name);
     if menu_item(ui, icons::TRASH, "Delete tag") {
-        shared.show(Dialog::confirm(
-            "Delete tag",
-            format!("Delete the tag \"{name}\" from this repository?"),
-            "Delete",
-            ops::delete_tag(name),
-        ));
+        crate::ui::tags::delete(shared, snap, name);
     }
     ui.separator();
     let path = crate::git::hidden::tag(name);
@@ -996,6 +993,7 @@ fn row_menu(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<Repo
             if menu_item(ui, icons::PLUS, "Stage all changes") {
                 tab.run(ops::stage_all());
             }
+            crate::ui::patch::changes_items(ui, tab, snap);
             ui.separator();
             if menu_item(ui, icons::TRASH, "Discard all changes") {
                 shared.show(discard_all_dialog(snap));
@@ -1114,6 +1112,9 @@ fn row_menu(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<Repo
         });
     }
     crate::ui::bisect::menu_items(ui, tab, snap, commit.oid);
+    ui.separator();
+    crate::ui::patch::commit_item(ui, tab, snap, commit.oid);
+    crate::ui::archive::item(ui, tab, &sha, &abbrev);
     ui.separator();
 
     if menu_item(ui, icons::COPY, "Copy commit SHA") {

@@ -521,6 +521,7 @@ pub fn menu(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, oid: Oid) -> bo
         // Finished by the panel, which polls every frame (`finish_compare`).
         tab.multi.pending = Some(Pending::WorkingTree(oid));
     }
+    crate::ui::patch::multi_items(ui, tab, snap, &facts.commits);
     ui.separator();
     if menu_item(ui, icons::COPY, &format!("Copy {n} SHAs")) {
         copy_shas(ui.ctx(), &facts);

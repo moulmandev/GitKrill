@@ -1,8 +1,10 @@
 //! User interface, one module per region of the window.
 
+pub mod archive;
 pub mod bisect;
 pub mod branch_folder;
 pub mod browse;
+pub mod clone;
 pub mod commit_button;
 pub mod commit_options;
 pub mod conflict;
@@ -24,6 +26,7 @@ pub mod multi;
 pub mod hosting;
 pub mod ignore;
 pub mod palette;
+pub mod patch;
 pub mod new_pull;
 pub mod panel;
 pub mod prefs;
@@ -33,6 +36,7 @@ pub mod remotes;
 pub mod sidebar;
 pub mod solo;
 pub mod stash;
+pub mod tags;
 pub mod textsel;
 pub mod toolbar;
 pub mod update;

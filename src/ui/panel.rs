@@ -112,24 +112,27 @@ fn working_tree(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<
         };
 
         let unborn = snap.head.oid.is_none();
-        list_header(ui, &format!("Unstaged Files ({})", unstaged.len()), |ui| {
+        let header = list_header(ui, &format!("Unstaged Files ({})", unstaged.len()), |ui| {
             if !unstaged.is_empty() && tint_button(ui, "Stage all changes", theme::green()).clicked() {
                 tab.run(ops::stage_all());
             }
         });
+        header.context_menu(|ui| crate::ui::patch::list_item(ui, tab, snap, crate::git::patch::Changes::Unstaged));
         file_list(ui, tab, shared, unstaged, DiffSource::Unstaged, h_unstaged);
 
-        list_header(ui, &format!("Staged Files ({})", staged.len()), |ui| {
+        let header = list_header(ui, &format!("Staged Files ({})", staged.len()), |ui| {
             if !staged.is_empty() && tint_button(ui, "Unstage all changes", theme::red()).clicked() {
                 tab.run(ops::unstage_all(unborn));
             }
         });
+        header.context_menu(|ui| crate::ui::patch::list_item(ui, tab, snap, crate::git::patch::Changes::Staged));
         file_list(ui, tab, shared, staged, DiffSource::Staged, h_staged);
     });
 }
 
-fn list_header(ui: &mut Ui, title: &str, trailing: impl FnOnce(&mut Ui)) {
-    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::hover());
+/// A list's title bar; its response takes a right-click menu.
+fn list_header(ui: &mut Ui, title: &str, trailing: impl FnOnce(&mut Ui)) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
     ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, theme::border()));
     ui.painter().text(
         pos2(rect.left() + 10.0, rect.center().y),
@@ -143,10 +146,14 @@ fn list_header(ui: &mut Ui, title: &str, trailing: impl FnOnce(&mut Ui)) {
         egui::UiBuilder::new().max_rect(inner).layout(Layout::right_to_left(Align::Center)),
         trailing,
     );
+    response
 }
 
 /// Shown while a merge, rebase, cherry-pick or revert is waiting on the user.
 fn operation_banner(ui: &mut Ui, tab: &mut RepoTab, state: RepoState, label: &str) {
+    if state == RepoState::ApplyMailbox {
+        return crate::ui::patch::banner(ui, tab, label);
+    }
     Frame::new()
         .fill(theme::mix(theme::bg_app(), theme::orange(), 0.18))
         .inner_margin(Margin::symmetric(10, 6))

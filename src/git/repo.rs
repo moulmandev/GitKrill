@@ -64,6 +64,7 @@ impl Loader {
             RepositoryState::Revert | RepositoryState::RevertSequence => RepoState::Revert,
             RepositoryState::CherryPick | RepositoryState::CherryPickSequence => RepoState::CherryPick,
             RepositoryState::Bisect => RepoState::Bisect,
+            RepositoryState::ApplyMailbox => RepoState::ApplyMailbox,
             RepositoryState::Rebase
             | RepositoryState::RebaseInteractive
             | RepositoryState::RebaseMerge => RepoState::Rebase,

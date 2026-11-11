@@ -262,7 +262,28 @@ be installed.
   git names the first bad commit it is selected too. A bisect started in a
   terminal gets the same banner and buttons, its own terms
   (`--term-new=broken`) and paths included
-- Tags: create (lightweight or annotated), delete, push
+- Tags: create (lightweight or annotated), delete, push. Push all of them
+  at once from the TAGS header's right-click menu or the command palette
+  (choosing the remote when there are several), delete one on a remote from
+  its right-click menu ("Delete from origin…"), and delete one here and, if
+  ticked, on the remotes too
+- Patch files: "Save as patch…" on a commit's right-click menu (`git
+  format-patch`); several selected commits save one file each in a folder,
+  numbered oldest first, or all in one file. "Save changes as a patch…" on
+  the WIP row's menu (all, staged or unstaged changes, untracked files as new
+  files) and on the right-click of the Unstaged and Staged headers
+- **File > Apply Patch…** (or "Apply patch…" in the command palette) checks
+  the file first and says whether it applies cleanly, needs a three-way merge
+  (naming the files that will have conflicts) or does not apply (naming each
+  file and why). Mails from `git format-patch` can be committed with their
+  authors and messages (`git am`); any patch can go into the working tree,
+  staged or not, and what does not apply is saved beside its file as a
+  `.rej`. Applying to the working tree is undoable; a `git am` stopped on a
+  conflict waits with Continue, Skip and Abort
+- "Export as archive…" on a commit's, branch's or tag's right-click menu
+  (the command palette exports what is checked out): a zip, tar.gz or tar of
+  its files, by the extension of the name you give, in a folder named after
+  the repository and the commit
 - Stash, apply, pop, delete. The stash dialog (right-click the WIP row, or
   "Stash…" in the command palette) takes a message and can leave untracked
   files out, keep the staged changes, or stash only the staged changes
@@ -275,11 +296,12 @@ be installed.
   fast-forward, tags releases and hotfixes, and can be undone; one that stops
   on a conflict carries on from there when run again
 - Undo / redo for commits, checkouts, merges, resets, rebases, branch create
-  and delete, and adding, editing and removing remotes. A rebase, merge,
-  cherry-pick or revert that stopped on conflicts is undone as a whole once
-  Continue (or the commit that concludes a merge) finishes it, and a drag
-  action that checks out another branch first is undone in one step, back
-  on the branch you were on
+  and delete, adding, editing and removing remotes, deleting a tag and
+  applying a patch to the working tree. A rebase, merge, cherry-pick or
+  revert that stopped on conflicts is undone as a whole once Continue (or
+  the commit that concludes a merge) finishes it, and a drag action that
+  checks out another branch first is undone in one step, back on the branch
+  you were on
 - Reflog (**View > Reflog**, "Show reflog" in the toolbar's branch menu or on
   a branch's right-click menu, or the command palette): a panel under the
   graph lists where HEAD, or a branch, pointed after every commit,
@@ -359,7 +381,9 @@ be installed.
   workspace › repository › branch breadcrumb in the toolbar
 - Preferences > Notifications: the taskbar button flashes (the Dock icon
   bounces) when an operation ends while GitKrill is in the background
-- Clone and init
+- Clone and init. The clone dialog's Options pick the branch to check out
+  (listed from the remote once the address is typed), a shallow history of
+  the last so many commits, only that branch's history, and the submodules
 - External tools (**Preferences > External Tools**): a merge tool, a diff
   tool, an editor and a terminal, picked from those installed (VS Code,
   Beyond Compare, KDiff3, Meld, P4Merge, WinMerge, Sublime Merge, JetBrains
@@ -383,6 +407,9 @@ in the **Help** menu, the others in the **View** menu.
 | Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, and the requests you open, with a token when one is found for that host (below). Then, for the requests that changed since: their review states (one GraphQL request on GitHub, signed in only; each merge request's approvals on GitLab), the projects GitLab merge requests come from, and once whether the repository is a fork. While Preferences > Integrations shows an account: whose token it is, its SSH keys, and the public keys you add there | api.github.com, gitlab.com, and only the servers you connected |
 | Automatic fetch | `git fetch --prune --all` (without `--prune` when Auto-Prune is off), as you would run it | your remotes |
 | Updates | A request for the latest release shortly after start and every six hours; the download when there is a newer one | api.github.com, github.com and its download host |
+
+The clone dialog's Options ask the address typed there for its branches
+(`git ls-remote`, never asking for a password) once you open them.
 
 A server other than github.com and gitlab.com is never sent anything until
 you have said what it runs; the answer is kept in the settings file
@@ -469,6 +496,10 @@ src/
     merge.rs     merge modes, the squash merge's prepared message
     fixup.rs     fixup commits and autosquash plans
     trailers.rs  sign-off, co-author trailers, skipping hooks
+    patch.rs     saving, checking and applying patch files
+    archive.rs   exporting a commit as zip or tar.gz
+    clone.rs     clone options, listing a remote's branches
+    tags.rs      pushing all tags, deleting tags on remotes
     blame.rs     file history and blame
     versions.rs  a commit's file tree, files as they were in a commit
     picture.rs   decoding images for the image preview
@@ -492,6 +523,9 @@ src/
     merge.rs     merge options, the squash merge banner
     fixup.rs     fixup and autosquash menus and palette entries
     commit_options.rs  sign-off, hooks and co-authors of the next commit
+    patch.rs     patch menus and the apply dialog
+    clone.rs     clone dialog        tags.rs     tags on remotes
+    archive.rs   "Export as archive…"
     palette.rs   command palette (Ctrl+P)
     image_diff.rs  image preview     update.rs   update offer, status bar
     widgets.rs   shared widgets
@@ -535,12 +569,6 @@ build.rs         the Windows executable's icon and version details
   as text
 - Autosquash only folds fixups whose commit comes after the last merge
   commit on the branch
-- No creating or applying patch files, and no exporting a commit as an
-  archive
-- Clone has no options: no shallow or single-branch clone, no choice of
-  branch, no submodules
-- All tags cannot be pushed at once, and a tag cannot be deleted on a
-  remote
 - Pushing and pulling over HTTPS needs a credential helper: without one
   (Windows comes with Git Credential Manager) GitKrill does not ask for a
   user name and password

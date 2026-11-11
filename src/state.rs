@@ -82,7 +82,8 @@ pub enum Dialog {
     Stash(Box<crate::ui::stash::StashForm>),
     Confirm { title: String, body: String, button: String, danger: bool, cmd: GitCmd },
     PushRejected,
-    Clone { url: String, dest: String },
+    /// "Clone repository", with its options; see `ui::clone`.
+    Clone(Box<crate::ui::clone::CloneForm>),
     About,
     /// A newer release to update to; see `ui::update`.
     Update(std::sync::Arc<crate::update::Release>),
@@ -102,6 +103,10 @@ pub enum Dialog {
     GitSetup,
     /// Add a pattern to `.gitignore`; see `ui::ignore`.
     Ignore(Box<crate::ui::ignore::IgnoreForm>),
+    /// How a patch file applies, and applying it; see `ui::patch`.
+    ApplyPatch(Box<crate::ui::patch::ApplyForm>),
+    /// Delete a tag here, and on remotes if asked; see `ui::tags`.
+    DeleteTag(Box<crate::ui::tags::DeleteForm>),
 }
 
 impl Dialog {
@@ -132,7 +137,7 @@ pub enum AppAction {
     AddWorkspace(crate::workspace::Opens),
     CloseTab(usize),
     Activate(usize),
-    Clone { url: String, dest: PathBuf },
+    Clone { url: String, dest: PathBuf, options: crate::git::clone::CloneOptions },
     InitDialog,
     /// Opens the preferences page at a section (or moves it there).
     OpenPreferences(crate::ui::prefs::Section),

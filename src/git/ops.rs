@@ -546,13 +546,24 @@ fn state_verb(state: RepoState) -> Option<&'static str> {
 }
 
 pub fn abort(state: RepoState) -> Option<GitCmd> {
+    if state == RepoState::ApplyMailbox {
+        return Some(GitCmd::new("Abort applying patches", &["am", "--abort"]));
+    }
     let verb = state_verb(state)?;
     Some(GitCmd::new(format!("Abort {verb}"), &[verb, "--abort"]))
 }
 
 pub fn continue_op(state: RepoState) -> Option<GitCmd> {
+    if state == RepoState::ApplyMailbox {
+        return Some(GitCmd::new("Continue applying patches", &["am", "--continue"]));
+    }
     let verb = state_verb(state)?;
     Some(GitCmd::new(format!("Continue {verb}"), &[verb, "--continue"]))
+}
+
+/// Leaves out the mail `git am` stopped on and goes on with the next.
+pub fn skip(state: RepoState) -> Option<GitCmd> {
+    (state == RepoState::ApplyMailbox).then(|| GitCmd::new("Skip this patch", &["am", "--skip"]))
 }
 
 // ---- undo -----------------------------------------------------------------

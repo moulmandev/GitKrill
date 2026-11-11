@@ -33,6 +33,10 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Search the graph, or open the search with a query | `ui::graph::search::start(tab, "path:src/ui")` opens the search bar with that typed in. `git::search::Query::parse` reads the query language (words plus `path:`, `code:`, `regex:`, `author:`, `after:`, `before:`); `Query::matches` answers what the loaded history can, `log_args` gives the `git log` for the rest, and `git::search::Scan` runs it on a thread of its own (results as they come, stopped when dropped). |
 | Know whether a bisect is running, or move it on | `tab.bisect.state` (`git::bisect::State`: terms, bad / good / skipped commits, `Progress`), read again by `ui::bisect` whenever the snapshot changes while `snap.state == RepoState::Bisect`, terminal-started bisects included; `git::bisect::read(repo)` from a job. Commands: `git::bisect::start(oid, bad)`, `mark(term, oid)` (a term of `State::terms`, or `"skip"`), `stop()`. |
 | Show one branch alone | `ui::solo::enter(tab, "refs/heads/x", "x")` and `ui::solo::leave(tab, &settings)`. It swaps in `Hidden::only(path)` (everything hidden but that ref, the `HEAD` rule hiding the checked out branch too) with `tab.apply_hidden()`, which sends `tab.hidden` to the reader without saving it; while `tab.solo` is set, `set_hidden` changes the view but not the remembered rules. |
+| Save or apply patch files, or export an archive | `git::patch`: `save_each` / `save_combined` (commits, oldest first, no merges), `save_changes(Changes::All \| Staged \| Unstaged, file)`, `inspect(workdir, file)` on the reader thread (what the file holds, and a `Check` of how it applies to the working tree and to the index), then `apply(workdir, &info, How::Commit \| Tree \| Stage)`. `git::archive::export(treeish, shown, file, format, prefix)`. `ui::patch::open_apply_file(tab, shared, path)` opens the apply dialog on a file. |
+| Ask for a file to open or save | `ui::patch::ask_open` / `ask_save` (the system dialog; a scripted run answers `GITKRILL_SHOT_FILE` instead and opens none). |
+| Clone | `git::clone::run(dest, url, &CloneOptions { branch, depth, single_branch, submodules })` (a local folder with a depth goes as `file://`, which git needs for a shallow clone); `git::clone::list_heads(dir, url)` lists a remote's branches without a repository and never asks for a password. |
+| Push or delete tags on remotes | `git::tags::push_all(remote)`, `delete_remote(remote, tag)`, `delete(tag, &remotes)` (the remotes first, one without the tag is fine; deleting here only is undoable). `ui::tags::delete(shared, snap, name)` asks first, offering the remotes. |
 | Know what the installed git supports | `git::cli::known_version()` is what `git --version` last answered (no process started); `git::stash::parse_version` reads it. |
 | Change several branches and tags in one undoable operation | `.undoable(UndoKind::Refs(vec![RefMove::new("refs/heads/develop"), ...]))`: the operator notes where each ref pointed before and after; undo and redo move them all back (or forth), HEAD included, and refuse if one has moved since. `git::gitflow::finish` uses it. |
 | Undo an operation whose inverse is known when it is built, and does not depend on HEAD | `.undoable(UndoKind::Inverse(Box::new(inverse)))`: undo runs `inverse` (labelled `Undo <label>`), redo the command's own steps again. `git::remotes` uses it: removing a remote is undone by adding it back with every setting it had. |
@@ -72,6 +76,10 @@ signing, credential helpers and the user's config behave as in a terminal.
 | List every file of a commit | `git::versions::tree(repo, oid)` on the reader thread: entries in file-browser order (folders first, each knowing where its contents end) and the files by path. `ui::browse` shows it in the commit details. |
 | Paint code | `prefs::editor::look()` (one atomic load): `font()`, `small()`, `line_height()`, `numbers`, `wrap`, `highlight`. `theme::code(size)` is the code font; `ui::diff::{first_rows, wrap_rows, segments}` wrap lines with rows kept from frame to frame. |
 | Do network or other non-repository background work | Spawn your own thread, send results over a channel, call `ctx.request_repaint()` when something arrives, and poll the channel from your UI code. Never block in UI code. |
+
+A `git am` that stopped on a mail is `RepoState::ApplyMailbox`: `ops::continue_op`,
+`ops::abort` and `ops::skip` (that state only) give its Continue, Abort
+and Skip.
 
 Fetch commands start from `ops::fetch(&[...])`, which adds `--prune`
 unless Auto-Prune (Preferences > General) is off. After any command whose
@@ -294,8 +302,10 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   gpg-agent`. SSH keys made from Preferences > SSH go to
   `<GITKRILL_CONFIG_DIR>/ssh` during runs, never `~/.ssh`.
 - Folder dialogs cannot be clicked through by a script: with
-  `GITKRILL_SHOT_FOLDER=<dir>` set, "Add a folder of repositories" picks
-  `<dir>` instead of asking. Workspaces can also be put straight into the
+  `GITKRILL_SHOT_FOLDER=<dir>` set, "Add a folder of repositories" (and
+  saving patches one per commit) picks `<dir>` instead of asking. File
+  dialogs (Apply Patch, Save as patch, Export as archive) answer
+  `GITKRILL_SHOT_FILE=<path>`; without it a scripted run opens none. Workspaces can also be put straight into the
   run's `cfg/settings.json` (`"workspaces": [{"root": "<dir>", "repos": []}]`);
   they are scanned on start.
 - Git being missing: `GITKRILL_GIT=<path>` makes GitKrill use exactly that

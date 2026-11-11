@@ -216,7 +216,7 @@ pub fn new_branch_dialog() -> Dialog {
 }
 
 pub fn clone_dialog() -> Dialog {
-    Dialog::Clone { url: String::new(), dest: default_clone_dir() }
+    Dialog::Clone(Box::new(crate::ui::clone::CloneForm::new(default_clone_dir())))
 }
 
 // What the buttons do, as functions so the command palette runs the same code.
