@@ -77,7 +77,8 @@ fn working_tree(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<
             widgets::galley_left(painter, pill, pill.left() + 6.0, pill_galley);
         }
 
-        if let Some(label) = snap.state.label() {
+        // A bisect has its own banner, above the graph (`ui::bisect`).
+        if let Some(label) = snap.state.label().filter(|_| snap.state != RepoState::Bisect) {
             operation_banner(ui, tab, snap.state, label);
         }
         crate::ui::merge::banner(ui, tab, shared, snap);

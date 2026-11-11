@@ -95,7 +95,16 @@ be installed.
 - WIP row for uncommitted changes, stashes shown in place
 - Loads history in pages as you scroll, or on request, or all at once
   (Preferences > Commit Graph); arrow keys walk the graph
-- Search by message, author or SHA (`Ctrl+F`, `Enter` / `Shift+Enter` to step)
+- Search by message, author or SHA (`Ctrl+F`, `Enter` / `Shift+Enter` to step),
+  and narrow it with filters, listed by the funnel button in the search bar:
+  `path:` for the files a commit changed (part of the path, or a wildcard
+  pattern), `code:` for text it added or removed (`git log -S`), `regex:`
+  for changed lines matching an expression (`git log -G`), `author:`, and
+  `after:` / `before:` with a date (`2026-01-31`, `2 weeks ago`,
+  `yesterday`). Git answers file and code filters in the background while
+  you type. The loaded commits are searched; the clock button loads older
+  ones. "Search commits by changed file / code / date" in the command
+  palette start one
 - Every column can be hidden or shown (gear icon), resizable columns;
   commit descriptions after the summary always, on hover or never
 - Hovering a branch, in the graph or the sidebar, dims the commits it does
@@ -121,6 +130,12 @@ be installed.
   unless something shown still reaches them. A hidden folder also hides
   branches created in it later, one branch inside it can still be shown, and
   the checked out branch is always shown. Remembered per repository
+- Show one branch alone: "Show only this branch" on a local or remote
+  branch's right-click menu (sidebar or graph label) hides every commit
+  that is not in its history, the checked out branch's included. A bar
+  above the graph names it, branches shown from the sidebar meanwhile join
+  in, and "Show all branches" (or the command palette) puts back exactly
+  what was hidden before
 
 **Working tree**
 - Unstaged / staged lists as paths or a folder tree
@@ -211,6 +226,14 @@ be installed.
   to squash and their combined message ready to edit, and warns when the
   upstream already has some of them); copy their SHAs
 - File history (following renames) and blame, from any file's context menu
+- Bisect: "Start bisect: this commit is bad" (or good) on a commit's
+  right-click menu, then answer from the banner above the graph (Good, Bad,
+  Skip, Stop) or mark any commit from its menu. The banner names the commit
+  being tested and roughly how many steps are left; good, bad and skipped
+  commits are labelled in the graph, the one to test is selected, and once
+  git names the first bad commit it is selected too. A bisect started in a
+  terminal gets the same banner and buttons, its own terms
+  (`--term-new=broken`) and paths included
 - Tags: create (lightweight or annotated), delete, push
 - Stash, apply, pop, delete. The stash dialog (right-click the WIP row, or
   "Stash…" in the command palette) takes a message and can leave untracked
@@ -445,12 +468,9 @@ build.rs         the Windows executable's icon and version details
   (ssh-agent, gpg-agent); there is no passphrase prompt
 - Submodule management, worktrees, Git LFS file locking; SVG changes show
   as text
-- No reflog view and no bisect (a bisect started in a terminal is only
-  shown as in progress)
+- No reflog view
 - Autosquash only folds fixups whose commit comes after the last merge
   commit on the branch
-- Commit search looks at messages, authors and SHAs only: not at the files
-  a commit changed, its code (`git log -S`) or its date
 - Commits are compared tree to tree: not with the working tree, and not
   from where two branches forked (what a branch adds on its own)
 - A commit's whole file tree cannot be browsed, and a file cannot be opened,
@@ -461,7 +481,6 @@ build.rs         the Windows executable's icon and version details
   branch, no submodules
 - All tags cannot be pushed at once, and a tag cannot be deleted on a
   remote
-- The graph can hide branches but not show one branch alone
 - Pushing and pulling over HTTPS needs a credential helper: without one
   (Windows comes with Git Credential Manager) GitKrill does not ask for a
   user name and password

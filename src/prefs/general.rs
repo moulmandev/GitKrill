@@ -126,7 +126,7 @@ pub fn reschedule(next: &mut Instant, now: Instant, minutes: u32) {
 /// continue), in any step. Not commits, `reset --soft` or forms that name
 /// paths (discarding or unstaging files): the submodules' recorded commits
 /// stay as they are there, and updating would throw away a submodule the
-/// user moved but has not staged.
+/// user moved but has not staged. Bisect counts too: it checks out commits.
 pub fn moves_head(cmd: &GitCmd) -> bool {
     cmd.steps.iter().any(|step| {
         let mut args = step.args.as_slice();
@@ -142,7 +142,7 @@ pub fn moves_head(cmd: &GitCmd) -> bool {
         match subcommand.as_str() {
             "checkout" | "switch" => !names_paths,
             "reset" => !names_paths && !rest.iter().any(|a| a == "--soft") && rest.iter().any(|a| !a.starts_with('-')),
-            "pull" | "merge" | "rebase" | "cherry-pick" | "revert" => true,
+            "pull" | "merge" | "rebase" | "cherry-pick" | "revert" | "bisect" => true,
             _ => false,
         }
     })
@@ -254,6 +254,8 @@ mod tests {
             GitCmd::new("Undo", &["reset", "--keep", "abc123"]),
             GitCmd::new("Abort merge", &["merge", "--abort"]),
             GitCmd::new("Rebase", &["-c", "core.editor=true", "rebase", "-i", "main"]),
+            crate::git::bisect::mark("good", None),
+            crate::git::bisect::stop(),
         ];
         for cmd in &moving {
             assert!(moves_head(cmd), "{:?} moves HEAD", cmd.steps[0].args);
