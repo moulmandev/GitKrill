@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 
-use eframe::egui::{self, Align, Frame, Label, Layout, Margin, RichText, Sense, Stroke, Ui, vec2};
+use eframe::egui::{self, Align, Frame, Label, Layout, Margin, RichText, Sense, Stroke, TextEdit, Ui, vec2};
 
 use super::{Page, form};
 use crate::hosting::account::{self, AccountId, AccountSession, AccountView, SshKey, Trouble, Work};
@@ -58,6 +58,8 @@ pub struct State {
     found: Found,
     /// "Add a server": what is typed, and why it was turned down.
     new_server: String,
+    /// The path a GitLab is installed under, when it is not at the root.
+    new_server_path: String,
     new_server_error: Option<String>,
     /// A server the connect dialog was opened for: chosen once it is added.
     awaiting: Option<(String, ServerKind)>,
@@ -677,9 +679,15 @@ fn server_list(ui: &mut Ui, page: &mut Page<'_>, state: &mut State, kind: Server
         None => form::loading(ui),
         Some(offers) => {
             let servers = &page.shared.settings.hosting_servers;
+            // A server connected under a path counts for its host too.
+            let rooted = |host: &str| servers.keys().any(|key| key.split_once('/').is_some_and(|(name, _)| name == host));
             let fitting: Vec<&Offer> = offers
                 .iter()
-                .filter(|offer| !servers.contains_key(&offer.host) && offer.guess.is_none_or(|guess| guess == kind))
+                .filter(|offer| {
+                    !servers.contains_key(&offer.host)
+                        && !rooted(&offer.host)
+                        && offer.guess.is_none_or(|guess| guess == kind)
+                })
                 .collect();
             if fitting.is_empty() {
                 form::help(ui, "No other servers in the remotes of your open repositories.");
@@ -705,13 +713,30 @@ fn server_list(ui: &mut Ui, page: &mut Page<'_>, state: &mut State, kind: Server
             if field.changed() {
                 state.new_server_error = None;
             }
-            let entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            let mut entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            // GitLab can be installed under a path (a relative URL root);
+            // GitHub Enterprise cannot.
+            let gitlab = kind == ServerKind::GitLab;
+            if gitlab {
+                ui.label(RichText::new("/").size(14.0).color(theme::text_dim()));
+                let path = TextEdit::singleline(&mut state.new_server_path)
+                    .hint_text("path")
+                    .desired_width(110.0)
+                    .margin(vec2(8.0, 5.0));
+                let path = ui.add(path).on_hover_text("Only when GitLab is not at the root of the server: gitlab for example.com/gitlab");
+                if path.changed() {
+                    state.new_server_error = None;
+                }
+                entered |= path.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            }
             let clicked = form::button(ui, "Connect…", theme::accent()).clicked();
             if (entered || clicked) && !state.new_server.trim().is_empty() {
-                match account::server_host(&state.new_server) {
+                let path = if gitlab { state.new_server_path.as_str() } else { "" };
+                match account::server_host(&state.new_server).and_then(|host| account::under_path(&host, path)) {
                     Ok(host) => {
                         connect = Some((host, String::new()));
                         state.new_server.clear();
+                        state.new_server_path.clear();
                     }
                     Err(error) => state.new_server_error = Some(error),
                 }
@@ -720,7 +745,14 @@ fn server_list(ui: &mut Ui, page: &mut Page<'_>, state: &mut State, kind: Server
         if let Some(error) = &state.new_server_error {
             form::error(ui, error);
         }
-        form::help(ui, "Its name, as in your remotes' addresses. You confirm what runs there before anything is sent to it.");
+        let help = match kind {
+            ServerKind::GitLab => {
+                "Its name, as in your remotes' addresses, and the path GitLab is installed under when it is not \
+                 at the root (gitlab for example.com/gitlab). You confirm what runs there before anything is sent to it."
+            }
+            _ => "Its name, as in your remotes' addresses. You confirm what runs there before anything is sent to it.",
+        };
+        form::help(ui, help);
     });
 
     if let Some(host) = open {

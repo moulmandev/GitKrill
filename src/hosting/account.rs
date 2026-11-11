@@ -128,6 +128,22 @@ pub fn server_host(text: &str) -> Result<String, String> {
     })
 }
 
+/// `host` (from [`server_host`]) with the path a server is installed under
+/// when it is not at the root, as typed (`gitlab`, `/gitlab/`,
+/// `tools/gitlab`): `example.com/gitlab`, as `settings.hosting_servers` and
+/// [`RepoId::host`] write it. An empty path is the host alone.
+pub fn under_path(host: &str, path: &str) -> Result<String, String> {
+    let path = path.trim().trim_matches('/');
+    if path.is_empty() {
+        return Ok(host.to_owned());
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() > 8 || !parts.iter().all(|part| super::path_part(part)) {
+        return Err(format!("\"{}\" is not a path GitLab can be installed under", tidy(path)));
+    }
+    Ok(format!("{host}/{}", parts.join("/")))
+}
+
 /// Self-hosted servers the remotes of the repositories at `paths` point at,
 /// one per host in the order first seen, whether or not the user has said
 /// what they run: what Preferences > Integrations offers to connect. Opens
@@ -1277,6 +1293,17 @@ mod tests {
         assert!(server_host("github.com").unwrap_err().contains("GitHub"));
         assert!(server_host("https://www.gitlab.com").is_err());
         assert!(server_host("bitbucket.org").is_err());
+
+        // A GitLab installed under a path, however the path is written.
+        for path in ["gitlab", "/gitlab", "gitlab/", " /gitlab/ "] {
+            assert_eq!(under_path("example.com", path).unwrap(), "example.com/gitlab", "{path:?}");
+        }
+        assert_eq!(under_path("example.com:8443", "tools/gitlab").unwrap(), "example.com:8443/tools/gitlab");
+        assert_eq!(under_path("example.com", "").unwrap(), "example.com");
+        assert_eq!(under_path("example.com", " / ").unwrap(), "example.com");
+        for path in ["git lab", "../gitlab", "gitlab//x", "a?b", r"gitlab\x", "a/b/c/d/e/f/g/h/i"] {
+            assert!(under_path("example.com", path).is_err(), "{path:?}");
+        }
         assert!(server_host("ssh://git.example.com").is_err());
         assert!(server_host("not a host").is_err());
         assert!(server_host("intranet").is_err());

@@ -6,7 +6,7 @@ use eframe::egui::{Align2, Button, Color32, Rect, Response, RichText, Sense, Str
 
 use crate::git::{BranchInfo, Oid, RemoteInfo, RepoSnapshot};
 use crate::git::ops::GitCmd;
-use crate::hosting::{self, Checks, Feed, Issue, Offer, PullRequest, Run, RunState, ServerKind, Service, Shown};
+use crate::hosting::{self, Checks, Feed, Issue, Offer, PullRequest, Review, Run, RunState, ServerKind, Service, Shown};
 use crate::state::{Dialog, RepoTab, Shared};
 use crate::theme::{self, icons};
 use crate::ui::dialogs;
@@ -426,11 +426,57 @@ fn checks_mark(service: Service, checks: Checks) -> (&'static str, Color32, &'st
     }
 }
 
+/// The mark for what the reviewers say, with its colour and what it means
+/// (for the tooltip). Nothing for a pull request nobody has reviewed yet,
+/// or whose reviews are not known.
+fn review_mark(pr: &PullRequest) -> Option<(String, Color32, String)> {
+    let approvals = pr.approvals.unwrap_or_default();
+    let count = |n: u32| if n == 1 { "1 approval".to_owned() } else { format!("{n} approvals") };
+    match pr.review {
+        Review::Unknown | Review::Unreviewed => None,
+        Review::Approved => {
+            let meaning = match approvals.given {
+                0 => "Approved".to_owned(),
+                n => format!("Approved ({})", count(n)),
+            };
+            Some((icons::SEAL_CHECK.to_owned(), theme::green(), meaning))
+        }
+        Review::ChangesRequested => Some((icons::NOTE_PENCIL.to_owned(), theme::orange(), "Changes requested".to_owned())),
+        Review::Required => {
+            let (mark, meaning) = match (approvals.fraction(), approvals.given) {
+                (Some(fraction), _) => (
+                    format!("{} {fraction}", icons::EYE),
+                    format!("Approvals: {fraction}, {} more needed", approvals.left),
+                ),
+                (None, 0) => (icons::EYE.to_owned(), "Review required".to_owned()),
+                (None, n) => (icons::EYE.to_owned(), format!("Review required ({} so far)", count(n))),
+            };
+            Some((mark, theme::yellow(), meaning))
+        }
+    }
+}
+
+/// Where a pull request's branch is, when that is not the repository shown:
+/// for its tooltip.
+fn fork_line(service: Service, shown: &Shown, pr: &PullRequest) -> Option<String> {
+    if pr.is_from(&shown.repo) {
+        return None;
+    }
+    Some(match (&pr.head_repo, service.is_gitlab()) {
+        (Some(fork), _) => format!("From the fork {fork}"),
+        // GitHub names every fork it still has.
+        (None, false) => "From a fork that was deleted".to_owned(),
+        (None, true) => "From a fork".to_owned(),
+    })
+}
+
 fn pull_row(ui: &mut Ui, snap: &RepoSnapshot, shown: &Shown, pr: &PullRequest, act: &mut Option<Act>) {
     let service = shown.repo.service;
     let local = local_branch(snap, shown, pr);
     let current = local.is_some_and(|branch| branch.is_head);
     let checks = hosting::checks_for(&pr.head_sha, &shown.view.runs.items).map(|checks| checks_mark(service, checks));
+    let review = review_mark(pr);
+    let fork = fork_line(service, shown, pr);
 
     let (icon_color, title_color) = match (pr.draft, current) {
         (true, _) => (theme::text_faint(), theme::text_dim()),
@@ -441,8 +487,15 @@ fn pull_row(ui: &mut Ui, snap: &RepoSnapshot, shown: &Shown, pr: &PullRequest, a
     if let Some((mark, color, _)) = checks {
         marks.push((mark, 13.0, color));
     }
+    if let Some((mark, color, _)) = &review {
+        // An icon alone, or with a count of approvals (smaller).
+        marks.push((mark.as_str(), if mark.chars().count() > 1 { 11.5 } else { 13.0 }, *color));
+    }
     if pr.draft {
         marks.push(("Draft", 11.0, theme::text_dim()));
+    }
+    if fork.is_some() {
+        marks.push((icons::GIT_FORK, 12.5, theme::text_dim()));
     }
     let number = service.pull_number(pr.number);
     let response = item_row(
@@ -493,10 +546,25 @@ fn pull_row(ui: &mut Ui, snap: &RepoSnapshot, shown: &Shown, pr: &PullRequest, a
 
     response.on_hover_ui(|ui| {
         ui.set_max_width(360.0);
-        let mut text = format!("{number}  {}\n{}  {}  {}", pr.title, pr.head_ref, icons::ARROW_RIGHT, pr.base_ref);
+        // A fork's branch as the services write it: `owner:branch`.
+        let head = match (&fork, pr.head_repo.as_deref().and_then(|full| full.rsplit_once('/'))) {
+            (Some(_), Some((owner, _))) => format!("{owner}:{}", pr.head_ref),
+            _ => pr.head_ref.clone(),
+        };
+        let mut text = format!("{number}  {}\n{head}  {}  {}", pr.title, icons::ARROW_RIGHT, pr.base_ref);
         text.push_str(&format!("\nby {}", pr.author));
         if pr.draft {
             text.push_str("  ·  draft");
+        }
+        if let Some(fork) = &fork {
+            text.push_str(&format!("\n{fork}"));
+        }
+        match (&review, pr.review) {
+            (Some((_, _, meaning)), _) => text.push_str(&format!("\n{meaning}")),
+            (None, Review::Unreviewed) => {
+                text.push_str(if service.is_gitlab() { "\nNo approvals yet" } else { "\nNo reviews yet" });
+            }
+            (None, _) => {}
         }
         if let Some((_, _, meaning)) = checks {
             text.push_str(&format!("\n{meaning}"));
@@ -651,6 +719,17 @@ pub fn remote_menu(ui: &mut Ui, shared: &mut Shared, remote: &RemoteInfo) {
     if !shared.settings.hosting_integration {
         return;
     }
+    // A server installed under a path is known by that path, not the host.
+    let rooted = hosting::parse_remote(&remote.url, &shared.settings.hosting_servers)
+        .filter(|repo| repo.host.contains('/'));
+    if let Some(repo) = rooted {
+        ui.separator();
+        let label = format!("Disconnect {} ({})", repo.host, repo.service.name());
+        if menu_item(ui, icons::LINK_BREAK, &label) {
+            shared.settings.hosting_servers.remove(&repo.host);
+        }
+        return;
+    }
     let Some(offer) = hosting::offer_for(remote) else { return };
     let connected = shared.settings.hosting_servers.get(&offer.host).and_then(|kind| kind.service());
     ui.separator();
@@ -689,6 +768,10 @@ pub fn connect_body(ui: &mut Ui, shared: &mut Shared, host: &str, path: &str, ch
         (ServerKind::Ignored, icons::PROHIBIT, "Neither: don't offer again"),
     ];
     for (kind, icon, label) in options {
+        // GitHub Enterprise is never installed under a path.
+        if host.contains('/') && kind == ServerKind::GitHubEnterprise {
+            continue;
+        }
         let selected = *choice == Some(kind);
         let color = if selected { theme::text_bright() } else { theme::text() };
         let text = RichText::new(format!("{icon}   {label}")).font(theme::font(13.5)).color(color);
@@ -700,12 +783,22 @@ pub fn connect_body(ui: &mut Ui, shared: &mut Shared, host: &str, path: &str, ch
         }
     }
 
+    // A path longer than a project's may start with the one GitLab is
+    // installed under, which only the user can tell.
+    let rooted = !host.contains('/') && path.split('/').count() > 2;
     let explanation = match *choice {
         Some(ServerKind::GitLab) => format!(
             "Requests go to {} only. A token is used if one is found for this server: \
              GITLAB_TOKEN when GITLAB_HOST names it, glab's sign-in, or Git's credential \
-             manager.",
-            hosting::api_base(Service::GitLab, host)
+             manager.{}",
+            hosting::api_base(Service::GitLab, host),
+            match rooted {
+                true => format!(
+                    " If GitLab is installed under a path ({host}/gitlab), add it with that path in \
+                     Preferences > Integrations instead."
+                ),
+                false => String::new(),
+            }
         ),
         Some(ServerKind::GitHubEnterprise) => format!(
             "Requests go to {} only. A token is used if one is found for this server: \

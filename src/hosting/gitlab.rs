@@ -53,9 +53,27 @@ struct RawMergeRequest {
     source_project_id: Option<u64>,
     target_project_id: Option<u64>,
     updated_at: Option<String>,
+    /// What stands in the way of merging, first reason only (GitLab 15.6
+    /// and later): `requested_changes` when a reviewer asked for changes.
+    detailed_merge_status: Option<String>,
+}
+
+/// A merge request of the list, with what the list says beyond the model.
+pub struct Listed {
+    pub pull: PullRequest,
+    /// The project its branch is in, when that is not this one (a fork).
+    pub fork: Option<u64>,
+    /// GitLab says a reviewer asked for changes.
+    pub changes_requested: bool,
 }
 
 impl RawMergeRequest {
+    fn listed(self, repo: &RepoId) -> Listed {
+        let fork = self.source_project_id.filter(|source| Some(*source) != self.target_project_id);
+        let changes_requested = self.detailed_merge_status.as_deref() == Some("requested_changes");
+        Listed { pull: self.model(repo), fork, changes_requested }
+    }
+
     fn model(self, repo: &RepoId) -> PullRequest {
         // The source project comes as an id only; the same id as the
         // target means the branch is in this project, not a fork.
@@ -70,13 +88,82 @@ impl RawMergeRequest {
             head_repo: own.then(|| repo.slug()),
             base_ref: self.target_branch,
             updated: timestamp(self.updated_at.as_deref()),
+            // The list does not say; `Client::details` asks.
+            ..Default::default()
         }
     }
 }
 
+#[cfg(test)]
 pub fn parse_merge_requests(json: &str, repo: &RepoId) -> Result<Vec<PullRequest>, String> {
+    Ok(parse_listed(json, repo)?.into_iter().map(|listed| listed.pull).collect())
+}
+
+/// [`parse_merge_requests`], keeping what the list says of forks and
+/// reviews.
+pub fn parse_listed(json: &str, repo: &RepoId) -> Result<Vec<Listed>, String> {
     let raw: Vec<RawMergeRequest> = serde_json::from_str(json).map_err(|e| e.to_string())?;
-    Ok(raw.into_iter().map(|request| request.model(repo)).collect())
+    Ok(raw.into_iter().map(|request| request.listed(repo)).collect())
+}
+
+/// What a merge request's approvals come to, from `GET
+/// /projects/:id/merge_requests/:iid/approvals`. Without approval rules
+/// (GitLab Free) it only says who approved; with rules, `approvals_left`
+/// says how many are still needed.
+pub fn parse_approvals(json: &str) -> Result<(Review, Approvals), String> {
+    #[derive(Deserialize)]
+    struct RawApprovals {
+        approved_by: Option<Vec<serde_json::Value>>,
+        approvals_required: Option<u32>,
+        approvals_left: Option<u32>,
+    }
+    let raw: RawApprovals = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let approvals = Approvals {
+        given: raw.approved_by.map_or(0, |by| by.len() as u32),
+        left: raw.approvals_left.unwrap_or(0),
+    };
+    let review = if approvals.left > 0 {
+        Review::Required
+    } else if approvals.given > 0 || raw.approvals_required.unwrap_or(0) > 0 {
+        Review::Approved
+    } else {
+        Review::Unreviewed
+    };
+    Ok((review, approvals))
+}
+
+/// What `GET /projects/:id` says of a project.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Project {
+    pub id: Option<u64>,
+    /// Its full path, when it is one a remote could have.
+    pub path: Option<String>,
+    /// The project it was forked from, with that one's id, when it is a
+    /// fork of a project the account can see.
+    pub parent: Option<(Parent, Option<u64>)>,
+}
+
+pub fn parse_project(json: &str, repo: &RepoId) -> Result<Project, String> {
+    #[derive(Deserialize)]
+    struct RawForked {
+        id: Option<u64>,
+        path_with_namespace: String,
+        default_branch: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct RawProject {
+        id: Option<u64>,
+        path_with_namespace: Option<String>,
+        forked_from_project: Option<RawForked>,
+    }
+    let raw: RawProject = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    let parent = raw.forked_from_project.and_then(|forked| {
+        let default_branch = branch_name(forked.default_branch.as_deref().unwrap_or_default());
+        let parent = Parent { repo: repo.sibling(&forked.path_with_namespace)?, default_branch };
+        Some((parent, forked.id))
+    });
+    let path = raw.path_with_namespace.and_then(|path| repo.sibling(&path)).map(|project| project.slug());
+    Ok(Project { id: raw.id, path, parent })
 }
 
 /// One merge request, as the API answers its creation.
@@ -225,17 +312,26 @@ const FORBIDDEN: &str = "403 Forbidden";
 /// The body of a new merge request. GitLab has no draft flag on creation:
 /// a title starting with "Draft:" is what makes one.
 pub fn new_merge_request(new: &NewPull) -> String {
+    merge_request_json(new, None)
+}
+
+/// [`new_merge_request`], into the project with the id `target` when that
+/// is not the one it is sent to (from a fork into its parent).
+pub fn merge_request_json(new: &NewPull, target: Option<u64>) -> String {
     let title = new.title.trim();
     let lower = title.to_lowercase();
     let marked = ["draft:", "[draft]", "(draft)", "draft -"].iter().any(|mark| lower.starts_with(mark));
     let title = if new.draft && !marked { format!("Draft: {title}") } else { title.to_owned() };
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "source_branch": new.head,
         "target_branch": new.base,
         "title": title,
         "description": new.body,
-    })
-    .to_string()
+    });
+    if let Some(id) = target {
+        json["target_project_id"] = serde_json::Value::from(id);
+    }
+    json.to_string()
 }
 
 // ---- the client ----
@@ -285,7 +381,37 @@ pub struct Client {
     limiter: Limiter,
     /// Last `ETag` per list, for conditional requests.
     etags: [Option<String>; 3],
+    /// The merge requests of the last list, as [`Client::details`] needs them.
+    listed: Vec<Seen>,
+    /// Approvals by iid: asked again once the merge request has changed.
+    approvals: BTreeMap<u64, Asked>,
+    /// Forks' paths by project id; `None` when the fork cannot be seen.
+    forks: BTreeMap<u64, Option<String>>,
+    /// This project's id and parent, once asked.
+    about: Option<Project>,
 }
+
+/// A merge request of the last list.
+#[derive(Clone, Copy)]
+struct Seen {
+    iid: u64,
+    updated: i64,
+    fork: Option<u64>,
+    changes_requested: bool,
+}
+
+/// The approvals of one merge request as last asked.
+struct Asked {
+    /// The `updated_at` of the merge request they were asked at.
+    at: i64,
+    etag: Option<String>,
+    review: Review,
+    approvals: Option<Approvals>,
+}
+
+/// Approvals asked at most per round, and forks looked up.
+const APPROVALS_AT_ONCE: usize = 30;
+const FORKS_AT_ONCE: usize = 10;
 
 impl Client {
     pub fn new(repo: RepoId, transport: Box<dyn Transport>, secrets: Box<dyn Secrets>) -> Self {
@@ -300,6 +426,10 @@ impl Client {
             looked: false,
             limiter: Limiter::default(),
             etags: [None, None, None],
+            listed: Vec::new(),
+            approvals: BTreeMap::new(),
+            forks: BTreeMap::new(),
+            about: None,
         }
     }
 
@@ -422,9 +552,9 @@ impl Client {
         }
     }
 
-    fn create(&mut self, new: &NewPull, now: u64) -> Result<PullRequest, Problem> {
-        let url = format!("{}/projects/{}/merge_requests", self.api, self.project);
-        let body = new_merge_request(new);
+    /// POSTs a new merge request (`body`) to `url`, the merge requests of
+    /// the project its branch is in; `into` is where it goes.
+    fn create(&mut self, url: &str, body: &str, into: &RepoId, now: u64) -> Result<PullRequest, Problem> {
         loop {
             self.look();
             // Nobody can open a merge request anonymously: do not even ask.
@@ -441,15 +571,15 @@ impl Client {
             if let Some(until) = self.limiter.blocked(now) {
                 return Err(Problem::RateLimited { until });
             }
-            let request = HttpRequest { url: &url, etag: None, token: Some(token) };
-            let response = self.transport.post(&request, &body).map_err(Problem::Unreachable)?;
+            let request = HttpRequest { url, etag: None, token: Some(token) };
+            let response = self.transport.post(&request, body).map_err(Problem::Unreachable)?;
             let message = api_message(&response.body);
             let rate = Rate::of(&response);
             if let Some(until) = self.limiter.record(response.status, &rate, &message, now) {
                 return Err(Problem::RateLimited { until });
             }
             return match response.status {
-                200 | 201 => parse_merge_request(&response.body, &self.repo)
+                200 | 201 => parse_merge_request(&response.body, into)
                     .map_err(|error| Problem::Failed(format!("Unreadable answer from GitLab ({error})"))),
                 // Refused before anything was created: the next sign-in
                 // may do better.
@@ -467,10 +597,127 @@ impl Client {
     }
 }
 
+// ---- what the lists do not say ----
+
+/// The answer to one of the requests of [`Client::details`].
+enum Asking {
+    Found(HttpResponse),
+    /// Unchanged since the validator sent along.
+    Same,
+    /// Refused or missing: there is nothing to learn.
+    Nothing,
+    /// No answer worth keeping (no connection, a rate limit, the server
+    /// failing): stop for this round.
+    Stop,
+}
+
+impl Client {
+    /// A GET for [`Client::details`], within the rate limit.
+    fn ask(&mut self, url: &str, etag: Option<&str>, now: u64) -> Asking {
+        self.look();
+        if self.limiter.blocked(now).is_some() {
+            return Asking::Stop;
+        }
+        let request = HttpRequest { url, etag, token: self.token.as_ref().map(|(token, _)| token) };
+        let Ok(response) = self.transport.get(&request) else { return Asking::Stop };
+        let message = api_message(&response.body);
+        if self.limiter.record(response.status, &Rate::of(&response), &message, now).is_some() {
+            return Asking::Stop;
+        }
+        match response.status {
+            200 => Asking::Found(response),
+            304 => Asking::Same,
+            500..=599 => Asking::Stop,
+            _ => Asking::Nothing,
+        }
+    }
+
+    /// A project by id (a fork) or by path: what `GET /projects/:id` says.
+    fn ask_project(&mut self, id: &str, now: u64) -> Option<Project> {
+        let url = format!("{}/projects/{id}", self.api);
+        match self.ask(&url, None, now) {
+            Asking::Found(response) => Some(parse_project(&response.body, &self.repo).unwrap_or_default()),
+            Asking::Same | Asking::Nothing => Some(Project::default()),
+            Asking::Stop => None,
+        }
+    }
+
+    /// The approvals of the merge request `seen`: its entry for
+    /// `self.approvals`, or `None` to stop for this round.
+    fn ask_approvals(&mut self, seen: Seen, now: u64) -> Option<Asked> {
+        let before = self.approvals.get(&seen.iid);
+        let etag = before.and_then(|asked| asked.etag.clone());
+        let url = format!("{}/projects/{}/merge_requests/{}/approvals", self.api, self.project, seen.iid);
+        let (etag, review, approvals) = match self.ask(&url, etag.as_deref(), now) {
+            Asking::Found(response) => match parse_approvals(&response.body) {
+                Ok((review, approvals)) => (response.header("etag").map(str::to_owned), review, Some(approvals)),
+                Err(_) => (None, Review::Unknown, None),
+            },
+            Asking::Same => {
+                let before = self.approvals.get(&seen.iid)?;
+                (etag, before.review, before.approvals)
+            }
+            Asking::Nothing => (None, Review::Unknown, None),
+            Asking::Stop => return None,
+        };
+        Some(Asked { at: seen.updated, etag, review, approvals })
+    }
+
+    /// A merge request of the list with what is known of it besides.
+    fn known(&self, listed: Listed) -> PullRequest {
+        let mut pull = listed.pull;
+        if let Some(asked) = self.approvals.get(&pull.number) {
+            pull.review = asked.review;
+            pull.approvals = asked.approvals;
+        }
+        if listed.changes_requested {
+            pull.review = Review::ChangesRequested;
+        }
+        if let Some(Some(path)) = listed.fork.and_then(|id| self.forks.get(&id)) {
+            pull.head_repo = Some(path.clone());
+        }
+        pull
+    }
+
+    /// The id of `into` on this server, for a merge request into it.
+    fn project_number(&mut self, into: &RepoId, now: u64) -> Result<u64, Problem> {
+        if let Some(about) = &self.about {
+            if into.same(&self.repo)
+                && let Some(id) = about.id
+            {
+                return Ok(id);
+            }
+            if let Some((parent, Some(id))) = &about.parent
+                && into.same(&parent.repo)
+            {
+                return Ok(*id);
+            }
+        }
+        let found = self.ask_project(&project_id(into), now);
+        found.and_then(|project| project.id).ok_or_else(|| Problem::Failed(format!("GitLab did not say which project {} is", into.slug())))
+    }
+}
+
 impl Backend for Client {
     fn pulls(&mut self, now: u64) -> Outcome<PullRequest> {
         let repo = self.repo.clone();
-        self.fetch(List::MergeRequests, now, |json| parse_merge_requests(json, &repo))
+        match self.fetch(List::MergeRequests, now, |json| parse_listed(json, &repo)) {
+            Outcome::Fresh { items, more } => {
+                self.listed = items
+                    .iter()
+                    .map(|listed| Seen {
+                        iid: listed.pull.number,
+                        updated: listed.pull.updated,
+                        fork: listed.fork,
+                        changes_requested: listed.changes_requested,
+                    })
+                    .collect();
+                let items = items.into_iter().map(|listed| self.known(listed)).collect();
+                Outcome::Fresh { items, more }
+            }
+            Outcome::Unchanged => Outcome::Unchanged,
+            Outcome::Failed(problem) => Outcome::Failed(problem),
+        }
     }
 
     fn issues(&mut self, now: u64) -> Outcome<Issue> {
@@ -496,6 +743,12 @@ impl Backend for Client {
         if self.token.is_none() {
             self.looked = false;
         }
+        // Approvals are asked about again (with their validators, so an
+        // unchanged answer costs little), forks not seen so far looked up.
+        for asked in self.approvals.values_mut() {
+            asked.at = i64::MIN;
+        }
+        self.forks.retain(|_, path| path.is_some());
     }
 
     fn blocked_until(&self, now: u64) -> Option<u64> {
@@ -503,8 +756,84 @@ impl Backend for Client {
     }
 
     fn create_pull(&mut self, new: &NewPull, now: u64) -> Result<PullRequest, Problem> {
-        let created = self.create(new, now);
+        let url = format!("{}/projects/{}/merge_requests", self.api, self.project);
+        let into = self.repo.clone();
+        let created = self.create(&url, &new_merge_request(new), &into, now);
         created.map_err(|problem| self.scrub(problem))
+    }
+
+    /// GitLab opens a merge request on the project its branch is in,
+    /// naming the project it goes into by id.
+    fn create_pull_across(&mut self, new: &NewPull, across: &Across, now: u64) -> Result<PullRequest, Problem> {
+        let here = |repo: &RepoId| repo.service == self.repo.service && repo.host == self.repo.host;
+        if !here(&across.from) || !here(&across.into) {
+            return Err(Problem::Failed(format!("Both projects must be on {}", self.repo.site())));
+        }
+        let created = match across.from.same(&across.into) {
+            true => Ok(None),
+            false => self.project_number(&across.into, now).map(Some),
+        }
+        .and_then(|target| {
+            let url = format!("{}/projects/{}/merge_requests", self.api, project_id(&across.from));
+            self.create(&url, &merge_request_json(new, target), &across.into, now)
+        });
+        created.map_err(|problem| self.scrub(problem))
+    }
+
+    fn details(&mut self, now: u64) -> Option<Details> {
+        let mut details = Details::default();
+        if self.about.is_none()
+            && let Some(about) = self.ask_project(&self.project.clone(), now)
+        {
+            details.parent = about.parent.as_ref().map(|(parent, _)| parent.clone());
+            self.about = Some(about);
+        }
+
+        let mut changed = BTreeSet::new();
+        // Forks the list names by id only.
+        let mut unknown: Vec<u64> = self.listed.iter().filter_map(|seen| seen.fork).collect();
+        unknown.sort_unstable();
+        unknown.dedup();
+        unknown.retain(|id| !self.forks.contains_key(id));
+        for id in unknown.into_iter().take(FORKS_AT_ONCE) {
+            let Some(fork) = self.ask_project(&id.to_string(), now) else { break };
+            self.forks.insert(id, fork.path.clone());
+            if fork.path.is_some() {
+                changed.extend(self.listed.iter().filter(|seen| seen.fork == Some(id)).map(|seen| seen.iid));
+            }
+        }
+
+        // Approvals of the merge requests that changed since last asked.
+        let stale: Vec<Seen> = self
+            .listed
+            .iter()
+            .filter(|seen| self.approvals.get(&seen.iid).is_none_or(|asked| asked.at != seen.updated))
+            .take(APPROVALS_AT_ONCE)
+            .copied()
+            .collect();
+        for seen in stale {
+            let Some(asked) = self.ask_approvals(seen, now) else { break };
+            let before = self.approvals.get(&seen.iid).map_or((Review::Unknown, None), |before| (before.review, before.approvals));
+            if before != (asked.review, asked.approvals) {
+                changed.insert(seen.iid);
+            }
+            self.approvals.insert(seen.iid, asked);
+        }
+
+        details.pulls = self
+            .listed
+            .iter()
+            .filter(|seen| changed.contains(&seen.iid))
+            .map(|seen| {
+                let listed = Listed {
+                    pull: PullRequest { number: seen.iid, ..Default::default() },
+                    fork: seen.fork,
+                    changes_requested: seen.changes_requested,
+                };
+                self.known(listed)
+            })
+            .collect();
+        (details != Details::default()).then_some(details)
     }
 }
 
@@ -981,5 +1310,216 @@ mod tests {
         assert_eq!(problem, Problem::Refused("token *** may not push here".to_owned()));
         let (mut client, _) = scripted(vec![Err(format!("reset while sending Bearer {SECRET}"))], with_token());
         assert!(!format!("{:?}", client.create_pull(&new_pull(false), NOW)).contains(SECRET));
+    }
+
+    // ---- approvals, forks and the parent ----
+
+    #[test]
+    fn approvals_come_to_a_review_state_with_and_without_rules() {
+        let given = |given, left| Approvals { given, left };
+        // GitLab Free: no rules, only who approved.
+        let free = r#"{"approved": true, "approved_by": [{"user": {"username": "ada"}}]}"#;
+        assert_eq!(parse_approvals(free).unwrap(), (Review::Approved, given(1, 0)));
+        let nobody = r#"{"approved": false, "approved_by": []}"#;
+        assert_eq!(parse_approvals(nobody).unwrap(), (Review::Unreviewed, given(0, 0)));
+        // Rules: still one to go, then met.
+        let short = r#"{"approvals_required": 2, "approvals_left": 1, "approved_by": [{"user": {"username": "ada"}}]}"#;
+        assert_eq!(parse_approvals(short).unwrap(), (Review::Required, given(1, 1)));
+        let met = r#"{"approved": true, "approvals_required": 2, "approvals_left": 0,
+            "approved_by": [{"user": {"username": "ada"}}, {"user": {"username": "grace"}}]}"#;
+        assert_eq!(parse_approvals(met).unwrap(), (Review::Approved, given(2, 0)));
+        // Several rules each needing someone: `approvals_left` is what counts.
+        let rules = r#"{"approvals_required": 0, "approvals_left": 2, "approved_by": null}"#;
+        assert_eq!(parse_approvals(rules).unwrap(), (Review::Required, given(0, 2)));
+        assert!(parse_approvals("[]").is_err());
+    }
+
+    /// A merge request of this project and one from a fork that a reviewer
+    /// asked changes of.
+    fn two_requests(updated: &str) -> String {
+        format!(
+            r#"[{{"iid": 12, "title": "Add dark mode", "author": {{"username": "ada"}},
+                 "source_branch": "feature/dark", "target_branch": "main",
+                 "source_project_id": 7, "target_project_id": 7, "updated_at": "{updated}",
+                 "detailed_merge_status": "not_approved"}},
+                {{"iid": 9, "title": "Parser", "author": {{"username": "grace"}},
+                 "source_branch": "main", "target_branch": "main",
+                 "source_project_id": 99, "target_project_id": 7, "updated_at": "1970-01-02T00:00:00Z",
+                 "detailed_merge_status": "requested_changes"}}]"#
+        )
+    }
+
+    const ABOUT: &str = r#"{"id": 7, "path_with_namespace": "group/sub/app", "default_branch": "main",
+        "forked_from_project": {"id": 3, "path_with_namespace": "group/upstream-app", "default_branch": "develop"}}"#;
+
+    #[test]
+    fn approvals_and_forks_are_asked_once_each_and_again_only_when_they_change() {
+        let short = r#"{"approvals_required": 2, "approvals_left": 1, "approved_by": [{"user": {"username": "ada"}}]}"#;
+        let (mut client, sent) = scripted(
+            vec![
+                reply(200, &[("etag", "W/\"l1\"")], &two_requests("1970-01-02T00:00:00Z")),
+                reply(200, &[], ABOUT),
+                reply(200, &[], r#"{"id": 99, "path_with_namespace": "grace/app"}"#),
+                reply(200, &[("etag", "W/\"a12\"")], short),
+                reply(200, &[], r#"{"approved_by": []}"#),
+                reply(304, &[], ""),
+                reply(200, &[], &two_requests("1970-01-03T00:00:00Z")),
+                reply(304, &[], ""),
+            ],
+            with_token(),
+        );
+        let Outcome::Fresh { items, .. } = client.pulls(NOW) else { panic!("a list") };
+        // What the list says already: the fork (unnamed yet) and the request for changes.
+        assert_eq!((items[0].review, items[1].review), (Review::Unknown, Review::ChangesRequested));
+        assert!(items[0].is_from(&project()) && items[1].head_repo.is_none());
+
+        let details = client.details(NOW).unwrap();
+        let parent = details.parent.unwrap();
+        assert_eq!((parent.repo.slug().as_str(), parent.default_branch.as_str()), ("group/upstream-app", "develop"));
+        let twelve = details.pulls.iter().find(|pull| pull.number == 12).unwrap();
+        assert_eq!((twelve.review, twelve.approvals), (Review::Required, Some(Approvals { given: 1, left: 1 })));
+        let nine = details.pulls.iter().find(|pull| pull.number == 9).unwrap();
+        assert_eq!((nine.review, nine.head_repo.as_deref()), (Review::ChangesRequested, Some("grace/app")));
+
+        // Unchanged list: nothing is asked.
+        assert_eq!(client.pulls(NOW), Outcome::Unchanged);
+        assert_eq!(client.details(NOW), None);
+        // !12 moved: a fresh list keeps what is known, and only its
+        // approvals are asked again, with their validator.
+        let Outcome::Fresh { items, .. } = client.pulls(NOW) else { panic!("a list") };
+        assert_eq!(items[0].review, Review::Required);
+        assert_eq!(items[1].head_repo.as_deref(), Some("grace/app"));
+        assert_eq!(client.details(NOW), None);
+
+        let sent = sent.lock().unwrap();
+        let urls: Vec<String> = sent.iter().map(|request| request.url.clone()).collect();
+        let base = "https://gitlab.com/api/v4/projects/group%2Fsub%2Fapp";
+        let list = format!("{base}/merge_requests?state=opened&per_page=30");
+        assert_eq!(
+            urls,
+            [
+                list.clone(),
+                base.to_owned(),
+                "https://gitlab.com/api/v4/projects/99".to_owned(),
+                format!("{base}/merge_requests/12/approvals"),
+                format!("{base}/merge_requests/9/approvals"),
+                list.clone(),
+                list,
+                format!("{base}/merge_requests/12/approvals"),
+            ]
+        );
+        assert_eq!(sent[7].etag.as_deref(), Some("W/\"a12\""));
+        assert!(sent.iter().all(|request| request.token.as_deref() == Some(SECRET)));
+    }
+
+    #[test]
+    fn a_fork_that_cannot_be_seen_stays_unnamed_and_a_failure_is_asked_again() {
+        let (mut client, sent) = scripted(
+            vec![
+                reply(200, &[], &two_requests("1970-01-02T00:00:00Z")),
+                reply(200, &[], r#"{"id": 7, "path_with_namespace": "group/sub/app"}"#),
+                // The fork is private: GitLab says it does not exist.
+                reply(404, &[], r#"{"message": "404 Project Not Found"}"#),
+                // The server fails on the approvals: the round stops there.
+                reply(502, &[], "<html>"),
+                reply(200, &[], r#"{"approved_by": []}"#),
+                reply(200, &[], r#"{"approved_by": []}"#),
+            ],
+            with_token(),
+        );
+        client.pulls(NOW);
+        // Nothing new: the project is no fork, its fork is hidden.
+        assert_eq!(client.details(NOW), None);
+        assert_eq!(sent.lock().unwrap().len(), 4);
+        // The approvals that failed are asked next round, and the fork is not.
+        let details = client.details(NOW).unwrap();
+        let states: Vec<(u64, Review)> = details.pulls.iter().map(|pull| (pull.number, pull.review)).collect();
+        // GitLab's word from the list stands over approvals nobody gave.
+        assert_eq!(states, [(12, Review::Unreviewed), (9, Review::ChangesRequested)]);
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 6);
+        assert!(sent[4].url.ends_with("/merge_requests/12/approvals") && sent[5].url.ends_with("/merge_requests/9/approvals"));
+    }
+
+    #[test]
+    fn a_merge_request_from_a_fork_is_opened_on_the_fork_with_the_target_project() {
+        let fork = RepoId { owner: "ada".to_owned(), name: "app".to_owned(), ..project() };
+        let parent = RepoId { owner: "group".to_owned(), name: "app".to_owned(), ..project() };
+        let (mut client, sent) = scripted(
+            vec![reply(200, &[], r#"{"id": 3, "path_with_namespace": "group/app"}"#), reply(201, &[], CREATED)],
+            with_token(),
+        );
+        let across = Across { from: fork.clone(), into: parent.clone() };
+        assert_eq!(client.create_pull_across(&new_pull(false), &across, NOW).unwrap().number, 13);
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent[0].url, "https://gitlab.com/api/v4/projects/group%2Fapp");
+        assert_eq!(sent[1].url, "https://gitlab.com/api/v4/projects/ada%2Fapp/merge_requests");
+        let body: serde_json::Value = serde_json::from_str(sent[1].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["target_project_id"], 3);
+        assert_eq!((body["source_branch"].as_str(), body["target_branch"].as_str()), (Some("feature/fast"), Some("main")));
+        drop(sent);
+
+        // The shown project is a fork whose parent is known: no lookup.
+        let (mut client, sent) = scripted(
+            vec![
+                reply(200, &[], "[]"),
+                reply(200, &[], ABOUT),
+                reply(201, &[], CREATED),
+            ],
+            with_token(),
+        );
+        client.pulls(NOW);
+        client.details(NOW);
+        let upstream = RepoId { owner: "group".to_owned(), name: "upstream-app".to_owned(), ..project() };
+        client.create_pull_across(&new_pull(false), &Across { from: project(), into: upstream }, NOW).unwrap();
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 3);
+        let body: serde_json::Value = serde_json::from_str(sent[2].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["target_project_id"], 3);
+        drop(sent);
+
+        // A target GitLab will not name: nothing is opened.
+        let (mut client, sent) = scripted(vec![reply(404, &[], r#"{"message": "404 Project Not Found"}"#)], with_token());
+        let problem = client.create_pull_across(&new_pull(false), &Across { from: fork, into: parent }, NOW).unwrap_err();
+        assert!(problem.line(Service::GitLab).contains("did not say which project group/app is"));
+        assert_eq!(sent.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_gitlab_under_a_path_is_asked_below_that_path() {
+        let sent = Log::default();
+        let transport = Script { replies: vec![reply(200, &[], "[]"), reply(200, &[], "{}")].into(), sent: sent.clone() };
+        let repo = RepoId { host: "example.com/gitlab".to_owned(), owner: "team".to_owned(), ..project() };
+        let secrets = Fake { cli: Some(OTHER), ..Default::default() };
+        let mut client = Client::new(repo, Box::new(transport), Box::new(secrets.clone()));
+        assert!(matches!(client.pulls(NOW), Outcome::Fresh { .. }));
+        assert_eq!(client.details(NOW), None);
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent[0].url, "https://example.com/gitlab/api/v4/projects/team%2Fapp/merge_requests?state=opened&per_page=30");
+        assert_eq!(sent[1].url, "https://example.com/gitlab/api/v4/projects/team%2Fapp");
+        assert_eq!(sent[0].token.as_deref(), Some(OTHER));
+        // glab knows the server by its name.
+        assert_eq!(secrets.asked(), ["GITLAB_HOST", "glab example.com"]);
+    }
+
+    #[test]
+    fn the_offline_fixture_answers_approvals_forks_and_the_project() {
+        let dir = std::env::temp_dir().join("gitkrill-tests").join(format!("hosting-canned-approvals-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("merge_requests.json"), two_requests("1970-01-02T00:00:00Z")).unwrap();
+        std::fs::write(dir.join("project.json"), ABOUT).unwrap();
+        std::fs::write(dir.join("project-99.json"), r#"{"id": 99, "path_with_namespace": "grace/app"}"#).unwrap();
+        std::fs::write(dir.join("approvals-12.json"), r#"{"approvals_left": 1, "approved_by": []}"#).unwrap();
+        let canned = Canned { dir: dir.clone(), created: false };
+        let mut client = Client::new(project(), Box::new(canned), Box::new(NoSecrets));
+        client.pulls(NOW);
+        let details = client.details(NOW).unwrap();
+        assert!(details.parent.is_some());
+        assert_eq!(details.pulls.iter().find(|pull| pull.number == 12).unwrap().review, Review::Required);
+        // No approvals file for !9: unknown, but GitLab's word from the list stands.
+        let nine = details.pulls.iter().find(|pull| pull.number == 9).unwrap();
+        assert_eq!((nine.review, nine.head_repo.as_deref()), (Review::ChangesRequested, Some("grace/app")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
