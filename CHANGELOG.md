@@ -3,7 +3,7 @@
 Each release's section here becomes its notes on GitHub, and what the update
 dialog shows. Add a `## x.y.z` section before tagging `vx.y.z`.
 
-## Unreleased
+## 0.5.0
 
 - Undo covers a rebase, merge, cherry-pick, revert or `git am` that
   stopped on conflicts and was finished in a terminal or another tool,
