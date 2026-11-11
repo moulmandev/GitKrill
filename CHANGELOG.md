@@ -3,6 +3,42 @@
 Each release's section here becomes its notes on GitHub, and what the update
 dialog shows. Add a `## x.y.z` section before tagging `vx.y.z`.
 
+## Unreleased
+
+- Undo covers a rebase, merge, cherry-pick, revert or `git am` that
+  stopped on conflicts and was finished in a terminal or another tool,
+  even while GitKrill was closed; one that was aborted leaves nothing to
+  undo
+- A `git am` stopped on a conflict is undone as a whole once Continue
+  finishes it
+- Interactive rebase: the commits a merge brought in are listed under it
+  and can be reworded, squashed, dropped or reordered one by one; a merge
+  can be squashed into the commit below it; a base on a merged-in branch
+  works
+- Autosquash folds fixups across merges, into merged branches too, and a
+  fixup it leaves says why in its menu
+- Hunks and lines of a file turned from UTF-8 into UTF-16 (or back) are
+  staged, unstaged and discarded in part, each version keeping its own
+  encoding; UTF-16 without a byte order mark is recognised in Chinese,
+  Japanese, Russian, Arabic and other scripts
+- In files over 1 MB or 20,000 lines, a hunk inside a block comment or
+  string is coloured as one, once the lines before it have been parsed in
+  the background
+- In a fork, a Fork / Parent switch shows the parent's pull requests,
+  issues and CI, your own pull requests first; Azure DevOps forks know
+  their parent and open pull requests into it
+- Review states on Gitea, Forgejo and Codeberg, and on GitHub without a
+  sign-in
+- Bitbucket Data Center servers: pull requests with their reviewers,
+  builds, opening and checking out pull requests, the account and its SSH
+  keys
+- SourceHut: tickets and builds in the sidebar, and how to send patches
+- Bitbucket Cloud no longer lists issues: Atlassian removed its issue
+  tracker on 20 August 2026
+- Asks for the passphrase of X.509 (gpgsm) signing certificates itself too
+- On macOS, system notifications come from GitKrill itself instead of
+  Script Editor
+
 ## 0.4.0
 
 - Select several commits (Ctrl+click, Shift+click): compare any two, see
