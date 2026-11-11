@@ -8,8 +8,15 @@
 //!   AppUserModelId\Moulman.GitKrill`: its name and icon), which works the
 //!   same for the installed and the portable copy and needs no Start menu
 //!   shortcut; the installer removes the key on uninstall.
-//! - **macOS** shows them through `osascript` (`display notification`).
+//! - **macOS** shows them as GitKrill's own (the UserNotifications
+//!   framework, [`macos`]) when GitKrill runs from its app bundle, and
+//!   through `osascript` (`display notification`, listed under Script
+//!   Editor) otherwise: a bare binary, a bundle without an identifier, or
+//!   notifications macOS does not allow GitKrill or refuses.
 //! - **Linux** uses `notify-send`, or `gdbus` when it is missing.
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Sender, channel};
@@ -158,6 +165,18 @@ fn escape_xml(text: &str) -> String {
 
 #[cfg(target_os = "macos")]
 fn show(title: &str, body: &str) -> Result<(), String> {
+    if macos::available() {
+        match macos::show(title, body) {
+            Ok(()) => return Ok(()),
+            Err(why) => {
+                // Said once: it usually stays so for the whole run.
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!("system notification through osascript instead: {why}");
+                }
+            }
+        }
+    }
     // The texts are arguments of the script, never part of it.
     let status = std::process::Command::new("osascript")
         .args(["-e", "on run argv", "-e", "display notification (item 2 of argv) with title (item 1 of argv)", "-e", "end run"])
@@ -273,6 +292,14 @@ mod tests {
         let _ = unsafe { RegDeleteTreeW(HKEY_CURRENT_USER, &HSTRING::from(format!(r"Software\Classes\AppUserModelId\{ID}"))) };
         sent.unwrap();
         assert_eq!(delivered.unwrap(), 1);
+    }
+
+    /// The test binary is not an app bundle: the framework, which would
+    /// throw without one, is never called.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bare_binary_does_not_use_the_notification_framework() {
+        assert!(!macos::available());
     }
 
     #[test]

@@ -501,7 +501,10 @@ be installed.
   the background, the taskbar button flashes (the Dock icon bounces) and the
   message appears in a system notification (Windows' notifications, macOS's
   Notification Center, the desktop's notifications on Linux), which can be
-  turned off on its own; also when git waits for a password
+  turned off on its own; also when git waits for a password. On macOS they
+  are GitKrill's own (macOS asks once whether to allow them); when macOS
+  does not allow them, they are shown through `osascript`, under Script
+  Editor
 - Clone and init. The clone dialog's Options pick the branch to check out
   (listed from the remote once the address is typed), a shallow history of
   the last so many commits, only that branch's history, and the submodules
@@ -614,7 +617,8 @@ src/
   theme.rs       colours, fonts, egui style
   avatars.rs     author pictures: fetch, disk cache, textures
   update.rs      checking for, downloading and applying updates
-  notification.rs  system notifications
+  notification.rs  system notifications (notification/macos.rs: macOS's
+                 own, through the UserNotifications framework)
   hosting/       pull / merge requests, issues and CI: github.rs (GitHub
                  and Enterprise), gitlab.rs, bitbucket.rs (Bitbucket
                  Cloud), bitbucket_dc.rs (Bitbucket Data Center), gitea.rs
@@ -719,8 +723,10 @@ build.rs         the Windows executable's icon and version details
   large file (from 70,000 to 200,000 lines of Rust, more of simpler
   formats), syntax colours start afresh at every hunk: a block comment or
   string that runs across the start of a hunk is coloured as if it did not
-- On macOS, system notifications are shown through `osascript`, so
-  Notification Center lists them under Script Editor rather than GitKrill
+- On macOS, GitKrill run outside its app bundle (the bare binary, `cargo
+  run`) still shows system notifications through `osascript`, under Script
+  Editor: macOS's own notifications need the bundle's identifier. The
+  bundle has no icon yet, so GitKrill's notifications show a generic one
 
 ## License
 

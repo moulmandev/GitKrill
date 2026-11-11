@@ -66,6 +66,22 @@ windows = { version = "0.62", default-features = false, features = [
 # The executable's icon and version details on Windows (see build.rs).
 winresource = "0.1"
 
+# System notifications from GitKrill itself when it runs from its app
+# bundle (src/notification/macos.rs). objc2, block2 and objc2-foundation
+# are already in the build through rfd; only these classes are compiled.
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSError", "NSString"] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "UNNotificationContent",
+    "UNNotificationRequest",
+    "UNNotificationTrigger",
+    "UNUserNotificationCenter",
+] }
+
 # Linux needs a window-system backend chosen explicitly because eframe's
 # default features are off; with both, the app runs on X11 and Wayland.
 [target.'cfg(target_os = "linux")'.dependencies]

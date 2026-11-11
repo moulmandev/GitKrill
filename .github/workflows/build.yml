@@ -188,7 +188,10 @@ jobs:
 
       # A minimal .app bundle so it can be launched from Finder. It is signed
       # ad hoc only: without an Apple Developer ID, macOS asks the user to
-      # confirm the first launch (right-click > Open).
+      # confirm the first launch (right-click > Open). GitKrill's own system
+      # notifications (src/notification/macos.rs) need the bundle
+      # identifier, and macOS keeps the user's permission for them under
+      # it: changing it asks every user again.
       - name: Package (macOS)
         if: runner.os == 'macOS'
         run: |
