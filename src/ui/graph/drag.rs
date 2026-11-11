@@ -32,7 +32,7 @@ use eframe::egui::{
     pos2, vec2,
 };
 
-use crate::git::ops::{self, GitCmd, ResetMode, UndoKind};
+use crate::git::ops::{self, GitCmd, RefMove, ResetMode, UndoKind};
 use crate::git::{History, Oid, RefKind, RefLabel, RemoteBranch, RepoSnapshot, RowKind, short};
 use crate::state::{Dialog, RepoTab, Shared};
 use crate::theme::{self, icons};
@@ -402,14 +402,19 @@ impl Action {
                 format!("Fast-forward {branch}"),
                 &["fetch", ".", &format!("{to_ref}:refs/heads/{branch}")],
             )
+            .undoable(moves(&[branch.as_str()]))
             .done(format!("Fast-forwarded {branch} to {to}")),
 
             Action::Merge { source, into, checkout: false } => {
                 ops::merge(source).done(format!("Merged {source} into {into}"))
             }
+            // One undo puts back both the branch that was checked out and
+            // the one merged into, also when the merge stopped on conflicts
+            // and was finished later (`git::carry`).
             Action::Merge { source, into, checkout: true } => {
                 GitCmd::new(format!("Checkout {into} and merge {source}"), &["checkout", into])
                     .step(&["merge", "--no-edit", source])
+                    .undoable(moves(&[into.as_str()]))
                     .done(format!("Checked out {into} and merged {source}"))
             }
 
@@ -421,6 +426,7 @@ impl Action {
                 format!("Checkout {branch} and rebase onto {onto_name}"),
                 &["rebase", onto, branch],
             )
+            .undoable(moves(&[branch.as_str()]))
             .done(format!("Checked out {branch} and rebased onto {onto_name}")),
 
             Action::Push { branch, remote } => ops::push_branch(remote, branch),
@@ -437,7 +443,14 @@ pub fn reset_command(branch: &str, to: Oid, checked_out: bool, mode: ResetMode) 
         ops::reset(&sha, mode)
     } else {
         GitCmd::new(format!("Reset {branch} to {}", short(to)), &["branch", "-f", branch, &sha])
+            .undoable(moves(&[branch]))
     }
+}
+
+/// Undo for a command that moves these local branches, and perhaps HEAD
+/// from one branch to another: everything goes back where it was.
+fn moves(branches: &[&str]) -> UndoKind {
+    UndoKind::Refs(branches.iter().map(|b| RefMove::new(format!("refs/heads/{b}"))).collect())
 }
 
 /// The actions for dropping `dragged` on `target` in this repository.
@@ -1165,5 +1178,92 @@ mod tests {
         let done = fx.run(reset_command("main", old, true, ResetMode::Hard));
         assert_eq!(done.snap.head.oid, Some(old));
         assert!(done.undo.is_some());
+    }
+
+    /// Runs the undo of `done`, which must exist and work.
+    fn undo(fx: &Fixture, done: crate::tests::Done) -> Arc<RepoSnapshot> {
+        let entry = done.undo.expect("the action is undoable");
+        let undone = fx.run_as(entry.undo.clone(), crate::worker::Origin::Undo(entry));
+        undone.result.expect("undo works");
+        undone.snap
+    }
+
+    #[test]
+    fn actions_that_check_out_another_branch_are_undone_in_one_go() {
+        let fx = diverged("drag-undo");
+        git(&fx.dir, &["checkout", "-q", "feature"]);
+        let snap = fx.snapshot();
+        let (main, feature) = (tip(&snap, "main"), tip(&snap, "feature"));
+
+        // Merge feature into main: checks out main, then merges.
+        let merge = plan(&snap, &local("feature"), &onto(local("main"))).remove(0);
+        let done = fx.run(merge.command().unwrap());
+        assert_eq!(done.snap.head.branch.as_deref(), Some("main"));
+        let snap = undo(&fx, done);
+        assert_eq!(snap.head.branch.as_deref(), Some("feature"));
+        assert_eq!((tip(&snap, "main"), tip(&snap, "feature")), (main, feature));
+        assert!(snap.status.is_clean());
+
+        // Rebase main onto feature from feature: checks out main.
+        let rebase = plan(&snap, &local("main"), &onto(local("feature"))).remove(1);
+        assert_eq!(rebase.note().as_deref(), Some("checks out main"));
+        let done = fx.run(rebase.command().unwrap());
+        assert_eq!(done.snap.head.branch.as_deref(), Some("main"));
+        assert_ne!(tip(&done.snap, "main"), main);
+        let snap = undo(&fx, done);
+        assert_eq!(snap.head.branch.as_deref(), Some("feature"));
+        assert_eq!((tip(&snap, "main"), tip(&snap, "feature")), (main, feature));
+    }
+
+    #[test]
+    fn a_checkout_and_rebase_that_stopped_on_conflicts_is_undone_once_finished() {
+        let fx = Fixture::new("drag-undo-conflict");
+        fx.write("f.txt", "base
+");
+        fx.commit_all("base");
+        git(&fx.dir, &["checkout", "-q", "-b", "feature"]);
+        fx.write("f.txt", "feature
+");
+        fx.commit_all("on feature");
+        git(&fx.dir, &["checkout", "-q", "main"]);
+        fx.write("f.txt", "main
+");
+        fx.commit_all("on main");
+        let snap = fx.snapshot();
+        let (main, feature) = (tip(&snap, "main"), tip(&snap, "feature"));
+
+        let rebase = plan(&snap, &local("feature"), &onto(local("main"))).remove(1);
+        let stopped = fx.run_as(rebase.command().unwrap(), crate::worker::Origin::User);
+        assert!(stopped.result.is_err());
+        fx.write("f.txt", "both
+");
+        git(&fx.dir, &["add", "f.txt"]);
+        let done = fx.run(ops::continue_op(crate::git::RepoState::Rebase).unwrap());
+        assert_eq!(done.snap.head.branch.as_deref(), Some("feature"));
+        let snap = undo(&fx, done);
+        assert_eq!(snap.head.branch.as_deref(), Some("main"));
+        assert_eq!((tip(&snap, "main"), tip(&snap, "feature")), (main, feature));
+        assert_eq!(fx.read("f.txt"), "main
+");
+    }
+
+    #[test]
+    fn branches_moved_in_place_can_be_put_back() {
+        let fx = diverged("drag-undo-in-place");
+        let snap = fx.snapshot();
+        let (main, old) = (tip(&snap, "main"), tip(&snap, "old"));
+
+        let forward = plan(&snap, &local("main"), &onto(local("old"))).remove(0);
+        let done = fx.run(forward.command().unwrap());
+        assert_eq!(tip(&done.snap, "old"), main);
+        let snap = undo(&fx, done);
+        assert_eq!(tip(&snap, "old"), old);
+        assert_eq!(snap.head.branch.as_deref(), Some("main"));
+
+        let feature = tip(&snap, "feature");
+        let done = fx.run(reset_command("feature", main, false, ResetMode::Mixed));
+        assert_eq!(tip(&done.snap, "feature"), main);
+        let snap = undo(&fx, done);
+        assert_eq!(tip(&snap, "feature"), feature);
     }
 }
