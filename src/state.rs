@@ -741,11 +741,11 @@ impl RepoTab {
                 DiffSource::Staged if in_staged => Some(DiffSource::Staged),
                 DiffSource::Staged if in_unstaged => Some(DiffSource::Unstaged),
                 DiffSource::Unstaged | DiffSource::Staged => None,
-                commit @ DiffSource::Commit(_) => Some(commit),
+                committed @ (DiffSource::Commit(_) | DiffSource::Compare { .. }) => Some(committed),
             };
             match source {
                 Some(source) => {
-                    if !matches!(source, DiffSource::Commit(_)) {
+                    if !source.is_committed() {
                         if source != view.target.source {
                             view.target.source = source;
                             let list = match source {

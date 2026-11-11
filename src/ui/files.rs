@@ -25,6 +25,7 @@ fn source_key(source: DiffSource) -> &'static str {
         DiffSource::Unstaged => "unstaged",
         DiffSource::Staged => "staged",
         DiffSource::Commit(_) => "commit",
+        DiffSource::Compare { .. } => "compare",
     }
 }
 
@@ -138,7 +139,7 @@ pub fn file_list(
                                     run = Some(ops::unstage(&inside(), unborn));
                                 }
                             }
-                            DiffSource::Commit(_) => {
+                            DiffSource::Commit(_) | DiffSource::Compare { .. } => {
                                 if menu_item(ui, icons::COPY, "Copy folder path") {
                                     ui.ctx().copy_text(path.clone());
                                 }
@@ -158,7 +159,7 @@ pub fn file_list(
                         let action = match source {
                             DiffSource::Unstaged => Some(("Stage File", theme::green())),
                             DiffSource::Staged => Some(("Unstage File", theme::red())),
-                            DiffSource::Commit(_) => None,
+                            DiffSource::Commit(_) | DiffSource::Compare { .. } => None,
                         };
                         let hovering = ui.rect_contains_pointer(rect);
                         let mut text_right = rect.right() - 8.0;
@@ -239,7 +240,7 @@ pub fn file_list(
                                     }
                                     ui.separator();
                                 }
-                                DiffSource::Commit(_) => {}
+                                DiffSource::Commit(_) | DiffSource::Compare { .. } => {}
                             }
                             let full = workdir.join(&file.path);
                             let tools = &shared.settings.tools;
@@ -275,7 +276,7 @@ pub fn file_list(
                             if menu_item(ui, icons::COPY, "Copy file path") {
                                 ui.ctx().copy_text(file.path.clone());
                             }
-                            if !matches!(source, DiffSource::Commit(_))
+                            if !source.is_committed()
                                 && let Some(pattern) = crate::git::lfs::extension_pattern(&file.path)
                             {
                                 ui.separator();
@@ -317,6 +318,9 @@ fn compare_for(tab: &RepoTab, source: DiffSource) -> Compare {
                 None => Some(format!("{oid}^")),
             };
             Compare::Commit { commit: oid.to_string(), parent }
+        }
+        DiffSource::Compare { from, to } => {
+            Compare::Commit { commit: to.to_string(), parent: Some(from.to_string()) }
         }
     }
 }

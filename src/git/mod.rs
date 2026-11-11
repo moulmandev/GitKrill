@@ -259,6 +259,17 @@ pub enum DiffSource {
     Staged,
     /// First parent -> commit (also used for stashes).
     Commit(Oid),
+    /// One commit's tree -> another's, for comparing two commits or
+    /// branches. `from` is the older side, shown as removed lines.
+    Compare { from: Oid, to: Oid },
+}
+
+impl DiffSource {
+    /// Whether the diff is between commits, so nothing in it can be staged,
+    /// unstaged or discarded.
+    pub fn is_committed(self) -> bool {
+        matches!(self, DiffSource::Commit(_) | DiffSource::Compare { .. })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]

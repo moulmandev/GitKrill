@@ -132,7 +132,7 @@ fn title_bar(
                         tab.run(ops::unstage(std::slice::from_ref(&target.path), unborn));
                     }
                 }
-                DiffSource::Commit(_) => {}
+                DiffSource::Commit(_) | DiffSource::Compare { .. } => {}
             }
             if let Some(diff) = diff.filter(|diff| !diff.binary) {
                 ui.add_space(6.0);
@@ -160,6 +160,7 @@ fn title_bar(
         DiffSource::Unstaged => "unstaged changes".to_owned(),
         DiffSource::Staged => "staged changes".to_owned(),
         DiffSource::Commit(oid) => format!("in commit {}", short(oid)),
+        DiffSource::Compare { from, to } => format!("{} → {}", short(from), short(to)),
     };
     x += widgets::text_left(&painter, rect, x, &origin, theme::font(12.0), theme::text_dim()) + 12.0;
     if let Some(old) = diff.and_then(|d| d.old_path.as_deref()).or(target.old_path.as_deref()) {
@@ -535,7 +536,7 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget
 
     // Lines can be picked wherever they can be staged: working tree diffs of
     // files that are not in the middle of a merge.
-    let stageable = !matches!(target.source, DiffSource::Commit(_))
+    let stageable = !target.source.is_committed()
         && !diff.file_header.is_empty()
         && diff.kind != Some(ChangeKind::Conflicted);
     let selection = stageable.then(|| {
@@ -765,7 +766,7 @@ fn hunk_buttons(
     bar: Rect,
     selection: Option<&mut LineSelection>,
 ) {
-    if matches!(target.source, DiffSource::Commit(_)) {
+    if target.source.is_committed() {
         return;
     }
     let Some(patch) = diff.hunk_patch(index) else { return };
@@ -830,7 +831,7 @@ fn hunk_buttons(
                     }
                 }
             }
-            DiffSource::Commit(_) => {}
+            DiffSource::Commit(_) | DiffSource::Compare { .. } => {}
         }
         if place(ui, "Clear selection", theme::text_dim()) {
             selection.clear();
@@ -857,7 +858,7 @@ fn hunk_buttons(
                 tab.run(ops::apply_patch("Unstage hunk", patch, true, true));
             }
         }
-        DiffSource::Commit(_) => {}
+        DiffSource::Commit(_) | DiffSource::Compare { .. } => {}
     }
 }
 

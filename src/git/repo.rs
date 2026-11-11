@@ -453,30 +453,7 @@ impl Loader {
             Ok(parent) => Some(parent.tree().map_err(err)?),
             Err(_) => None,
         };
-
-        let mut diff = self
-            .repo
-            .diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), None)
-            .map_err(err)?;
-        let mut find = git2::DiffFindOptions::new();
-        find.renames(true);
-        let _ = diff.find_similar(Some(&mut find));
-
-        let mut files: Vec<FileChange> = diff
-            .deltas()
-            .filter_map(|delta| {
-                let kind = delta_kind(delta.status())?;
-                let new_path = delta.new_file().path_bytes().map(lossy);
-                let old_path = delta.old_file().path_bytes().map(lossy);
-                let path = new_path.clone().or_else(|| old_path.clone())?;
-                Some(FileChange {
-                    path,
-                    old_path: old_path.filter(|_| kind == ChangeKind::Renamed),
-                    kind,
-                })
-            })
-            .collect();
-        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let files = self.changed_files(parent_tree.as_ref(), &tree)?;
 
         let author = commit.author();
         let committer = commit.committer();
@@ -499,6 +476,40 @@ impl Loader {
             committer_time: committer.when().seconds(),
             files,
         })
+    }
+
+    /// The files that differ between two commits, `from` being the older
+    /// side; their diffs are `DiffSource::Compare { from, to }`.
+    pub fn compare_files(&self, from: Oid, to: Oid) -> Result<Vec<FileChange>, String> {
+        let from = self.repo.find_commit(from).and_then(|c| c.tree()).map_err(err)?;
+        let to = self.repo.find_commit(to).and_then(|c| c.tree()).map_err(err)?;
+        self.changed_files(Some(&from), &to)
+    }
+
+    /// Files changed from `old` (none: an empty tree) to `new`, renames
+    /// detected, sorted by path.
+    fn changed_files(&self, old: Option<&git2::Tree<'_>>, new: &git2::Tree<'_>) -> Result<Vec<FileChange>, String> {
+        let mut diff = self.repo.diff_tree_to_tree(old, Some(new), None).map_err(err)?;
+        let mut find = git2::DiffFindOptions::new();
+        find.renames(true);
+        let _ = diff.find_similar(Some(&mut find));
+
+        let mut files: Vec<FileChange> = diff
+            .deltas()
+            .filter_map(|delta| {
+                let kind = delta_kind(delta.status())?;
+                let new_path = delta.new_file().path_bytes().map(lossy);
+                let old_path = delta.old_file().path_bytes().map(lossy);
+                let path = new_path.clone().or_else(|| old_path.clone())?;
+                Some(FileChange {
+                    path,
+                    old_path: old_path.filter(|_| kind == ChangeKind::Renamed),
+                    kind,
+                })
+            })
+            .collect();
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        Ok(files)
     }
 }
 

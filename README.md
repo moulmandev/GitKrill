@@ -368,6 +368,26 @@ build.rs         the Windows executable's icon and version details
   (ssh-agent, gpg-agent); there is no passphrase prompt
 - Submodule management, worktrees, Git LFS file locking; SVG changes show
   as text
+- No reflog view and no bisect (a bisect started in a terminal is only
+  shown as in progress)
+- Merges always use git's default (no choice of a merge commit or a squash
+  merge), and there are no fixup commits or autosquash
+- Commits cannot be signed off, committed without hooks or given
+  co-authors from the commit panel
+- Commit search looks at messages, authors and SHAs only: not at the files
+  a commit changed, its code (`git log -S`) or its date
+- A commit's whole file tree cannot be browsed, and a file cannot be opened,
+  saved or restored as it was in an older commit
+- No creating or applying patch files, and no exporting a commit as an
+  archive
+- Clone has no options: no shallow or single-branch clone, no choice of
+  branch, no submodules
+- All tags cannot be pushed at once, and a tag cannot be deleted on a
+  remote
+- The graph can hide branches but not show one branch alone
+- Pushing and pulling over HTTPS needs a credential helper: without one
+  (Windows comes with Git Credential Manager) GitKrill does not ask for a
+  user name and password
 - Desktop notifications draw attention to the window but do not pop up a
   system notification with the message; dates follow one pattern, not the
   system's locale

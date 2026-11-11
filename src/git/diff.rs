@@ -45,6 +45,11 @@ impl Loader {
                 repo.diff_tree_to_tree(parent_tree.as_ref(), Some(&tree), Some(&mut opts))
                     .map_err(err)?
             }
+            DiffSource::Compare { from, to } => {
+                let from = repo.find_commit(from).and_then(|c| c.tree()).map_err(err)?;
+                let to = repo.find_commit(to).and_then(|c| c.tree()).map_err(err)?;
+                repo.diff_tree_to_tree(Some(&from), Some(&to), Some(&mut opts)).map_err(err)?
+            }
         };
 
         if target.old_path.is_some() {

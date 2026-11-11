@@ -488,6 +488,33 @@ fn commit_details_and_commit_diffs_describe_the_change() {
 }
 
 #[test]
+fn two_commits_compare_across_the_commits_between_them() {
+    let fx = Fixture::new("compare");
+    fx.write("a.txt", "one\n");
+    fx.write("gone.txt", "bye\n");
+    fx.commit_all("base");
+    let base = fx.snapshot().head.oid.unwrap();
+    fx.write("a.txt", "one\ntwo\n");
+    fx.commit_all("second");
+    std::fs::remove_file(fx.dir.join("gone.txt")).unwrap();
+    fx.write("new.txt", "fresh\n");
+    fx.commit_all("third");
+    let tip = fx.snapshot().head.oid.unwrap();
+
+    let files = fx.job(move |loader| loader.compare_files(base, tip)).unwrap();
+    assert_eq!(
+        paths(&files),
+        [("a.txt", ChangeKind::Modified), ("gone.txt", ChangeKind::Deleted), ("new.txt", ChangeKind::Added)]
+    );
+
+    let diff = fx.diff(DiffSource::Compare { from: base, to: tip }, "a.txt");
+    assert_eq!((diff.additions, diff.deletions), (1, 0));
+    // The other way round, what was added is removed.
+    let back = fx.diff(DiffSource::Compare { from: tip, to: base }, "a.txt");
+    assert_eq!((back.additions, back.deletions), (0, 1));
+}
+
+#[test]
 fn tags_and_labels_attach_to_the_right_commits() {
     let fx = Fixture::new("labels");
     fx.write("a.txt", "one\n");
