@@ -28,6 +28,9 @@ signing, credential helpers and the user's config behave as in a terminal.
 | --- | --- |
 | Read something from the repository without blocking the UI | `tab.spawn_job("feature:key", \|loader\| ...)` then `tab.take_result::<T>("feature:key")` on a later frame. The closure gets a `&Loader`; `loader.repo()` is the `git2::Repository`. It may also shell out with `git::cli::run`. |
 | Change the repository | Build a `GitCmd` (`src/git/ops.rs`: `GitCmd::new`, `.step`, `GitCmd::empty` + `Step::new(...).env(...)`) and call `tab.run(cmd)`. Progress, toasts and the refresh afterwards are automatic. Name it with a short imperative label; set `.done("Past tense")` for the success toast; `.quiet()` for routine operations. |
+| Do something git has no command for (write a file) as a step of a command | `cmd.steps.push(Step::internal(Internal::new("what", move \|workdir\| ...)))` (`src/git/internal.rs`): it runs on the operator thread in its turn, its `Err` stops the command and becomes its error toast, its `Ok` text joins the output. `.undoable(UndoKind::Files(FileUndo { files: vec![FileState::new(path)], undo_steps }))` makes it undoable: the operator reads each file before and after; undo writes back what was there (refusing if the file changed since), then runs `undo_steps`; redo replays the command. `git::ignore::append_step` adds a line to an ignore file this way. |
+| Ignore a path, or stash some of the changes | `git::ignore` (patterns that match exactly one file, folder or extension; `ignore(pattern, file, target, untrack)`), `ui::ignore::open`; `git::stash::push(&StashOptions { .. })`, `ui::stash::open` (or `Dialog::Stash(Box::new(StashForm::paths(..)))`). |
+| Know what the installed git supports | `git::cli::known_version()` is what `git --version` last answered (no process started); `git::stash::parse_version` reads it. |
 | Change several branches and tags in one undoable operation | `.undoable(UndoKind::Refs(vec![RefMove::new("refs/heads/develop"), ...]))`: the operator notes where each ref pointed before and after; undo and redo move them all back (or forth), HEAD included, and refuse if one has moved since. `git::gitflow::finish` uses it. |
 | Say what is left when an operation stops on conflicts | `.after_conflict("Finish … again once the merge is committed.")` on the `GitCmd`: added to the "stopped on conflicts" toast. |
 | Know whether the repository uses Gitflow | `snap.gitflow` (`git::gitflow::Config`, read with every snapshot); `ui::gitflow::open_start` / `open_finish` open the dialogs. |
@@ -152,7 +155,16 @@ front, and the global and repository git configuration files.
 - **libgit2 revwalk**: any sort mode makes it walk all of history first. See
   `Loader::walk` for how the history page stays O(page size).
 - `GIT_LITERAL_PATHSPECS` breaks `git stash push --include-untracked`; it is
-  therefore set per step (`Step::with_paths`), not globally.
+  therefore set per step (`Step::with_paths`), not globally. `git::stash`
+  makes stash paths literal with `:(literal)` instead.
+- **`git stash push` traps** (git 2.51): with `--staged` and paths it puts
+  the working files of every other staged file back to HEAD too, and
+  `--pathspec-from-file` is refused; `--staged` saves the stash before
+  reverse-applying the staged changes to the working tree, so unstaged
+  edits next to staged lines leave the stash saved and nothing removed
+  (`git::stash::staged_check` dry-runs that); a path only HEAD has (a
+  staged deletion, a rename's old name) is refused, or with
+  `--include-untracked` the stash is saved and then the command fails.
 - **git-lfs sets itself up** in a repository on most commands, even ones
   that only list (`git lfs track`, `git lfs ls-files`): it installs its
   hooks and writes `lfs.repositoryformatversion` to `.git/config`. Ask

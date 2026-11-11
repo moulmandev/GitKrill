@@ -78,7 +78,8 @@ pub enum Dialog {
     CreateBranch { at: Option<String>, at_label: String, name: String, checkout: bool },
     RenameBranch { old: String, name: String },
     CreateTag { at: String, at_label: String, name: String, message: String },
-    Stash { message: String },
+    /// "Stash changes", with its options; see `ui::stash`.
+    Stash(Box<crate::ui::stash::StashForm>),
     Confirm { title: String, body: String, button: String, danger: bool, cmd: GitCmd },
     PushRejected,
     Clone { url: String, dest: String },
@@ -97,6 +98,8 @@ pub enum Dialog {
     DeleteFolder(Box<crate::ui::branch_folder::DeleteForm>),
     /// Git is missing: the offer to get it; see `ui::git_setup`.
     GitSetup,
+    /// Add a pattern to `.gitignore`; see `ui::ignore`.
+    Ignore(Box<crate::ui::ignore::IgnoreForm>),
 }
 
 impl Dialog {

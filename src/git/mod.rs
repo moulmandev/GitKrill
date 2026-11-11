@@ -13,11 +13,14 @@ pub mod diff;
 pub mod gitflow;
 pub mod graph;
 pub mod hidden;
+pub mod ignore;
+pub mod internal;
 pub mod lfs;
 pub mod ops;
 pub mod picture;
 pub mod rebase;
 pub mod repo;
+pub mod stash;
 pub mod text;
 
 use std::collections::HashMap;

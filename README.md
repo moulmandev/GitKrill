@@ -134,6 +134,13 @@ be installed.
 - Git LFS (Preferences > LFS): set it up in a repository, add and remove
   tracked patterns (or "Track *.psd with LFS" from a file's menu), fetch and
   pull LFS objects
+- Ignore a changed file from its right-click menu: the file itself, every
+  file with its extension, or one of its folders (folder rows have "Ignore
+  folder" too). The pattern can be edited before it goes in the root
+  `.gitignore` or only in this clone (`.git/info/exclude`), and the dialog
+  says how many changed files it hides. For a tracked file, "Stop tracking
+  and ignore" also takes it out of the index; it stays on disk. Undo takes
+  the line out again
 - Changes made outside the app (editor, terminal) appear on their own
 
 **Conflicts**
@@ -159,7 +166,11 @@ be installed.
 - Interactive rebase: pick, reword, squash, fixup, drop and reorder
 - File history (following renames) and blame, from any file's context menu
 - Tags: create (lightweight or annotated), delete, push
-- Stash, apply, pop, delete
+- Stash, apply, pop, delete. The stash dialog (right-click the WIP row, or
+  "Stash…" in the command palette) takes a message and can leave untracked
+  files out, keep the staged changes, or stash only the staged changes
+  (Git 2.35 or later). "Stash this file" and "Stash folder" in the
+  changed-file lists stash just that
 - Gitflow without the git-flow program: set it up in **Preferences > Gitflow**
   (the same `gitflow.*` settings git-flow uses), then start and finish
   features, releases and hotfixes from Gitflow in the branch menu, a branch's
