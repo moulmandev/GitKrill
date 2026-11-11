@@ -155,7 +155,10 @@ be installed.
   Swift, Dart, PowerShell, Dockerfile, Vue, Svelte, TOML, Zig, Terraform
   and the like). Colours follow the whole file, in the inline and side by
   side layouts and the whole-file view alike: a hunk that starts inside a
-  block comment or a multi-line string is coloured as one
+  block comment or a multi-line string is coloured as one. In files over
+  1 MB or 20,000 lines (up to 16 MB), each hunk shows its own colours first
+  while the lines between the hunks are parsed in the background, for up to
+  20 seconds, and takes the right ones once that gets to it
 - Diffs inline or side by side (the old version on the left, the new one on
   the right, unchanged lines level), as the changed hunks or the whole file,
   and with or without whitespace changes (`git diff -w`): switches in the
@@ -666,9 +669,10 @@ build.rs         the Windows executable's icon and version details
 - UTF-16 without a byte order mark and with no Latin text in it is only
   told from other data when its first 4 KiB have a line break or a space
   (or the repository is set to UTF-16)
-- In files over 1 MB or 20,000 lines, syntax colours start afresh at every
-  hunk: a block comment or string that runs across the start of a hunk is
-  coloured as if it did not
+- In files over 16 MB, and past what 20 seconds of parsing get through in a
+  large file (from 70,000 to 200,000 lines of Rust, more of simpler
+  formats), syntax colours start afresh at every hunk: a block comment or
+  string that runs across the start of a hunk is coloured as if it did not
 - X.509 (gpgsm) signing keys with a passphrase still need gpg-agent's own
   pinentry: GitKrill asks only for OpenPGP and SSH keys
 - Autosquash only folds fixups whose commit comes after the last merge

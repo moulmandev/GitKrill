@@ -21,8 +21,23 @@ const CONTEXT: u32 = 3;
 const WHOLE_FILE_CONTEXT: u32 = 1 << 24;
 /// A diff of the hunks of a file no larger than this (either version) comes
 /// with all its lines (`FileDiff::whole`), so that syntax colours can follow
-/// the file from its start. Larger files are coloured hunk by hunk.
+/// the file from its start, unless they are more than
+/// [`WHOLE_FOR_COLOURS_LINES`] lines or [`WHOLE_FOR_COLOURS_TEXT`] bytes of
+/// text (both versions together): colouring every line from the top would
+/// take too long then. Such files, and larger ones up to
+/// [`NEW_FILE_FOR_COLOURS_BYTES`], come with their new version instead
+/// (`FileDiff::new_file`), which the colours of each hunk are carried
+/// through.
 pub const WHOLE_FOR_COLOURS_BYTES: u64 = 1024 * 1024;
+/// See [`WHOLE_FOR_COLOURS_BYTES`].
+pub const WHOLE_FOR_COLOURS_LINES: usize = 20_000;
+/// See [`WHOLE_FOR_COLOURS_BYTES`].
+pub const WHOLE_FOR_COLOURS_TEXT: usize = 1_500_000;
+/// See [`WHOLE_FOR_COLOURS_BYTES`]. The bytes are kept with the diff, and
+/// the highlighter gives up on most code well before the end of a larger
+/// file (`ui::highlight`, `CARRY_MAX_TIME`). Larger files are coloured hunk
+/// by hunk, each hunk from the syntax's initial state.
+pub const NEW_FILE_FOR_COLOURS_BYTES: u64 = 16 * 1024 * 1024;
 
 // ---- how a diff is worked out ---------------------------------------------------
 
@@ -109,13 +124,21 @@ impl Loader {
         } else if mode.whole_file && !out.binary && !out.hunks.is_empty() {
             let (whole, _) = self.collect(target, mode, WHOLE_FILE_CONTEXT, format)?;
             fill_gaps(&mut out, whole);
+            if out.too_long_for_whole_file && crate::prefs::editor::look().highlight && let Some((_, new)) = blobs {
+                out.new_file = self.new_file(target, new, &out);
+            }
         } else if !out.binary
             && !out.hunks.is_empty()
             && crate::prefs::editor::look().highlight
-            && blobs.is_some_and(|(old, new)| self.small_for_colours(target, old, new, out.kind))
+            && let Some((old, new)) = blobs
         {
-            let (whole, _) = self.collect(target, mode, WHOLE_FILE_CONTEXT, format)?;
-            out.whole = only_hunk(whole);
+            if self.small_for_colours(target, old, new, out.kind) {
+                let (whole, _) = self.collect(target, mode, WHOLE_FILE_CONTEXT, format)?;
+                out.whole = only_hunk(whole).filter(|whole| one_stream(whole));
+            }
+            if out.whole.is_none() {
+                out.new_file = self.new_file(target, new, &out);
+            }
         }
 
         // An SVG is text, and a picture too: both versions drawn, unless one
@@ -321,6 +344,33 @@ impl Loader {
         [blob_size(old), new_size].iter().all(|size| size.is_some_and(|size| size <= WHOLE_FOR_COLOURS_BYTES))
     }
 
+    /// The new version of the file of `diff` (blob `new`, or the working tree
+    /// file), for colours carried from hunk to hunk (`FileDiff::new_file`):
+    /// only when it has lines the hunks leave out, and is no larger than
+    /// [`NEW_FILE_FOR_COLOURS_BYTES`].
+    fn new_file(&self, target: &DiffTarget, new: git2::Oid, diff: &FileDiff) -> Option<std::sync::Arc<super::NewFile>> {
+        if !has_unchanged_lines(diff) {
+            return None;
+        }
+        let repo = &self.repo;
+        let (bytes, id) = if target.source.reads_working_tree() {
+            let file = repo.workdir()?.join(&target.path);
+            if std::fs::metadata(&file).ok()?.len() > NEW_FILE_FOR_COLOURS_BYTES {
+                return None;
+            }
+            let bytes = std::fs::read(&file).ok()?;
+            let id = super::Oid::hash_object(git2::ObjectType::Blob, &bytes).ok()?;
+            (bytes, id)
+        } else {
+            let (size, _) = repo.odb().ok()?.read_header(new).ok()?;
+            if size as u64 > NEW_FILE_FOR_COLOURS_BYTES {
+                return None;
+            }
+            (repo.find_blob(new).ok()?.content().to_vec(), new)
+        };
+        Some(std::sync::Arc::new(super::NewFile { bytes, id }))
+    }
+
     /// UTF-16 is binary to git: it is full of zero bytes. When a version of
     /// the file is UTF-16 (`text::utf16_encoding`: a byte order mark, the
     /// repository set to UTF-16, or text that plainly is), both are turned
@@ -400,10 +450,16 @@ impl Loader {
                 Some(FileDiff { hunks: whole.hunks, truncated: whole.truncated, max_chars: whole.max_chars, ..FileDiff::default() })
             };
             let small = [&old_text, &new_text].iter().all(|text| text.len() as u64 <= WHOLE_FOR_COLOURS_BYTES);
+            let colours = crate::prefs::editor::look().highlight;
             if mode.whole_file {
                 fill_gaps(out, whole()?);
-            } else if small && crate::prefs::editor::look().highlight {
-                out.whole = whole().and_then(only_hunk);
+            } else if small && colours {
+                out.whole = whole().and_then(only_hunk).filter(|whole| one_stream(whole));
+            }
+            let carried = colours && out.whole.is_none() && (!mode.whole_file || out.too_long_for_whole_file);
+            if carried && has_unchanged_lines(out) && new_text.len() as u64 <= NEW_FILE_FOR_COLOURS_BYTES {
+                let id = super::Oid::hash_object(git2::ObjectType::Blob, new_text.as_bytes()).ok();
+                out.new_file = id.map(|id| std::sync::Arc::new(super::NewFile { bytes: new_text.clone().into_bytes(), id }));
             }
         }
 
@@ -470,6 +526,22 @@ fn patch_lines(patch: &git2::Patch, format: &text::Format) -> Option<PatchLines>
 }
 
 // ---- the whole file -----------------------------------------------------------------
+
+/// Whether every line of a file (`whole`, as from [`only_hunk`]) is few
+/// enough to be coloured from the top as one stream.
+fn one_stream(whole: &Hunk) -> bool {
+    whole.lines.len() <= WHOLE_FOR_COLOURS_LINES
+        && whole.lines.iter().map(|line| line.text.len()).sum::<usize>() <= WHOLE_FOR_COLOURS_TEXT
+}
+
+/// Whether the hunks of `diff` leave lines of the file out: lines that are
+/// the same in both versions, which colours have to be carried through.
+/// Not for a file added or deleted whole.
+fn has_unchanged_lines(diff: &FileDiff) -> bool {
+    use super::ChangeKind::{Added, Deleted, Untracked};
+    let starts_late = |hunk: &Hunk| hunk.lines.first().is_some_and(|line| line.new_no.or(line.old_no).is_some_and(|n| n > 1));
+    !matches!(diff.kind, Some(Added | Deleted | Untracked)) && (diff.hunks.len() > 1 || diff.hunks.iter().any(starts_late))
+}
 
 /// The one hunk of a diff worked out with a context that takes in the whole
 /// file, unless it was cut short.
@@ -1636,12 +1708,38 @@ mod tests {
         // A whole-file diff has them all already.
         assert!(diff_in(&fx, Unstaged, "lib.rs", WHOLE).whole.is_none());
 
-        // Too large: hunk by hunk.
+        // Too many lines to colour from the top: the new version comes
+        // instead, for colours carried from hunk to hunk.
         let big = numbered(1..=60_000);
         fx.write("big.txt", &big);
         fx.commit_all("big");
-        fx.write("big.txt", &big.replace("line 7\n", "line seven\n"));
-        assert!(diff_in(&fx, Unstaged, "big.txt", Mode::default()).whole.is_none());
+        let changed = big.replace("line 7\n", "line seven\n").replace("line 50000\n", "line fifty thousand\n");
+        fx.write("big.txt", &changed);
+        let diff = diff_in(&fx, Unstaged, "big.txt", Mode::default());
+        assert!(diff.whole.is_none());
+        let file = diff.new_file.as_ref().expect("the new version comes along");
+        assert_eq!(file.bytes, changed.as_bytes());
+        // So it does for a whole-file diff too long to show whole.
+        let whole = diff_in(&fx, Unstaged, "big.txt", WHOLE);
+        assert!(whole.too_long_for_whole_file && whole.new_file.is_some());
+
+        // Larger than WHOLE_FOR_COLOURS_BYTES, staged: the index's version.
+        let large: String = (1..=40_000).map(|i| format!("line {i} with some more text to make it long\n")).collect();
+        assert!(large.len() as u64 > super::WHOLE_FOR_COLOURS_BYTES);
+        fx.write("large.txt", &large);
+        fx.commit_all("large");
+        let staged = large.replace("line 30000 ", "line thirty thousand ");
+        fx.write("large.txt", &staged);
+        git(&fx.dir, &["add", "large.txt"]);
+        fx.write("large.txt", "something else\n");
+        let diff = diff_in(&fx, Staged, "large.txt", Mode::default());
+        assert_eq!(diff.new_file.as_ref().map(|file| file.bytes.as_slice()), Some(staged.as_bytes()));
+        let id = diff.new_file.as_ref().unwrap().id;
+        assert_eq!(id.to_string(), git(&fx.dir, &["rev-parse", ":large.txt"]));
+
+        // A file added whole has no lines between its hunks.
+        fx.write("added.txt", &big);
+        assert!(diff_in(&fx, Unstaged, "added.txt", Mode::default()).new_file.is_none());
     }
 
     #[test]

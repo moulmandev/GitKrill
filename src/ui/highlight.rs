@@ -23,13 +23,26 @@
 //! string is coloured as such. Until the stream has got that far, a line
 //! shows the colours of the same line in the version of the file shown
 //! before (after staging, or saving in an editor), or else those of its
-//! hunk parsed on its own, which is quick. Files of more than
-//! [`STREAM_MAX_LINES`] lines (or [`STREAM_MAX_BYTES`]) are coloured hunk by
-//! hunk only, each hunk starting in the syntax's initial state.
+//! hunk parsed on its own, which is quick.
+//!
+//! Files of more than [`STREAM_MAX_LINES`] lines (or [`STREAM_MAX_BYTES`]),
+//! whose diff of the hunks comes with the file's new version instead
+//! (`FileDiff::new_file`), are not coloured line by line from the top: that
+//! would keep the colours of every line, and take long. Each hunk is
+//! coloured on its own first; then the parser is carried through the lines
+//! between the hunks, which are not coloured, and each hunk is parsed again
+//! from the state it starts in ([`Carried`]). Where that differs from what
+//! the hunk shows already (it starts inside a block comment or a string),
+//! its new colours take over. That goes on for [`CARRY_MAX_TIME`] at most;
+//! hunks it has not reached by then keep their own colours. A whole-file
+//! diff of such a file is coloured from the top for its first
+//! [`STREAM_MAX_LINES`] lines, the rest left plain, as the hunks of any
+//! diff are past [`MAX_LINES`].
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, RwLock, RwLockReadGuard, Weak};
 use std::time::{Duration, Instant};
 
@@ -37,6 +50,7 @@ use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{self, Color32, FontId};
 use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxDefinition, SyntaxSet, SyntaxSetBuilder};
 
+use crate::git::text::display_text_in;
 use crate::git::{DiffLine, FileDiff, Hunk};
 use crate::theme;
 
@@ -60,10 +74,20 @@ const RECENT_DIFFS: usize = 6;
 /// Finished lines are published this many at a time.
 const BATCH: usize = 256;
 /// Files with more lines than this (both versions together, as a whole-file
-/// diff shows them) are coloured hunk by hunk instead of from the top.
-pub const STREAM_MAX_LINES: usize = 20_000;
+/// diff shows them) are not coloured from the top line by line; the loader
+/// leaves out `FileDiff::whole` past it.
+pub const STREAM_MAX_LINES: usize = crate::git::diff::WHOLE_FOR_COLOURS_LINES;
 /// The same limit in bytes.
-pub const STREAM_MAX_BYTES: usize = 1_500_000;
+pub const STREAM_MAX_BYTES: usize = crate::git::diff::WHOLE_FOR_COLOURS_TEXT;
+/// How long the parser is carried through a large file at most, in time
+/// spent on it, for colours of its hunks that follow the file ([`Carried`]).
+/// It gets through some 4,000 to 11,000 lines of Rust a second and 24,000
+/// of JSON (`carry_speed` in the tests; the release build is no faster, the
+/// time goes in syntect), so this covers files of 70,000 lines and more,
+/// several megabytes. It runs on the highlight thread only while the diff
+/// is shown and nothing newer waits; past it, the hunks not reached keep
+/// their own colours.
+const CARRY_MAX_TIME: Duration = Duration::from_secs(20);
 /// No line: in a map from shown lines to the lines of a stream.
 const NONE: u32 = u32::MAX;
 
@@ -413,7 +437,7 @@ pub struct Span {
 
 /// Coloured runs for the first lines of a hunk; it grows while the
 /// background thread works through the hunk.
-#[derive(Default)]
+#[derive(Default, Clone, PartialEq, Debug)]
 struct Lines {
     /// Per finished line, where its runs end in `spans`.
     ends: Vec<u32>,
@@ -445,6 +469,65 @@ pub struct DiffStyle {
     hunks: Vec<Arc<HunkStyle>>,
     /// The colours of the whole file, when the diff has all its lines.
     stream: Option<StreamLink>,
+    /// The colours of its hunks parsed from the state the file is in where
+    /// each starts, when the file is too large for `stream`.
+    carried: Option<Arc<Carried>>,
+}
+
+/// The colours of the hunks of a file too large to colour from the top
+/// (see the module comment): what the parser makes of each hunk when it is
+/// carried there through the lines before it, which come from
+/// `FileDiff::new_file` and are parsed without keeping their colours. Shared
+/// by every diff with the same hunks of the same file, and worked out while
+/// one of them is shown.
+pub struct Carried {
+    /// Per hunk: its lines coloured from where the file is at its start, set
+    /// all at once when the parser is done with it; empty when those are the
+    /// colours the hunk has on its own. Until the parser gets there, the
+    /// colours of the same hunk in the version shown before, if any.
+    hunks: Vec<RwLock<Lines>>,
+    /// Per hunk: how many of its lines are coloured (the diff's share of
+    /// [`MAX_LINES`]), and its own colours, to compare with.
+    limits: Vec<usize>,
+    own: Vec<Weak<HunkStyle>>,
+    /// Per hunk: its content key and the line of the new version it starts
+    /// at, to find it again in the next version of the diff.
+    marks: Vec<(u64, u32)>,
+    /// How many hunks, from the first, are done.
+    reached: AtomicUsize,
+    /// The parser stopped short: out of time, or the file did not match.
+    given_up: AtomicBool,
+    link: Mutex<CarryLink>,
+}
+
+/// Who a [`Carried`] works for.
+#[derive(Default)]
+struct CarryLink {
+    /// The diffs it was asked for. While none of them is alive (the diff was
+    /// closed, or replaced by one of other content), the work stops.
+    users: Vec<Weak<FileDiff>>,
+    /// Its job, set aside while nobody shows it; a diff that shows it again
+    /// puts it back in the queue.
+    parked: Option<Job>,
+}
+
+impl Carried {
+    /// Whether some diff it is for is alive besides `mine`, which the
+    /// worker holds while it reads from it.
+    fn shown(&self, mine: &Arc<FileDiff>) -> bool {
+        if Arc::strong_count(mine) > 1 {
+            return true;
+        }
+        let link = self.link.lock().unwrap_or_else(|e| e.into_inner());
+        link.users.iter().any(|user| user.strong_count() > 0 && !std::ptr::eq(user.as_ptr(), Arc::as_ptr(mine)))
+    }
+
+    /// A diff it is for that is still alive.
+    fn user(&self) -> Option<Arc<FileDiff>> {
+        let mut link = self.link.lock().unwrap_or_else(|e| e.into_inner());
+        link.users.retain(|user| user.strong_count() > 0);
+        link.users.iter().find_map(Weak::upgrade)
+    }
 }
 
 /// Where the lines of a diff are in the stream of every line of the file
@@ -473,6 +556,8 @@ pub struct HunkView<'a> {
     syntax: RwLockReadGuard<'a, Lines>,
     emphasis: &'a [Stretch],
     stream: Option<StreamView<'a>>,
+    /// The hunk's colours from the file's state where it starts.
+    carried: Option<RwLockReadGuard<'a, Lines>>,
 }
 
 /// One hunk's part of a [`StreamLink`], while it is painted.
@@ -503,7 +588,8 @@ impl DiffStyle {
                 seed: link.seed.as_ref().map(|seed| (read(&seed.style.syntax), seed.map.as_slice())),
             })
         });
-        Some(HunkView { syntax: read(&hunk.syntax), emphasis: hunk.emphasis.get().map_or(&[], Vec::as_slice), stream })
+        let carried = self.carried.as_ref().and_then(|carried| carried.hunks.get(index)).map(read);
+        Some(HunkView { syntax: read(&hunk.syntax), emphasis: hunk.emphasis.get().map_or(&[], Vec::as_slice), stream, carried })
     }
 }
 
@@ -526,6 +612,9 @@ impl HunkView<'_> {
     /// Coloured runs of a line; empty while (or if) it is not highlighted.
     pub fn spans(&self, line: usize) -> &[Span] {
         if let Some(spans) = self.stream.as_ref().and_then(|stream| stream.spans(line)) {
+            return spans;
+        }
+        if let Some(spans) = self.carried.as_ref().and_then(|carried| carried.get(line)) {
             return spans;
         }
         self.syntax.get(line).unwrap_or(&[])
@@ -593,21 +682,47 @@ enum Part {
 }
 
 struct Job {
-    /// Kept alive so the work stays valid if the view moves on to a reloaded
-    /// copy of the same diff, which shares the output below.
-    diff: Arc<FileDiff>,
-    part: Part,
-    /// How many of the lines to parse (0: emphasis only).
-    limit: usize,
+    task: Task,
     file_name: Arc<str>,
-    /// Dead once no diff shows this hunk any more; the job is then skipped.
-    out: Weak<HunkStyle>,
     ctx: egui::Context,
     /// Which request the job came with; later requests have higher numbers
     /// and go first.
     request: u64,
-    /// Where parsing stopped, if the job stepped aside for a later request.
-    progress: Option<Box<Progress>>,
+}
+
+enum Task {
+    /// Colours lines of a diff.
+    Colour {
+        /// Kept alive so the work stays valid if the view moves on to a
+        /// reloaded copy of the same diff, which shares the output below.
+        diff: Arc<FileDiff>,
+        part: Part,
+        /// How many of the lines to parse (0: emphasis only).
+        limit: usize,
+        /// Dead once no diff shows this hunk any more; the job is then
+        /// skipped.
+        out: Weak<HunkStyle>,
+        /// Where parsing stopped, if the job stepped aside for a later
+        /// request.
+        progress: Option<Box<Progress>>,
+    },
+    /// Carries the parser through a large file for its hunks' colours. It
+    /// holds no diff: it reads from one of `Carried::link`'s while it runs.
+    Carry {
+        /// Dead once no diff style has it; the job is then dropped.
+        out: Weak<Carried>,
+        /// How far it has come.
+        progress: Option<Box<Carry>>,
+    },
+}
+
+/// What becomes of a job once the worker stops working on it.
+enum Next {
+    Done,
+    /// Back in the queue: it stepped aside for a later request.
+    Again,
+    /// Set aside in its [`Carried`] until a diff shows that again.
+    Park(Arc<Carried>),
 }
 
 #[derive(Default)]
@@ -629,6 +744,11 @@ struct State {
     /// The stream last coloured for each of the files shown lately, by
     /// path, newest first: what the next version of the file is seeded from.
     streams: VecDeque<(Arc<str>, Arc<FileDiff>, Arc<HunkStyle>)>,
+    /// Carried colours that are still referenced, by content hash.
+    carried: HashMap<u64, Weak<Carried>>,
+    /// The carried colours last asked for each of the large files shown
+    /// lately, by path, newest first: what the next version is seeded from.
+    carried_by_path: VecDeque<(Arc<str>, Weak<Carried>)>,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
@@ -733,6 +853,8 @@ fn seed_map(stream: &[&DiffLine], earlier: &[&DiffLine]) -> Vec<u32> {
 /// The stream of `diff` and how its shown lines map onto it, if it has one
 /// small enough. A stream not coloured yet gets a job in `jobs`, and the
 /// colours of the version of the file at `path` shown before as its seed.
+/// A whole-file diff of a file too long for that is coloured from the top
+/// for its first lines only, as many as the hunks of any diff would be.
 fn link_stream(
     state: &mut State,
     diff: &Arc<FileDiff>,
@@ -741,8 +863,19 @@ fn link_stream(
     mut job: impl FnMut(Part, usize, &Arc<HunkStyle>),
 ) -> Option<StreamLink> {
     let lines = stream_of(diff);
-    let bytes: usize = lines.iter().map(|line| line.text.len()).sum();
-    if lines.len() > STREAM_MAX_LINES || bytes > STREAM_MAX_BYTES || !in_file_order(&lines) {
+    if !in_file_order(&lines) {
+        return None;
+    }
+    let mut bytes = 0;
+    let limit = lines
+        .iter()
+        .take(STREAM_MAX_LINES)
+        .take_while(|line| {
+            bytes += line.text.len();
+            bytes <= STREAM_MAX_BYTES
+        })
+        .count();
+    if diff.whole.is_some() && limit < lines.len() {
         return None;
     }
     let map = match diff.whole {
@@ -758,8 +891,8 @@ fn link_stream(
     starts.push(total);
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    ("stream", &**file_name).hash(&mut hasher);
-    for line in &lines {
+    ("stream", &**file_name, limit).hash(&mut hasher);
+    for line in &lines[..limit] {
         (line.origin, line.text.as_str()).hash(&mut hasher);
     }
     let key = hasher.finish();
@@ -770,7 +903,7 @@ fn link_stream(
         None => {
             let style = Arc::new(HunkStyle::default());
             state.hunks.insert(key, Arc::downgrade(&style));
-            job(Part::Stream, lines.len(), &style);
+            job(Part::Stream, limit, &style);
             let seed = earlier
                 .as_ref()
                 .map(|(_, diff, style)| Seed { style: style.clone(), map: seed_map(&lines, &stream_of(diff)) });
@@ -780,6 +913,79 @@ fn link_stream(
     state.streams.push_front((path, diff.clone(), style.clone()));
     state.streams.truncate(RECENT_DIFFS);
     Some(StreamLink { style, starts, map, seed })
+}
+
+/// The carried colours of `diff` (see [`Carried`]), if it comes with its
+/// file's new version: shared with the diffs of the same hunks of the same
+/// file, or made anew (and then returned with its job), seeded from the
+/// version of the file at `path` shown before. `keys`, `limits` and `own`
+/// are the content key, the number of lines to colour and the styling of
+/// each hunk, as [`style_for`] worked them out. A job that was set aside
+/// because nobody showed the colours any more comes back to be queued.
+fn link_carried(
+    state: &mut State,
+    diff: &Arc<FileDiff>,
+    path: &str,
+    file_name: &Arc<str>,
+    (keys, limits, own): (&[u64], &[usize], &[Arc<HunkStyle>]),
+    job: impl FnOnce(Weak<Carried>) -> Job,
+) -> (Option<Arc<Carried>>, Option<Job>) {
+    let Some(file) = &diff.new_file else { return (None, None) };
+    if diff.hunks.iter().any(|hunk| hunk.gap) || limits.iter().all(|limit| *limit == 0) {
+        return (None, None);
+    }
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    ("carried", &**file_name, file.id, diff.format.encoding, diff.format.tab_width, keys, limits).hash(&mut hasher);
+    let key = hasher.finish();
+    let path: Arc<str> = path.into();
+    let earlier = state.carried_by_path.iter().position(|(known, _)| *known == path).and_then(|i| state.carried_by_path.remove(i));
+
+    let (carried, job) = match state.carried.get(&key).and_then(Weak::upgrade) {
+        Some(carried) => {
+            let parked = {
+                let mut link = carried.link.lock().unwrap_or_else(|e| e.into_inner());
+                link.users.push(Arc::downgrade(diff));
+                link.parked.take()
+            };
+            (carried, parked)
+        }
+        None => {
+            let marks: Vec<(u64, u32)> =
+                diff.hunks.iter().zip(keys).map(|(hunk, key)| (*key, new_range(&hunk.header).map_or(0, |(first, _)| first))).collect();
+            // The hunks the earlier version had too, at the same place, take
+            // the colours the parser gave them there until it gets to them.
+            let earlier = earlier.as_ref().and_then(|(_, carried)| carried.upgrade());
+            let seeds: HashMap<(u64, u32), usize> = earlier.as_ref().map_or_else(HashMap::new, |earlier| {
+                let done = earlier.reached.load(Ordering::Acquire).min(earlier.marks.len());
+                earlier.marks[..done].iter().enumerate().map(|(i, mark)| (*mark, i)).collect()
+            });
+            let hunks = marks
+                .iter()
+                .map(|mark| {
+                    let seed = earlier.as_ref().zip(seeds.get(mark)).map(|(earlier, &i)| read(&earlier.hunks[i]).clone());
+                    RwLock::new(seed.unwrap_or_default())
+                })
+                .collect();
+            let carried = Arc::new(Carried {
+                hunks,
+                limits: limits.to_vec(),
+                own: own.iter().map(Arc::downgrade).collect(),
+                marks,
+                reached: AtomicUsize::new(0),
+                given_up: AtomicBool::new(false),
+                link: Mutex::new(CarryLink { users: vec![Arc::downgrade(diff)], parked: None }),
+            });
+            state.carried.insert(key, Arc::downgrade(&carried));
+            if state.carried.len() > 256 {
+                state.carried.retain(|_, carried| carried.strong_count() > 0);
+            }
+            let job = job(Arc::downgrade(&carried));
+            (carried, Some(job))
+        }
+    };
+    state.carried_by_path.push_front((path, Arc::downgrade(&carried)));
+    state.carried_by_path.truncate(RECENT_DIFFS);
+    (Some(carried), job)
 }
 
 /// The styling for `diff`, a file called `path`: syntax colours when
@@ -802,14 +1008,10 @@ pub fn style_for(ctx: &egui::Context, diff: &Arc<FileDiff>, path: &str, syntax: 
     let request = state.requests + 1;
     let mut jobs = Vec::new();
     let new_job = |part: Part, limit: usize, style: &Arc<HunkStyle>| Job {
-        diff: diff.clone(),
-        part,
-        limit,
+        task: Task::Colour { diff: diff.clone(), part, limit, out: Arc::downgrade(style), progress: None },
         file_name: file_name.clone(),
-        out: Arc::downgrade(style),
         ctx: ctx.clone(),
         request,
-        progress: None,
     };
 
     // The whole file, when the diff has it all; its job goes after those of
@@ -826,6 +1028,7 @@ pub fn style_for(ctx: &egui::Context, diff: &Arc<FileDiff>, path: &str, syntax: 
     let shown_is_stream = stream.as_ref().is_some_and(|link| link.map.is_none());
     let (mut lines_left, mut bytes_left) = if syntax && !shown_is_stream { (MAX_LINES, MAX_BYTES) } else { (0, 0) };
     let mut hunks = Vec::with_capacity(diff.hunks.len());
+    let (mut keys, mut limits) = (Vec::with_capacity(diff.hunks.len()), Vec::with_capacity(diff.hunks.len()));
     for (index, hunk) in diff.hunks.iter().enumerate() {
         let mut limit = 0;
         for line in hunk.lines.iter().take(lines_left) {
@@ -855,10 +1058,28 @@ pub fn style_for(ctx: &egui::Context, diff: &Arc<FileDiff>, path: &str, syntax: 
             }
         };
         hunks.push(style);
+        keys.push(key);
+        limits.push(limit);
     }
     jobs.extend(stream_job);
 
-    let style = Arc::new(DiffStyle { hunks, stream });
+    // A large file's hunks parsed again from where the file is at each:
+    // after the hunks' own colours, which show meanwhile.
+    let carried = if syntax && stream.is_none() {
+        let (carried, job) = link_carried(&mut state, diff, path, &file_name, (&keys, &limits, &hunks), |out| Job {
+            task: Task::Carry { out, progress: None },
+            file_name: file_name.clone(),
+            ctx: ctx.clone(),
+            request,
+        });
+        // One set aside by an earlier diff carries on for this one.
+        jobs.extend(job.map(|job| Job { ctx: ctx.clone(), request, ..job }));
+        carried
+    } else {
+        None
+    };
+
+    let style = Arc::new(DiffStyle { hunks, stream, carried });
     state.recent.push_front((Arc::downgrade(diff), syntax, style.clone()));
     state.recent.truncate(RECENT_DIFFS);
     if state.hunks.len() > 4096 {
@@ -909,64 +1130,52 @@ fn worker(queue: &Queue) {
                 jobs = queue.ready.wait(jobs).unwrap_or_else(|e| e.into_inner());
             }
         };
-        let Some(out) = job.out.upgrade() else { continue };
-        let diff = job.diff.clone();
-        let hunk = match job.part {
-            Part::Hunk(index) => match diff.hunks.get(index) {
-                Some(hunk) => Some(hunk),
-                None => continue,
-            },
-            Part::Stream => None,
-        };
-        let lines: Vec<&DiffLine> = match hunk {
-            Some(hunk) => hunk.lines.iter().collect(),
-            None => stream_of(&diff),
-        };
         let ctx = job.ctx.clone();
-
+        // Asks for a frame, unless one was asked for lately and `force` is
+        // not set; says whether it did.
         let mut repaint = |force: bool| {
             // Often enough to look live, not so often that a diff of a
             // thousand small hunks asks for a thousand frames.
-            if force || last_repaint.elapsed() > Duration::from_millis(40) {
+            let ask = force || last_repaint.elapsed() > Duration::from_millis(40);
+            if ask {
                 ctx.request_repaint();
                 last_repaint = Instant::now();
             }
+            ask
         };
-        if job.progress.is_none() {
-            let _ = out.emphasis.set(hunk.map(emphasize_hunk).unwrap_or_default());
-            repaint(false);
-        }
-
-        let mut finished = true;
-        if job.limit > 0 {
-            // A later request is for what the user is looking at now.
-            let request = job.request;
-            let overtaken = || {
-                let jobs = queue.jobs.lock().unwrap_or_else(|e| e.into_inner());
-                jobs.front().is_some_and(|next| next.request > request)
-            };
-            // A grammar that trips over some input must not take the thread
-            // (and with it all later highlighting) down.
-            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let engine = engine.get_or_insert_with(Engine::new);
-                if job.progress.is_none() {
-                    let Some(syntax) = engine.syntax_for(&job.file_name) else { return true };
-                    job.progress = engine.start(syntax).map(Box::new);
-                }
-                let Some(progress) = job.progress.as_deref_mut() else { return true };
-                engine.colour_lines(progress, &lines, job.limit, &out, &mut || {
-                    repaint(false);
-                    !overtaken()
-                })
-            }));
-            match outcome {
-                Ok(done) => finished = done,
-                Err(_) => engine = None,
+        // A later request is for what the user is looking at now.
+        let request = job.request;
+        let overtaken = || {
+            let jobs = queue.jobs.lock().unwrap_or_else(|e| e.into_inner());
+            jobs.front().is_some_and(|next| next.request > request)
+        };
+        let next = match &mut job.task {
+            Task::Colour { diff, part, limit, out, progress } => {
+                colour_job(&mut engine, &job.file_name, diff, *part, *limit, out, progress, &mut repaint, &overtaken)
             }
-        }
+            Task::Carry { out, progress } => carry_job(&mut engine, &job.file_name, out, progress, &mut repaint, &overtaken),
+        };
 
+        let again = match next {
+            Next::Done => false,
+            Next::Again => true,
+            Next::Park(carried) => {
+                // Checked again under the lock that a diff showing it takes
+                // to put it back in the queue, so it is never left aside
+                // while one does.
+                let mut link = carried.link.lock().unwrap_or_else(|e| e.into_inner());
+                link.users.retain(|user| user.strong_count() > 0);
+                if link.users.is_empty() {
+                    link.parked = Some(job);
+                    drop(link);
+                    repaint(false);
+                    continue;
+                }
+                true
+            }
+        };
         let mut jobs = queue.jobs.lock().unwrap_or_else(|e| e.into_inner());
-        if !finished {
+        if again {
             // Back in line behind the newer requests, ahead of the rest of
             // its own diff.
             let at = jobs.iter().position(|other| other.request <= job.request).unwrap_or(jobs.len());
@@ -975,6 +1184,114 @@ fn worker(queue: &Queue) {
         let idle = jobs.is_empty();
         drop(jobs);
         repaint(idle);
+    }
+}
+
+/// Works on a [`Task::Colour`]: the word emphasis of a hunk, then the
+/// colours of `limit` of its lines (or of the whole file's).
+#[allow(clippy::too_many_arguments)]
+fn colour_job(
+    engine: &mut Option<Engine>,
+    file_name: &str,
+    diff: &Arc<FileDiff>,
+    part: Part,
+    limit: usize,
+    out: &Weak<HunkStyle>,
+    progress: &mut Option<Box<Progress>>,
+    repaint: &mut dyn FnMut(bool) -> bool,
+    overtaken: &dyn Fn() -> bool,
+) -> Next {
+    let Some(out) = out.upgrade() else { return Next::Done };
+    let hunk = match part {
+        Part::Hunk(index) => match diff.hunks.get(index) {
+            Some(hunk) => Some(hunk),
+            None => return Next::Done,
+        },
+        Part::Stream => None,
+    };
+    let lines: Vec<&DiffLine> = match hunk {
+        Some(hunk) => hunk.lines.iter().collect(),
+        None => stream_of(diff),
+    };
+    if progress.is_none() {
+        let _ = out.emphasis.set(hunk.map(emphasize_hunk).unwrap_or_default());
+        repaint(false);
+    }
+    if limit == 0 {
+        return Next::Done;
+    }
+    // A grammar that trips over some input must not take the thread (and
+    // with it all later highlighting) down.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let engine = engine.get_or_insert_with(Engine::new);
+        if progress.is_none() {
+            let Some(syntax) = engine.syntax_for(file_name) else { return true };
+            *progress = engine.start(syntax).map(Box::new);
+        }
+        let Some(progress) = progress.as_deref_mut() else { return true };
+        engine.colour_lines(progress, &lines, limit, &out, &mut || {
+            repaint(false);
+            !overtaken()
+        })
+    }));
+    match outcome {
+        Ok(true) => Next::Done,
+        Ok(false) => Next::Again,
+        Err(_) => {
+            *engine = None;
+            Next::Done
+        }
+    }
+}
+
+/// Works on a [`Task::Carry`] for as long as a diff it is for is shown, no
+/// later request waits and [`CARRY_MAX_TIME`] is not used up.
+fn carry_job(
+    engine: &mut Option<Engine>,
+    file_name: &str,
+    out: &Weak<Carried>,
+    progress: &mut Option<Box<Carry>>,
+    repaint: &mut dyn FnMut(bool) -> bool,
+    overtaken: &dyn Fn() -> bool,
+) -> Next {
+    let Some(carried) = out.upgrade() else { return Next::Done };
+    let Some(diff) = carried.user() else { return Next::Park(carried) };
+    let started = Instant::now();
+    let spent = progress.as_ref().map_or(Duration::ZERO, |carry| carry.spent);
+    let in_time = || spent + started.elapsed() < CARRY_MAX_TIME;
+    // Nothing shows until a hunk is done: a frame is asked for then only.
+    let mut painted = carried.reached.load(Ordering::Acquire);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let engine = engine.get_or_insert_with(Engine::new);
+        if progress.is_none() {
+            let syntax = engine.syntax_for(file_name)?;
+            *progress = Some(Box::new(engine.start_carry(syntax)?));
+        }
+        let carry = progress.as_deref_mut()?;
+        Some(engine.carry(carry, &diff, &carried, &mut || {
+            let reached = carried.reached.load(Ordering::Acquire);
+            if reached != painted && repaint(false) {
+                painted = reached;
+            }
+            !overtaken() && carried.shown(&diff) && in_time()
+        }))
+    }));
+    if let Some(carry) = progress.as_deref_mut() {
+        carry.spent += started.elapsed();
+    }
+    match outcome {
+        Ok(Some(false)) if !in_time() => {
+            carried.given_up.store(true, Ordering::Relaxed);
+            Next::Done
+        }
+        Ok(Some(false)) if !carried.shown(&diff) => Next::Park(carried),
+        Ok(Some(false)) => Next::Again,
+        Ok(_) => Next::Done,
+        Err(_) => {
+            *engine = None;
+            carried.given_up.store(true, Ordering::Relaxed);
+            Next::Done
+        }
     }
 }
 
@@ -1095,7 +1412,86 @@ impl Engine {
             new: Stream::new(ParseState::new(syntax), grammar.set, names_tell),
             next: 0,
             joined: true,
+            keep_both: false,
         })
+    }
+
+    /// The start of a [`Carry`] through a file in `grammar`.
+    fn start_carry(&self, grammar: Grammar) -> Option<Carry> {
+        let mut sides = self.start(grammar)?;
+        sides.keep_both = true;
+        Some(Carry { sides, hunk: 0, under_way: None, at: 0, line: 1, spent: Duration::ZERO })
+    }
+
+    /// Carries the parser through the file of `diff` (`FileDiff::new_file`)
+    /// from where `carry` is, and colours each hunk afresh from the state it
+    /// finds at its start, into `carried`. `go_on` is asked after every
+    /// batch of lines; when it says no, the rest is left for a later call
+    /// and the result is `false`. `true` once every hunk that gets colours
+    /// is done, or when the file turns out not to be the one the diff was
+    /// made from (`Carried::given_up`).
+    fn carry(&mut self, carry: &mut Carry, diff: &FileDiff, carried: &Carried, go_on: &mut dyn FnMut() -> bool) -> bool {
+        let Some(file) = diff.new_file.as_deref() else { return true };
+        let bytes = file.bytes.as_slice();
+        let give_up = || {
+            carried.given_up.store(true, Ordering::Relaxed);
+            true
+        };
+        let Carry { sides, hunk: index, under_way, at, line, .. } = carry;
+        let mut parsed = 0usize;
+        while let Some(hunk) = diff.hunks.get(*index) {
+            // The hunks past the diff's share of `MAX_LINES` get no colours.
+            let limit = carried.limits.get(*index).copied().unwrap_or(0);
+            if limit == 0 {
+                return true;
+            }
+            if under_way.is_none() {
+                let Some((first, count)) = new_range(&hunk.header) else { return give_up() };
+                // The lines before it: the same in both versions, parsed
+                // for the state they leave, their colours not kept.
+                while *line < first {
+                    let Some(text) = next_line(bytes, at, line) else { return give_up() };
+                    sides.context(self, &display_text_in(text, &diff.format));
+                    parsed += 1;
+                    if parsed.is_multiple_of(BATCH) && !go_on() {
+                        return false;
+                    }
+                }
+                // Its own lines of the new version are the file's next ones:
+                // a file that changed since the diff was made stops here.
+                for shown in hunk.lines.iter().filter(|shown| shown.origin != '-') {
+                    match next_line(bytes, at, line) {
+                        Some(text) if display_text_in(text, &diff.format) == shown.text => {}
+                        _ => return give_up(),
+                    }
+                }
+                // Lines a diff cut short does not show.
+                while *line < first + count && next_line(bytes, at, line).is_some() {}
+                sides.next = 0;
+                *under_way = Some(HunkStyle::default());
+            }
+            let lines: Vec<&DiffLine> = hunk.lines.iter().collect();
+            let Some(scratch) = under_way.as_ref() else { return true };
+            if !self.colour_lines(sides, &lines, limit, scratch, go_on) {
+                return false;
+            }
+            let Some(scratch) = under_way.take() else { return true };
+            let done = scratch.syntax.into_inner().unwrap_or_else(|e| e.into_inner());
+            // Come out as the hunk did on its own (it starts where the
+            // syntax does, as most do): its own colours are right, and stay,
+            // without a second copy of them.
+            let same = carried.own.get(*index).and_then(Weak::upgrade).is_some_and(|own| *read(&own.syntax) == done);
+            if let Some(slot) = carried.hunks.get(*index) {
+                *slot.write().unwrap_or_else(|e| e.into_inner()) = if same { Lines::default() } else { done };
+            }
+            *index += 1;
+            carried.reached.store(*index, Ordering::Release);
+            // Lines of it left unparsed: nothing after it gets colours.
+            if limit < hunk.lines.len() {
+                return true;
+            }
+        }
+        true
     }
 
     /// [`Engine::colour_lines`] for the lines of a hunk.
@@ -1125,13 +1521,14 @@ impl Engine {
         go_on: &mut dyn FnMut() -> bool,
     ) -> bool {
         let lines = &lines[..limit.min(lines.len())];
-        let Progress { old, new, next, joined } = progress;
+        let Progress { old, new, next, joined, keep_both } = progress;
 
         // Context lines belong to both sides. They are coloured from the new
         // side, and fed to the old side only while it still has removed
-        // lines coming that depend on them. While both sides are in the
-        // same state (`joined`), only the new side is parsed, and the old
-        // one takes over its state when the two part.
+        // lines coming that depend on them (to the end with `keep_both`).
+        // While both sides are in the same state (`joined`), only the new
+        // side is parsed, and the old one takes over its state when the two
+        // part.
         let last_removed = lines.iter().rposition(|l| l.origin == '-');
         let any_added = lines.iter().any(|l| l.origin == '+');
 
@@ -1151,6 +1548,11 @@ impl Engine {
                 '-' => old.line(self, &line.text, Some(&mut batch.spans)),
                 '+' => new.line(self, &line.text, Some(&mut batch.spans)),
                 _ if *joined => new.line(self, &line.text, Some(&mut batch.spans)),
+                _ if *keep_both => {
+                    new.line(self, &line.text, Some(&mut batch.spans));
+                    old.line(self, &line.text, None);
+                    *joined = old.same_state(new);
+                }
                 _ if any_added => {
                     new.line(self, &line.text, Some(&mut batch.spans));
                     if last_removed.is_some_and(|last| *next < last) {
@@ -1182,6 +1584,58 @@ struct Progress {
     next: usize,
     /// The two sides are in the same state, kept by `new` alone.
     joined: bool,
+    /// Both sides are kept where they are to the end of the lines, for what
+    /// comes after them (a [`Carry`]), not only as far as their colours need.
+    keep_both: bool,
+}
+
+impl Progress {
+    /// Parses a line both sides have, keeping nothing of its colours.
+    fn context(&mut self, engine: &mut Engine, text: &str) {
+        self.new.line(engine, text, None);
+        if !self.joined {
+            self.old.line(engine, text, None);
+            self.joined = self.old.same_state(&self.new);
+        }
+    }
+}
+
+/// How far the parser has been carried through a large file (see
+/// [`Carried`]).
+struct Carry {
+    /// Both versions of the file, where the parser is in them.
+    sides: Progress,
+    /// The hunk being worked towards, or on.
+    hunk: usize,
+    /// That hunk's colours so far, once its lines are being parsed.
+    under_way: Option<HunkStyle>,
+    /// Where the next line of the new version starts in its bytes, and its
+    /// number.
+    at: usize,
+    line: u32,
+    /// Time spent on it so far.
+    spent: Duration,
+}
+
+/// The lines of the new version a hunk covers, from its header (`@@ -a,b
+/// +c,d @@`): the first one (for none, the one after the place they would
+/// be), and how many.
+fn new_range(header: &str) -> Option<(u32, u32)> {
+    let new = header.strip_prefix("@@ -")?.split(' ').nth(1)?.strip_prefix('+')?;
+    let mut numbers = new.split(',');
+    let start: u32 = numbers.next()?.parse().ok()?;
+    let count: u32 = numbers.next().map_or(Some(1), |n| n.parse().ok())?;
+    Some((if count == 0 { start + 1 } else { start }, count))
+}
+
+/// The line of `bytes` that starts at `at`, line ending included; `at` and
+/// the line number `line` move on to the next one.
+fn next_line<'a>(bytes: &'a [u8], at: &mut usize, line: &mut u32) -> Option<&'a [u8]> {
+    let rest = bytes.get(*at..).filter(|rest| !rest.is_empty())?;
+    let len = rest.iter().position(|b| *b == b'\n').map_or(rest.len(), |end| end + 1);
+    *at += len;
+    *line += 1;
+    Some(&rest[..len])
 }
 
 /// One side of a hunk being parsed line by line.
@@ -1606,7 +2060,7 @@ mod tests {
         if let Some(mut progress) = engine.syntax_for(file_name).and_then(|syntax| engine.start(syntax)) {
             assert!(engine.colour_hunk(&mut progress, &hunk, hunk.lines.len(), &style, &mut || true));
         }
-        let diff = DiffStyle { hunks: vec![Arc::new(style)], stream: None };
+        let diff = DiffStyle { hunks: vec![Arc::new(style)], stream: None, carried: None };
         let view = diff.hunk(0).unwrap();
         hunk.lines
             .iter()
@@ -2216,6 +2670,222 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
         assert!(style.hunk(1).unwrap().spans(100).is_empty());
         assert!(style.hunk(1).unwrap().spans(599).is_empty());
+    }
+
+    /// A diff of the hunks of a file that comes with its new version, as
+    /// the loader gives one for a large file (`FileDiff::new_file`): `lines`
+    /// are the new version, `changes` the lines (by index, at least seven
+    /// apart) that read otherwise in the old one, with their old text.
+    fn carried_diff(lines: &[String], changes: &[(usize, &str)]) -> Arc<FileDiff> {
+        let mut hunks = Vec::new();
+        for &(at, old) in changes {
+            let (from, to) = (at.saturating_sub(3), (at + 4).min(lines.len()));
+            let mut shown = Vec::new();
+            for (i, text) in lines.iter().enumerate().take(to).skip(from) {
+                let n = Some(i as u32 + 1);
+                if i == at {
+                    shown.push(numbered('-', n, None, old));
+                    shown.push(numbered('+', None, n, text));
+                } else {
+                    shown.push(numbered(' ', n, n, text));
+                }
+            }
+            let count = to - from;
+            hunks.push(Hunk { header: format!("@@ -{0},{count} +{0},{count} @@", from + 1), lines: shown, ..Hunk::default() });
+        }
+        let bytes: Vec<u8> = lines.iter().flat_map(|line| [line.as_bytes(), b"\n"]).flatten().copied().collect();
+        let id = crate::git::Oid::hash_object(git2::ObjectType::Blob, &bytes).unwrap();
+        Arc::new(FileDiff { hunks, new_file: Some(Arc::new(crate::git::NewFile { bytes, id })), ..Default::default() })
+    }
+
+    /// Lines of Rust, one function each, called `name_<n>`.
+    fn rust_lines(name: &str, count: usize) -> Vec<String> {
+        (0..count).map(|i| format!("fn {name}_{i}() {{ let x = {i}; }}")).collect()
+    }
+
+    /// The classes of every line of a hunk as shown.
+    fn shown_classes(style: &DiffStyle, diff: &FileDiff, hunk: usize) -> Vec<Vec<Class>> {
+        let view = style.hunk(hunk).unwrap();
+        (0..diff.hunks[hunk].lines.len()).map(|line| view.spans(line).iter().map(|span| span.class).collect()).collect()
+    }
+
+    #[test]
+    fn hunks_of_a_large_file_are_coloured_from_where_the_file_is() {
+        let ctx = egui::Context::default();
+        let mut lines = rust_lines("carried", 300);
+        lines[100] = "/* a comment that runs on".to_owned();
+        lines[200] = "   and ends here */".to_owned();
+        let changes = [(50, "fn before() {}"), (150, "fn was_code() {}"), (250, "fn after() {}")];
+        let diff = carried_diff(&lines, &changes);
+        let style = style_for(&ctx, &diff, "src/carried_test.rs", true);
+        assert!(style.stream.is_none());
+        let carried = style.carried.clone().expect("the hunks are carried");
+        wait_for("the parser", || carried.reached.load(Ordering::Acquire) == 3);
+        assert!(!carried.given_up.load(Ordering::Relaxed));
+
+        // The hunk inside the comment is a comment, its removed line too.
+        let inside = shown_classes(&style, &diff, 1);
+        assert_eq!(inside.len(), 8);
+        assert!(inside.iter().all(|line| !line.is_empty() && line.iter().all(|class| *class == Class::Comment)), "{inside:?}");
+        // The others come out as they do on their own, which they keep,
+        // without a second copy.
+        for hunk in [0, 2] {
+            assert!(read(&carried.hunks[hunk]).ends.is_empty(), "hunk {hunk}");
+            assert!(shown_classes(&style, &diff, hunk).iter().all(|line| line.first() == Some(&Class::Keyword)), "hunk {hunk}");
+        }
+
+        // A reloaded copy of the same diff shares them.
+        let again = carried_diff(&lines, &changes);
+        let reloaded = style_for(&ctx, &again, "src/carried_test.rs", true);
+        assert!(Arc::ptr_eq(reloaded.carried.as_ref().unwrap(), &carried));
+        // The next version (one more change, above them) starts from them:
+        // the hunk in the comment is one from the first look.
+        let mut next = changes.to_vec();
+        next.insert(0, (20, "fn first() {}"));
+        let next = carried_diff(&lines, &next);
+        let next_style = style_for(&ctx, &next, "src/carried_test.rs", true);
+        let next_carried = next_style.carried.clone().unwrap();
+        assert!(!Arc::ptr_eq(&next_carried, &carried));
+        let seeded = read(&next_carried.hunks[2]).clone();
+        assert_eq!(seeded, *read(&carried.hunks[1]), "seeded from the version shown before");
+        wait_for("the next parser", || next_carried.reached.load(Ordering::Acquire) == 4);
+        assert!(shown_classes(&next_style, &next, 2).iter().all(|line| line.iter().all(|class| *class == Class::Comment)));
+    }
+
+    #[test]
+    fn carried_colours_stop_with_the_diff_and_go_on_for_a_copy() {
+        let ctx = egui::Context::default();
+        let mut lines = rust_lines("parked", 3000);
+        lines[2000] = "/* opened".to_owned();
+        let changes = [(100, "fn a() {}"), (2500, "fn b() {}")];
+        let diff = carried_diff(&lines, &changes);
+        let style = style_for(&ctx, &diff, "src/carried_park.rs", true);
+        let carried = style.carried.clone().unwrap();
+        // The diff is closed before the parser gets far: its job is set
+        // aside, the hunk past the comment not reached.
+        drop(diff);
+        let parked = || carried.link.lock().unwrap().parked.is_some();
+        wait_for("the job to stop", || parked() || carried.reached.load(Ordering::Acquire) == 2);
+        if !parked() {
+            // This thread was held up long enough for the parser to finish.
+            return;
+        }
+        assert!(carried.reached.load(Ordering::Acquire) < 2);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(parked() && carried.reached.load(Ordering::Acquire) < 2, "nothing goes on meanwhile");
+
+        // Shown again: it carries on where it stopped.
+        let again = carried_diff(&lines, &changes);
+        let shown = style_for(&ctx, &again, "src/carried_park.rs", true);
+        assert!(Arc::ptr_eq(shown.carried.as_ref().unwrap(), &carried));
+        wait_for("the parser", || carried.reached.load(Ordering::Acquire) == 2);
+        assert!(shown_classes(&shown, &again, 1).iter().all(|line| line.iter().all(|class| *class == Class::Comment)));
+    }
+
+    #[test]
+    fn a_file_that_is_not_the_diffs_keeps_the_hunks_own_colours() {
+        let ctx = egui::Context::default();
+        let mut lines = rust_lines("mismatch", 100);
+        lines[10] = "/* opened".to_owned();
+        let diff = carried_diff(&lines, &[(50, "fn old() {}")]);
+        // The file on disk changed since: a line of the hunk reads otherwise.
+        let mut other = lines.clone();
+        other[49] = "fn changed_since() {}".to_owned();
+        let bytes: Vec<u8> = other.iter().flat_map(|line| [line.as_bytes(), b"\n"]).flatten().copied().collect();
+        let id = crate::git::Oid::hash_object(git2::ObjectType::Blob, &bytes).unwrap();
+        let diff = Arc::new(FileDiff { new_file: Some(Arc::new(crate::git::NewFile { bytes, id })), ..(*diff).clone() });
+        let style = style_for(&ctx, &diff, "src/carried_mismatch.rs", true);
+        let carried = style.carried.clone().unwrap();
+        wait_for("the parser to give up", || carried.given_up.load(Ordering::Relaxed));
+        assert_eq!(carried.reached.load(Ordering::Acquire), 0);
+        wait_for("the hunk's own colours", || !style.hunk(0).unwrap().spans(0).is_empty());
+        assert!(shown_classes(&style, &diff, 0).iter().all(|line| line.first() == Some(&Class::Keyword)));
+    }
+
+    /// A [`Carried`] for `diff` that compares with no colours of its own.
+    fn carried_for(diff: &FileDiff) -> Carried {
+        let count = diff.hunks.len();
+        Carried {
+            hunks: (0..count).map(|_| RwLock::default()).collect(),
+            limits: diff.hunks.iter().map(|hunk| hunk.lines.len()).collect(),
+            own: (0..count).map(|_| Weak::new()).collect(),
+            marks: vec![(0, 0); count],
+            reached: AtomicUsize::new(0),
+            given_up: AtomicBool::new(false),
+            link: Mutex::default(),
+        }
+    }
+
+    #[test]
+    fn carrying_stops_after_any_batch_and_carries_on_the_same() {
+        let mut lines = rust_lines("batches", 2000);
+        lines[300] = "let s = \"a string".to_owned();
+        lines[900] = "   that ends here\";".to_owned();
+        let changes = [(10, "fn a() {}"), (600, "fn b() {}"), (1500, "fn c() {}")];
+        let diff = carried_diff(&lines, &changes);
+        let mut engine = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+        let grammar = engine.syntax_for("lib.rs").unwrap();
+
+        let whole = carried_for(&diff);
+        let mut carry = engine.start_carry(grammar).unwrap();
+        assert!(engine.carry(&mut carry, &diff, &whole, &mut || true));
+        assert_eq!(whole.reached.load(Ordering::Acquire), 3);
+        assert!(read(&whole.hunks[1]).spans.iter().all(|span| span.class == Class::String));
+
+        // Stopped at every batch: where it stopped, the hunks it has not
+        // reached have nothing yet (their own colours show), and in the end
+        // it comes to the same.
+        let stepped = carried_for(&diff);
+        let mut carry = engine.start_carry(grammar).unwrap();
+        let mut stops = 0;
+        while !engine.carry(&mut carry, &diff, &stepped, &mut || false) {
+            stops += 1;
+            let reached = stepped.reached.load(Ordering::Acquire);
+            assert!(stepped.hunks[reached..].iter().all(|hunk| read(hunk).ends.is_empty()));
+        }
+        assert!(stops >= 5, "{stops}");
+        for (a, b) in whole.hunks.iter().zip(&stepped.hunks) {
+            assert_eq!(*read(a), *read(b));
+        }
+        assert!(!stepped.given_up.load(Ordering::Relaxed));
+    }
+
+    /// Not a check, a measurement: `cargo test carry_speed -- --ignored
+    /// --nocapture`. How long carrying the parser through a large file
+    /// takes, for [`CARRY_MAX_TIME`].
+    #[test]
+    #[ignore]
+    fn carry_speed() {
+        let source = include_str!("highlight.rs");
+        let rust: Vec<String> = source.lines().cycle().take(150_000).map(str::to_owned).collect();
+        let json: Vec<String> = std::iter::once("[".to_owned())
+            .chain((0..150_000).map(|i| format!("  {{\"id\": {i}, \"name\": \"item {i}\", \"tags\": [\"a\", \"b\"], \"ok\": true}},")))
+            .collect();
+        let mut engine = ENGINE.lock().unwrap();
+        for (name, mut lines) in [("big.rs", rust), ("big.json", json)] {
+            let count = lines.len();
+            // Twenty lines edited, spread through the file.
+            let at: Vec<usize> = (1..=20).map(|k| k * count / 21).collect();
+            let old: Vec<String> = at.iter().map(|&i| std::mem::take(&mut lines[i])).collect();
+            for (&i, old) in at.iter().zip(&old) {
+                lines[i] = format!("{old} ");
+            }
+            let changes: Vec<(usize, &str)> = at.iter().copied().zip(old.iter().map(String::as_str)).collect();
+            let diff = carried_diff(&lines, &changes);
+            let bytes = diff.new_file.as_ref().unwrap().bytes.len();
+            let carried = carried_for(&diff);
+            let grammar = engine.syntax_for(name).unwrap();
+            let mut carry = engine.start_carry(grammar).unwrap();
+            let started = Instant::now();
+            assert!(engine.carry(&mut carry, &diff, &carried, &mut || true));
+            let secs = started.elapsed().as_secs_f32();
+            println!(
+                "{name}: {count} lines, {:.1} MB in {secs:.2}s: {:.0} lines/s, {:.2} MB/s",
+                bytes as f32 / 1e6,
+                count as f32 / secs,
+                bytes as f32 / 1e6 / secs
+            );
+        }
     }
 
     /// Not a check, a measurement: `cargo test parse_speed -- --ignored --nocapture`.

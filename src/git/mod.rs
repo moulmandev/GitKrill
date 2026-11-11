@@ -389,9 +389,26 @@ pub struct FileDiff {
     /// Every line of both versions of the file as one hunk (context, removed
     /// and added lines in file order), for syntax colours that follow the
     /// whole file. Only in a diff of the hunks, of a file small enough
-    /// (`diff::WHOLE_FOR_COLOURS_BYTES`); a whole-file diff has them all
-    /// already.
+    /// (`diff::WHOLE_FOR_COLOURS_BYTES`, `WHOLE_FOR_COLOURS_LINES`); a
+    /// whole-file diff has them all already.
     pub whole: Option<Arc<Hunk>>,
+    /// The new version of a file too large for `whole`, for syntax colours
+    /// that carry on from one hunk to the next (`ui::highlight`): the lines
+    /// between the hunks are read from it, being the same in both versions.
+    /// Only in a diff of the hunks of a changed file of up to
+    /// `diff::NEW_FILE_FOR_COLOURS_BYTES`, or of a whole-file diff too long
+    /// to show whole.
+    pub new_file: Option<Arc<NewFile>>,
+}
+
+/// The new version of a file, as `FileDiff::new_file` carries it.
+#[derive(Debug)]
+pub struct NewFile {
+    /// Its bytes, in the encoding the diff's lines were read in
+    /// (`FileDiff::format`): UTF-8 for a diff of decoded text.
+    pub bytes: Vec<u8>,
+    /// The hash of those bytes, which tells this version from others.
+    pub id: Oid,
 }
 
 impl FileDiff {
