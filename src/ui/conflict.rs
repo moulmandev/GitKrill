@@ -1,11 +1,19 @@
 //! Merge-conflict resolver for one file.
 //!
-//! The two sides sit next to each other with the result underneath. All
-//! three panes show the same rows at the same height: text that merges on
-//! its own appears once in each, and every conflict is a block with a
-//! header strip (the controls) and as many rows as its tallest version. One
-//! scroll position therefore serves all three panes, and only the rows in
-//! view are laid out.
+//! The two sides sit next to each other with the result underneath, and the
+//! common ancestor between the sides when it is asked for. All panes show
+//! the same rows at the same height: text that merges on its own appears
+//! once in each, and every conflict is a block with a header strip (the
+//! controls) and as many rows as its tallest version. With word wrap every
+//! pane wraps at the width of the narrowest, so a line takes as many rows
+//! wherever it is. One scroll position therefore serves all panes, and only
+//! the rows in view are laid out.
+//!
+//! The panes' text is kept as shown (tabs at the tab stops of Preferences >
+//! Editor) and syntax-coloured in the background; see `ui::conflict_text`.
+//! The text of the sides and the ancestor can be selected and copied
+//! (`ui::textsel`); a click on a conflict's strip or on its line numbers
+//! takes that side.
 //!
 //! What the user decides lives in a [`Draft`]; the backend in
 //! `git::conflict` turns it into bytes. Clicking in the result pane opens a
@@ -17,16 +25,16 @@
 //! view parks itself (see [`PARKED`]) and comes back the next time a
 //! conflict is opened.
 
-use std::borrow::Cow;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use eframe::egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
+use eframe::egui::text::{CCursor, CCursorRange};
 use eframe::egui::{
     self, Align, Align2, Button, Color32, CursorIcon, FontId, Frame, Id, Key, Layout, Margin, Modal,
-    Modifiers, Painter, Rect, RichText, Sense, Stroke, StrokeKind, TextBuffer, TextEdit, Ui,
+    Modifiers, Painter, Pos2, Rangef, Rect, RichText, Sense, Stroke, StrokeKind, TextBuffer, TextEdit, Ui,
     UiBuilder, Vec2, pos2, vec2,
 };
 
@@ -34,10 +42,15 @@ use crate::git::conflict::{
     self, Chunk, ConflictFile, Content, Draft, Resolution, Segment, Side, SideInfo, Stage, TextMerge,
     Whole,
 };
-use crate::git::{ChangeKind, DiffTarget, Oid, text};
+use crate::git::{ChangeKind, DiffLine, DiffTarget, FileDiff, Hunk, Oid, text};
 use crate::prefs::editor;
-use crate::state::{Overlay, RepoTab, Shared, ToastKind};
+use crate::state::{Overlay, RepoTab, Settings, Shared, ToastKind};
 use crate::theme::{self, icons};
+use crate::ui::conflict_text::{self, EditorLook, PaneText, Version, typed_hunk};
+use crate::ui::diff;
+use crate::ui::highlight::{self, DiffStyle, HunkView, Span};
+use crate::ui::palette::{Entry, Env, Kind as EntryKind};
+use crate::ui::textsel::{self, Pos, Selection};
 use crate::ui::widgets::{self, icon_button, tint_button, tint_button_at, tint_button_size};
 
 /// Height of a row of text, from the font size in Preferences > Editor.
@@ -55,10 +68,8 @@ const MIN_GUTTER: f32 = 48.0;
 const NO_NUMBERS_GUTTER: f32 = 12.0;
 const TEXT_PAD: f32 = 8.0;
 const SCROLLBAR: f32 = 12.0;
-/// Share of the height given to the two sides; the result gets the rest.
+/// Share of the height given to the panes on top; the result gets the rest.
 const SIDES_SHARE: f32 = 0.45;
-/// Lines are cut off after this many characters when painted.
-const MAX_SHOWN: usize = 4000;
 /// Space kept above a conflict that previous / next scrolls to.
 fn jump_margin() -> f32 {
     line_h() * 2.0
@@ -90,7 +101,7 @@ enum Phase {
 }
 
 /// What the editor in the result pane is open on.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum Target {
     /// The whole resolution of a conflict.
     Conflict(usize),
@@ -107,6 +118,11 @@ struct Editing {
     shown: bool,
     /// Where the cursor was last, to follow it only when it moves.
     cursor: Option<usize>,
+    /// Rows the text took when last laid out, wrapped lines included.
+    rows: Option<usize>,
+    /// The colours each line was last shown with, kept for a line while it
+    /// is being typed in and the highlighter has not caught up.
+    spans: Vec<Vec<Span>>,
 }
 
 /// A save (or whole-file choice) that is running.
@@ -168,8 +184,19 @@ struct Resolver {
     saved: Draft,
     plan: Plan,
     replan: bool,
-    /// The row height the plan was made for; another font size makes another.
-    plan_line_h: f32,
+    /// What the plan was made for; anything else makes another.
+    plan_for: PlanFor,
+    /// The panes' texts, made once the file is read (and again for a new
+    /// tab width).
+    panes: Option<Box<Panes>>,
+    /// Counts the texts made, see [`Panes::serial`].
+    serial: u64,
+    typed: Typed,
+    styles: Styles,
+    /// What is selected in each pane with a text, by [`Version`].
+    selections: [Selection; 3],
+    /// The wrapped rows the plan was made with.
+    wrapped: Option<[Arc<Vec<u32>>; 3]>,
     scroll: Vec2,
     /// The conflict that previous / next start from.
     current: usize,
@@ -199,7 +226,13 @@ impl Resolver {
             saved: Draft::default(),
             plan: Plan::default(),
             replan: true,
-            plan_line_h: 0.0,
+            plan_for: PlanFor::default(),
+            panes: None,
+            serial: 0,
+            typed: Typed::default(),
+            styles: Styles::default(),
+            selections: Default::default(),
+            wrapped: None,
             scroll: Vec2::ZERO,
             current: 0,
             jump: None,
@@ -231,6 +264,7 @@ impl Resolver {
         tab.spawn_job(self.job_key(), move |loader| conflict::load(loader.repo(), &path, encoding));
         self.phase = Phase::Loading;
         self.file = None;
+        self.panes = None;
         self.editing = None;
         self.checking = false;
     }
@@ -450,6 +484,23 @@ fn is_conflicted(tab: &RepoTab, path: &str) -> bool {
     })
 }
 
+/// Command palette entries for the resolver's switches, while the
+/// repository in front has conflicted files. (Word wrap has its own entry.)
+pub fn palette_entries(list: &mut Vec<Entry>, snap: Option<&crate::git::RepoSnapshot>, settings: &Settings) {
+    let conflicted = snap.is_some_and(|snap| snap.status.unstaged.iter().any(|f| f.kind == ChangeKind::Conflicted));
+    if !conflicted {
+        return;
+    }
+    let on = settings.editor.conflict_ancestor;
+    let label = if on { "Hide the common ancestor of conflicts" } else { "Show the common ancestor of conflicts" };
+    list.push(
+        Entry::new(EntryKind::Action, "conflict-ancestor", icons::GIT_FORK, label, move |env: &mut Env<'_>| {
+            env.shared.settings.editor.conflict_ancestor = !on;
+        })
+        .keywords("conflict resolver ancestor base merge base stage 1 diff3 three-way"),
+    );
+}
+
 /// Called for Escape while an overlay is open. Returns whether the overlay
 /// may close; a resolver with unsaved choices closes its editor or asks
 /// first instead.
@@ -510,7 +561,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, view: &mut Conf
 
 #[derive(Clone, Copy)]
 enum Kind {
-    /// Lines `from..to` of a stable segment, the same in all three panes.
+    /// Lines `from..to` of a stable segment, the same in all panes.
     Stable { seg: usize, from: usize, to: usize },
     /// A line outside the conflicts that was rewritten by hand (or is being).
     Edited { seg: usize, line: usize },
@@ -523,71 +574,39 @@ struct Block {
     bottom: f32,
     /// Rows of text; a conflict has its header strip above them.
     rows: usize,
-    /// Lines above this block in the current side, the incoming side and
-    /// the result, for the line numbers.
-    above: [usize; 3],
+    /// Lines above this block in the current side, the incoming side, the
+    /// result and the ancestor ([`RESULT`], or a [`Version`] as index), for
+    /// the line numbers.
+    above: [usize; 4],
 }
+
+/// Index of the result in [`Block::above`], after the three [`Version`]s.
+const RESULT: usize = 3;
 
 /// Where every block of rows sits, top to bottom.
 #[derive(Default)]
 struct Plan {
     blocks: Vec<Block>,
     height: f32,
-    /// Longest line in bytes, for the horizontal scroll range.
+    /// Longest line in columns, for the horizontal scroll range.
     longest: usize,
-    /// Lines in the longest of the three panes, for the width of the numbers.
+    /// Lines in the longest of the panes, for the width of the numbers.
     lines: usize,
+}
+
+/// What a plan was made for; another font size, wrap width or set of panes
+/// makes another.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct PlanFor {
+    line_h: f32,
+    columns: Option<usize>,
+    ancestor: bool,
+    texts: u64,
 }
 
 /// Rows a piece of typed text occupies: none when empty.
 fn text_rows(text: &str) -> usize {
     if text.is_empty() { 0 } else { text.split('\n').count() }
-}
-
-/// Lines a resolution puts into the result.
-fn resolved_rows(choice: &Resolution, ours: &Chunk, theirs: &Chunk) -> usize {
-    match choice {
-        Resolution::Unresolved | Resolution::Neither => 0,
-        Resolution::Ours => ours.len(),
-        Resolution::Theirs => theirs.len(),
-        Resolution::OursTheirs | Resolution::TheirsOurs => ours.len() + theirs.len(),
-        Resolution::Custom(text) => text_rows(text),
-    }
-}
-
-/// Rows `rows` of what a resolution puts into the result, each with the
-/// side it comes from (`None` for typed text).
-fn resolved_lines<'a>(
-    choice: &'a Resolution,
-    ours: &'a Chunk,
-    theirs: &'a Chunk,
-    rows: Range<usize>,
-) -> Vec<(Cow<'a, str>, Option<Side>)> {
-    let two = |first: (&'a Chunk, Side), second: (&'a Chunk, Side)| {
-        rows.clone()
-            .map(|row| {
-                if row < first.0.len() {
-                    (first.0.line(row), Some(first.1))
-                } else {
-                    (second.0.line(row - first.0.len()), Some(second.1))
-                }
-            })
-            .collect()
-    };
-    let (mine, yours) = ((ours, Side::Ours), (theirs, Side::Theirs));
-    match choice {
-        Resolution::Unresolved | Resolution::Neither => Vec::new(),
-        Resolution::Ours => rows.clone().map(|row| (ours.line(row), Some(Side::Ours))).collect(),
-        Resolution::Theirs => rows.clone().map(|row| (theirs.line(row), Some(Side::Theirs))).collect(),
-        Resolution::OursTheirs => two(mine, yours),
-        Resolution::TheirsOurs => two(yours, mine),
-        Resolution::Custom(text) => text
-            .split('\n')
-            .skip(rows.start)
-            .take(rows.len())
-            .map(|line| (Cow::Borrowed(line), None))
-            .collect(),
-    }
 }
 
 /// The text the editor starts with for a conflict.
@@ -612,25 +631,212 @@ fn editor_text(choice: &Resolution, ours: &Chunk, theirs: &Chunk) -> String {
     }
 }
 
+/// Some lines of a text and the row each starts at.
+#[derive(Clone, Copy)]
+struct Rows<'a> {
+    lines: &'a [DiffLine],
+    /// The first row of every line, then the total, when lines wrap; each
+    /// line is one row without.
+    first: Option<&'a [u32]>,
+}
+
+impl Rows<'_> {
+    /// The row line `line` starts at (or, for one past the last, the total).
+    fn start(&self, line: usize) -> usize {
+        self.first.map_or(line, |first| first.get(line).map_or(0, |row| *row as usize))
+    }
+
+    fn count(&self, lines: Range<usize>) -> usize {
+        self.start(lines.end) - self.start(lines.start)
+    }
+
+    fn all(&self) -> usize {
+        self.count(0..self.lines.len())
+    }
+
+    /// The line row `row` is part of.
+    fn line_at(&self, row: usize) -> usize {
+        match self.first {
+            None => row,
+            Some(first) => first.partition_point(|start| *start as usize <= row).saturating_sub(1),
+        }
+    }
+}
+
+/// The texts of the panes that have one, made with the tab width in effect.
+struct Panes {
+    /// Indexed by [`Version`].
+    texts: [PaneText; 3],
+    /// `text::generation` when they were made.
+    generation: u64,
+    /// Goes up every time texts are made, so plans and selections know.
+    serial: u64,
+}
+
+impl Panes {
+    fn new(merge: &TextMerge, serial: u64) -> Self {
+        let generation = text::generation();
+        let width = text::tab_width();
+        let texts = [Version::Ours, Version::Theirs, Version::Base].map(|version| PaneText::new(merge, version, width));
+        Panes { texts, generation, serial }
+    }
+}
+
+/// The text typed by hand, kept as shown for painting and colouring.
+#[derive(Default)]
+struct Typed {
+    /// Every piece: what it was typed for, and the text.
+    pieces: Vec<(Target, String)>,
+    index: HashMap<Target, usize>,
+    /// The pieces as shown, one hunk each.
+    diff: Arc<FileDiff>,
+    /// Where each line of each piece starts when wrapping (see [`Rows`]).
+    rows: Vec<Vec<u32>>,
+    columns: Option<usize>,
+    tab_width: usize,
+    longest: usize,
+}
+
+impl Typed {
+    /// Brings the pieces up to date with `draft` and the text being typed.
+    fn update(&mut self, draft: &Draft, editing: Option<&Editing>, columns: Option<usize>) {
+        let mut pieces = Vec::new();
+        for (index, choice) in draft.choices.iter().enumerate() {
+            if let Resolution::Custom(text) = choice {
+                pieces.push((Target::Conflict(index), text.clone()));
+            }
+        }
+        for (&(seg, line), text) in &draft.edits {
+            pieces.push((Target::Line { seg, line }, text.clone()));
+        }
+        if let Some(editing) = editing {
+            match pieces.iter_mut().find(|(target, _)| *target == editing.target) {
+                Some(piece) => piece.1.clone_from(&editing.text),
+                None => pieces.push((editing.target, editing.text.clone())),
+            }
+        }
+        let tab_width = text::tab_width();
+        let changed = pieces != self.pieces || tab_width != self.tab_width;
+        if changed {
+            let hunks: Vec<Hunk> = pieces.iter().map(|(_, text)| typed_hunk(text, tab_width)).collect();
+            self.longest = hunks.iter().flat_map(|h| &h.lines).map(|l| l.text.chars().count()).max().unwrap_or(0);
+            self.index = pieces.iter().enumerate().map(|(i, (target, _))| (*target, i)).collect();
+            self.diff = Arc::new(FileDiff { hunks, ..Default::default() });
+            self.pieces = pieces;
+            self.tab_width = tab_width;
+        }
+        if changed || columns != self.columns {
+            self.columns = columns;
+            self.rows = match columns {
+                Some(columns) => {
+                    let rows = |hunk: &Hunk| diff::first_rows(hunk.lines.iter().map(|l| l.text.as_str()), columns);
+                    self.diff.hunks.iter().map(rows).collect()
+                }
+                None => Vec::new(),
+            };
+        }
+    }
+}
+
+/// The texts as the plan and the panes need them in one frame.
+struct Texts<'a> {
+    panes: &'a [PaneText; 3],
+    /// First rows of every line of each pane text when wrapping.
+    wrapped: Option<&'a [Arc<Vec<u32>>; 3]>,
+    typed: &'a Typed,
+    /// Columns lines wrap at, the same in every pane so that the same text
+    /// takes the same rows wherever it is.
+    columns: Option<usize>,
+}
+
+impl<'a> Texts<'a> {
+    fn pane(&self, version: Version) -> Rows<'a> {
+        let first = self.wrapped.map(|rows| rows[version as usize].as_slice());
+        Rows { lines: self.panes[version as usize].lines(), first }
+    }
+
+    /// The hunk of the text typed for `target`, and its rows.
+    fn typed(&self, target: Target) -> Option<(usize, Rows<'a>)> {
+        let hunk = *self.typed.index.get(&target)?;
+        let lines = &self.typed.diff.hunks.get(hunk)?.lines;
+        let first = self.columns.and_then(|_| self.typed.rows.get(hunk)).map(Vec::as_slice);
+        Some((hunk, Rows { lines, first }))
+    }
+
+    /// The lines of `version`'s text that `block` shows.
+    fn block_lines(&self, merge: &TextMerge, version: Version, block: &Block) -> Range<usize> {
+        let pane = &self.panes[version as usize];
+        match block.kind {
+            Kind::Stable { seg, from, to } => {
+                let start = pane.segment(seg).start;
+                start + from..start + to
+            }
+            Kind::Edited { seg, line } => {
+                let start = pane.segment(seg).start + line;
+                start..start + 1
+            }
+            Kind::Conflict { index } => merge.conflicts.get(index).map_or(0..0, |seg| pane.segment(*seg)),
+        }
+    }
+
+    /// What a resolution of conflict `index` (segment `seg`) puts into the
+    /// result when it takes sides: lines of the side texts, in order.
+    fn taken(&self, choice: &Resolution, seg: usize) -> Vec<(Side, Range<usize>)> {
+        let ours = (Side::Ours, self.panes[Version::Ours as usize].segment(seg));
+        let theirs = (Side::Theirs, self.panes[Version::Theirs as usize].segment(seg));
+        match choice {
+            Resolution::Ours => vec![ours],
+            Resolution::Theirs => vec![theirs],
+            Resolution::OursTheirs => vec![ours, theirs],
+            Resolution::TheirsOurs => vec![theirs, ours],
+            Resolution::Unresolved | Resolution::Neither | Resolution::Custom(_) => Vec::new(),
+        }
+    }
+
+    /// Lines and rows a resolution puts into the result.
+    fn resolved(&self, choice: &Resolution, index: usize, seg: usize) -> (usize, usize) {
+        if let Resolution::Custom(_) = choice {
+            return self.typed(Target::Conflict(index)).map_or((0, 0), |(_, rows)| (rows.lines.len(), rows.all()));
+        }
+        self.taken(choice, seg).into_iter().fold((0, 0), |(lines, rows), (side, range)| {
+            (lines + range.len(), rows + self.pane(version_of(side)).count(range))
+        })
+    }
+}
+
+fn version_of(side: Side) -> Version {
+    match side {
+        Side::Ours => Version::Ours,
+        Side::Theirs => Version::Theirs,
+    }
+}
+
 impl Plan {
-    fn build(merge: &TextMerge, draft: &Draft, editing: Option<&Editing>) -> Plan {
+    fn build(merge: &TextMerge, draft: &Draft, editing: Option<&Editing>, texts: &Texts<'_>, ancestor: bool) -> Plan {
         let mut plan = Plan::default();
         let mut top = 0.0;
-        let mut above = [0usize; 3];
+        let mut above = [0usize; 4];
         let mut conflict = 0;
-        let mut push = |plan: &mut Plan, kind: Kind, rows: usize, head: f32, lines: [usize; 3]| {
-            let bottom = top + head + rows as f32 * line_h();
+        let line_h = line_h();
+        let mut push = |plan: &mut Plan, kind: Kind, rows: usize, head: f32, lines: [usize; 4]| {
+            let bottom = top + head + rows as f32 * line_h;
             plan.blocks.push(Block { kind, top, bottom, rows, above });
             top = bottom;
             for (count, add) in above.iter_mut().zip(lines) {
                 *count += add;
             }
         };
+        let ours = texts.pane(Version::Ours);
+        // The text being typed: its rows as laid out last frame, once known.
+        let typing = |target: Target, rows: usize| match editing {
+            Some(e) if e.target == target => e.rows.unwrap_or(rows).max(1),
+            _ => rows,
+        };
 
         for (seg, segment) in merge.segments.iter().enumerate() {
             match segment {
                 Segment::Stable(chunk) => {
-                    plan.longest = plan.longest.max(chunk.longest_line());
+                    let start = texts.panes[Version::Ours as usize].segment(seg).start;
                     // Lines with an edit, plus the one the editor is open on.
                     let mut own: Vec<usize> = draft
                         .edits
@@ -650,34 +856,40 @@ impl Plan {
                     for line in own {
                         if line > from {
                             let n = line - from;
-                            push(&mut plan, Kind::Stable { seg, from, to: line }, n, 0.0, [n, n, n]);
+                            let rows = ours.count(start + from..start + line);
+                            push(&mut plan, Kind::Stable { seg, from, to: line }, rows, 0.0, [n, n, n, n]);
                         }
-                        let typed = match editing {
-                            Some(e) if e.target == (Target::Line { seg, line }) => Some(&e.text),
-                            _ => draft.edits.get(&(seg, line)),
-                        };
-                        let typed_rows = typed.map_or(1, |text| text_rows(text));
-                        plan.longest = plan.longest.max(typed.map_or(0, |text| text.len()));
-                        push(&mut plan, Kind::Edited { seg, line }, typed_rows.max(1), 0.0, [1, 1, typed_rows]);
+                        let target = Target::Line { seg, line };
+                        let (typed_lines, typed_rows) =
+                            texts.typed(target).map_or((1, 1), |(_, rows)| (rows.lines.len(), rows.all()));
+                        let rows = ours.count(start + line..start + line + 1).max(typing(target, typed_rows)).max(1);
+                        push(&mut plan, Kind::Edited { seg, line }, rows, 0.0, [1, 1, 1, typed_lines]);
                         from = line + 1;
                     }
                     if from < chunk.len() {
                         let n = chunk.len() - from;
-                        push(&mut plan, Kind::Stable { seg, from, to: chunk.len() }, n, 0.0, [n, n, n]);
+                        let rows = ours.count(start + from..start + chunk.len());
+                        push(&mut plan, Kind::Stable { seg, from, to: chunk.len() }, rows, 0.0, [n, n, n, n]);
                     }
                 }
-                Segment::Conflict { ours, theirs } => {
-                    plan.longest = plan.longest.max(ours.longest_line()).max(theirs.longest_line());
+                Segment::Conflict { ours: mine, theirs: yours, base } => {
                     let choice = draft.choices.get(conflict).unwrap_or(&Resolution::Unresolved);
-                    let result = match editing {
-                        Some(e) if e.target == Target::Conflict(conflict) => text_rows(&e.text).max(1),
-                        _ => resolved_rows(choice, ours, theirs),
+                    let target = Target::Conflict(conflict);
+                    let (result_lines, result_rows) = match editing {
+                        Some(e) if e.target == target => {
+                            let rows = texts.typed(target).map_or(1, |(_, rows)| rows.all());
+                            (text_rows(&e.text), typing(target, rows))
+                        }
+                        _ => texts.resolved(choice, conflict, seg),
                     };
-                    if let Resolution::Custom(text) = choice {
-                        plan.longest = plan.longest.max(text.len());
-                    }
-                    let rows = ours.len().max(theirs.len()).max(result).max(1);
-                    let lines = [ours.len(), theirs.len(), result];
+                    let side_rows = |version: Version| texts.pane(version).count(texts.panes[version as usize].segment(seg));
+                    let base_rows = if ancestor { side_rows(Version::Base) } else { 0 };
+                    let rows = side_rows(Version::Ours)
+                        .max(side_rows(Version::Theirs))
+                        .max(base_rows)
+                        .max(result_rows)
+                        .max(1);
+                    let lines = [mine.len(), yours.len(), base.len(), result_lines];
                     push(&mut plan, Kind::Conflict { index: conflict }, rows, HEAD_H, lines);
                     conflict += 1;
                 }
@@ -685,6 +897,8 @@ impl Plan {
         }
         plan.height = top;
         plan.lines = above.into_iter().max().unwrap_or(0);
+        let [mine, yours, base] = texts.panes.each_ref().map(|pane| pane.longest);
+        plan.longest = mine.max(yours).max(if ancestor { base } else { 0 }).max(texts.typed.longest);
         plan
     }
 
@@ -695,12 +909,74 @@ impl Plan {
         &self.blocks[first.min(last)..last]
     }
 
+    /// The block at `y`, or the nearest one above or below the content.
+    fn nearest(&self, y: f32) -> Option<&Block> {
+        let at = self.blocks.partition_point(|block| block.bottom <= y);
+        self.blocks.get(at.min(self.blocks.len().saturating_sub(1)))
+    }
+
     fn at(&self, y: f32) -> Option<&Block> {
         self.blocks.get(self.blocks.partition_point(|block| block.bottom <= y)).filter(|block| block.top <= y)
     }
 
     fn conflict(&self, index: usize) -> Option<&Block> {
         self.blocks.iter().find(|block| matches!(block.kind, Kind::Conflict { index: i } if i == index))
+    }
+}
+
+/// A place in the view, kept while the rows move under it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Anchor {
+    /// The block it is in.
+    block: usize,
+    /// In a stretch of merged lines, the line (of the current side's text),
+    /// else nothing more precise than the block.
+    line: Option<usize>,
+    /// Points below the top of that line, or of the block.
+    offset: f32,
+}
+
+impl Anchor {
+    /// Where `y` is in `plan`, made from `texts` with rows `line_h` high.
+    fn at(plan: &Plan, texts: &Texts<'_>, merge: &TextMerge, y: f32, line_h: f32) -> Option<Anchor> {
+        let index = plan.blocks.partition_point(|block| block.bottom <= y);
+        let block = plan.blocks.get(index)?;
+        let rows = texts.pane(Version::Ours);
+        let lines = texts.block_lines(merge, Version::Ours, block);
+        if let Kind::Stable { .. } = block.kind
+            && !lines.is_empty()
+        {
+            let first = rows.start(lines.start);
+            let row = ((y - block.top) / line_h).max(0.0) as usize;
+            let line = rows.line_at(first + row).clamp(lines.start, lines.end - 1);
+            let offset = y - (block.top + (rows.start(line) - first) as f32 * line_h);
+            return Some(Anchor { block: index, line: Some(line), offset: offset / line_h });
+        }
+        Some(Anchor { block: index, line: None, offset: (y - block.top) / line_h })
+    }
+
+    /// Where the place is in `plan`, made from `texts` for the same blocks.
+    fn find(self, plan: &Plan, texts: &Texts<'_>, merge: &TextMerge) -> Option<f32> {
+        let block = plan.blocks.get(self.block)?;
+        let line_h = line_h();
+        match self.line {
+            Some(line) => {
+                let rows = texts.pane(Version::Ours);
+                let lines = texts.block_lines(merge, Version::Ours, block);
+                lines.contains(&line).then(|| {
+                    block.top + (rows.start(line) - rows.start(lines.start)) as f32 * line_h + self.offset * line_h
+                })
+            }
+            None => Some(block.top + (self.offset * line_h).min(block.bottom - block.top)),
+        }
+    }
+}
+
+/// Height of the strip above a block's rows.
+fn head_h(block: &Block) -> f32 {
+    match block.kind {
+        Kind::Conflict { .. } => HEAD_H,
+        _ => 0.0,
     }
 }
 
@@ -731,6 +1007,12 @@ enum Action {
     Save { mark_resolved: bool },
     /// Hand the file to the external merge tool (Preferences > External Tools).
     MergeTool,
+    /// Show the ancestor pane, or not.
+    ShowAncestor(bool),
+    /// Wrap long lines, or not.
+    Wrap(bool),
+    /// The editor's text takes another number of rows: lay out again.
+    Relayout,
 }
 
 /// What clicking a side's checkbox makes of a resolution. Picking the
@@ -815,7 +1097,15 @@ impl Resolver {
                         }
                     }
                 };
-                self.editing = Some(Editing { target, text, place: Some(place), shown: false, cursor: None });
+                self.editing = Some(Editing {
+                    target,
+                    text,
+                    place: Some(place),
+                    shown: false,
+                    cursor: None,
+                    rows: None,
+                    spans: Vec::new(),
+                });
             }
             Action::Typed => {
                 let Some(editing) = &self.editing else { return };
@@ -866,21 +1156,66 @@ impl Resolver {
                     tab.run(cmd);
                 }
             }
+            // Both are Preferences > Editor settings, so they are remembered.
+            Action::ShowAncestor(on) => shared.settings.editor.conflict_ancestor = on,
+            Action::Wrap(on) => shared.settings.editor.word_wrap = on,
+            Action::Relayout => {}
         }
     }
 }
 
 // ---- the text resolver -----------------------------------------------------
 
+/// Colour of the ancestor, which is neither side.
+fn ancestor_color() -> Color32 {
+    theme::text_dim()
+}
+
+/// Syntax colours of the pane texts and of the typed text (indexed by
+/// [`Version`], then [`TYPED`]), kept while the text they colour stays.
+#[derive(Default)]
+struct Styles {
+    known: [Option<Styled>; 4],
+}
+
+/// A text, whether colours were asked for, and its styling.
+type Styled = (Arc<FileDiff>, bool, Arc<DiffStyle>);
+
+/// Index of the typed text in [`Styles`].
+const TYPED: usize = 3;
+
+impl Styles {
+    /// The styling of `diff`, asked for once per text: it fills in from the
+    /// highlighting thread while it is held.
+    fn get(&mut self, slot: usize, ctx: &egui::Context, diff: &Arc<FileDiff>, path: &str, colours: bool) -> Arc<DiffStyle> {
+        if let Some((known, on, style)) = &self.known[slot]
+            && Arc::ptr_eq(known, diff)
+            && *on == colours
+        {
+            return style.clone();
+        }
+        let style = highlight::style_for(ctx, diff, path, colours);
+        self.known[slot] = Some((diff.clone(), colours, style.clone()));
+        style
+    }
+}
+
 /// What the panes need to paint a frame.
 struct Scene<'a> {
     merge: &'a TextMerge,
     draft: &'a Draft,
     plan: &'a Plan,
+    texts: Texts<'a>,
+    /// Indexed by [`Version`], then [`TYPED`].
+    styles: [Arc<DiffStyle>; 4],
     scroll: Vec2,
     current: usize,
     font: FontId,
     char_w: f32,
+    /// What the editor needs to put tabs at the tab stops.
+    space_w: f32,
+    tab_w: f32,
+    tab_width: usize,
     /// Width of the line-number column.
     gutter: f32,
 }
@@ -896,13 +1231,14 @@ fn text_ui(
     edited_outside: bool,
     free: Rect,
 ) {
-    if view.replan || view.plan_line_h != line_h() {
-        view.plan = Plan::build(merge, &view.draft, view.editing.as_ref());
-        view.replan = false;
-        view.plan_line_h = line_h();
-    }
-    if let Some(block) = view.jump.take().and_then(|index| view.plan.conflict(index)) {
-        view.scroll.y = block.top - jump_margin();
+    // Preferences > Editor: the font, its size, line numbers, wrapping,
+    // colours; and whether the ancestor is shown.
+    let look = editor::look();
+    let ancestor = shared.settings.editor.conflict_ancestor;
+    // The pane texts are made with the tab width in effect.
+    if view.panes.as_ref().is_none_or(|panes| panes.generation != text::generation()) {
+        view.serial += 1;
+        view.panes = Some(Box::new(Panes::new(merge, view.serial)));
     }
 
     let mut actions = Vec::new();
@@ -911,7 +1247,7 @@ fn text_ui(
     let total = view.draft.choices.len();
     let merging = tab.is_running(&crate::external::merge_label(&shared.settings.tools, &file.path));
     title_buttons(ui, free, open, view.is_dirty(), (saving, merging), &mut actions);
-    toolbar(ui, open, total, saving, &mut actions);
+    toolbar(ui, open, total, saving, (ancestor, look.wrap), &mut actions);
     if edited_outside {
         notice(
             ui,
@@ -923,27 +1259,78 @@ fn text_ui(
     let body = ui.available_rect_before_wrap();
     ui.allocate_rect(body, Sense::hover());
 
-    // Geometry: two sides on top, the result below, one scrollbar for all.
+    // Geometry: the sides on top (the ancestor between them when shown),
+    // the result below, one scrollbar for all.
     let content = Rect::from_min_max(body.min, pos2(body.right() - SCROLLBAR, body.bottom()));
     let sides_h = ((content.height() - PANE_HEAD_H * 2.0) * SIDES_SHARE).floor().max(line_h());
-    let middle = content.center().x.round();
     let heads = Rect::from_min_max(content.min, pos2(content.right(), content.top() + PANE_HEAD_H));
     let sides = Rect::from_min_max(heads.left_bottom(), pos2(content.right(), heads.bottom() + sides_h));
     let result_head = Rect::from_min_max(sides.left_bottom(), pos2(content.right(), sides.bottom() + PANE_HEAD_H));
     let below = Rect::from_min_max(result_head.left_bottom(), content.max);
-    let ours_rect = Rect::from_min_max(sides.min, pos2(middle, sides.bottom()));
-    let theirs_rect = Rect::from_min_max(pos2(middle + 1.0, sides.top()), sides.max);
+    let columns_on_top = if ancestor { 3 } else { 2 };
+    let edge = |i: usize| (content.left() + content.width() * i as f32 / columns_on_top as f32).round();
+    let top_pane = |i: usize, y: Rangef| {
+        Rect::from_x_y_ranges((edge(i) + if i > 0 { 1.0 } else { 0.0 })..=edge(i + 1), y)
+    };
+    let ours_rect = top_pane(0, sides.y_range());
+    let base_rect = ancestor.then(|| top_pane(1, sides.y_range()));
+    let theirs_rect = top_pane(columns_on_top - 1, sides.y_range());
+    let narrow = ours_rect.width().min(theirs_rect.width());
 
-    // Preferences > Editor: the font, its size, line numbers or not.
-    let look = editor::look();
     let font = look.font();
-    let (char_w, digit_w) =
-        ui.painter().fonts_mut(|f| (f.glyph_width(&font, 'm'), f.glyph_width(&number_font(), '0')));
-    // Room for the largest line number.
-    let digits = view.plan.lines.max(1).ilog10() + 1;
+    let (char_w, space_w, digit_w) = ui.painter().fonts_mut(|f| {
+        (f.glyph_width(&font, 'm'), f.glyph_width(&font, ' '), f.glyph_width(&number_font(), '0'))
+    });
+    let tab_w = ui.painter().layout_no_wrap("\t".to_owned(), font.clone(), theme::text()).size().x;
+    // Room for the largest line number, as far as it is known.
+    let panes = view.panes.as_deref().expect("made above");
+    let most = view.plan.lines.max(panes.texts.iter().map(|pane| pane.lines().len()).max().unwrap_or(0));
+    let digits = most.max(1).ilog10() + 1;
     let gutter = if look.numbers { (digits as f32 * digit_w + 22.0).max(MIN_GUTTER) } else { NO_NUMBERS_GUTTER };
-    let text_w = view.plan.longest.min(MAX_SHOWN) as f32 * char_w + 40.0;
-    let max_x = (text_w - (ours_rect.width() - gutter - TEXT_PAD)).max(0.0);
+    // Every pane wraps at the width of the narrowest, so a line takes as
+    // many rows in each and the panes stay level.
+    let columns = look.wrap.then(|| {
+        let width = narrow - gutter - TEXT_PAD - diff::WRAP_MARGIN;
+        ((width / char_w).floor().max(0.0) as usize).max(diff::MIN_WRAP_COLUMNS)
+    });
+    let wrapped = columns.map(|columns| {
+        [0, 1, 2].map(|i| {
+            let pane = &panes.texts[i];
+            let lines = || pane.lines().iter().map(|line| line.text.as_str());
+            diff::wrap_rows(ui, ui.id().with(("conflict-wrap", i)), &pane.diff, columns, || diff::first_rows(lines(), columns))
+        })
+    });
+
+    let plan_for = PlanFor { line_h: line_h(), columns, ancestor, texts: panes.serial };
+    if view.replan || view.plan_for != plan_for {
+        // Another wrap width or font size moves every row: keep the line at
+        // the top of the view where it is.
+        let anchor = (view.plan_for != plan_for && view.plan_for.texts == plan_for.texts).then(|| {
+            let old = Texts { panes: &panes.texts, wrapped: view.wrapped.as_ref(), typed: &view.typed, columns: view.plan_for.columns };
+            Anchor::at(&view.plan, &old, merge, view.scroll.y, view.plan_for.line_h)
+        });
+        let blocks = view.plan.blocks.len();
+        view.typed.update(&view.draft, view.editing.as_ref(), columns);
+        let texts = Texts { panes: &panes.texts, wrapped: wrapped.as_ref(), typed: &view.typed, columns };
+        view.plan = Plan::build(merge, &view.draft, view.editing.as_ref(), &texts, ancestor);
+        if let Some(y) = anchor.flatten().filter(|_| view.plan.blocks.len() == blocks).and_then(|a| a.find(&view.plan, &texts, merge)) {
+            view.scroll.y = y;
+        }
+        view.wrapped.clone_from(&wrapped);
+        view.replan = false;
+        view.plan_for = plan_for;
+        // More lines than the numbers had room for: lay out again.
+        if view.plan.lines.max(1).ilog10() + 1 != digits {
+            view.replan = true;
+            ui.ctx().request_repaint();
+        }
+    }
+    if let Some(block) = view.jump.take().and_then(|index| view.plan.conflict(index)) {
+        view.scroll.y = block.top - jump_margin();
+    }
+
+    let text_w = view.plan.longest as f32 * char_w + 40.0;
+    let max_x = if columns.is_some() { 0.0 } else { (text_w - (narrow - gutter - TEXT_PAD)).max(0.0) };
     let result_rect = if max_x > 0.0 {
         Rect::from_min_max(below.min, pos2(below.right(), below.bottom() - SCROLLBAR))
     } else {
@@ -986,8 +1373,11 @@ fn text_ui(
     view.scroll.x = view.scroll.x.clamp(0.0, max_x);
 
     // Pane headers.
-    let (ours_head, theirs_head) = heads.split_left_right_at_x(middle);
-    pane_header(ui, ours_head, &file.ours_info, side_color(Side::Ours));
+    pane_header(ui, Rect::from_x_y_ranges(ours_rect.x_range(), heads.y_range()), &file.ours_info, side_color(Side::Ours));
+    if let Some(base) = base_rect {
+        pane_header(ui, Rect::from_x_y_ranges(base.x_range(), heads.y_range()), &file.base_info, ancestor_color());
+    }
+    let theirs_head = Rect::from_x_y_ranges(theirs_rect.x_range(), heads.y_range());
     pane_header(ui, theirs_head, &file.theirs_info, side_color(Side::Theirs));
     let status = if saving {
         "saving…"
@@ -1013,22 +1403,45 @@ fn text_ui(
         );
     }
 
+    let path = file.path.as_str();
+    let ctx = ui.ctx().clone();
+    let styles = [0, 1, 2].map(|i| view.styles.get(i, &ctx, &panes.texts[i].diff, path, look.highlight));
+    let typed_style = view.styles.get(TYPED, &ctx, &view.typed.diff, path, look.highlight);
+    let [ours_style, theirs_style, base_style] = styles;
     let scene = Scene {
         merge,
         draft: &view.draft,
         plan: &view.plan,
+        texts: Texts { panes: &panes.texts, wrapped: wrapped.as_ref(), typed: &view.typed, columns },
+        styles: [ours_style, theirs_style, base_style, typed_style],
         scroll: view.scroll,
         current: view.current,
         font,
         char_w,
+        space_w,
+        tab_w,
+        tab_width: text::tab_width(),
         gutter,
     };
-    side_pane(ui, &scene, ours_rect, Side::Ours, &mut actions);
-    side_pane(ui, &scene, theirs_rect, Side::Theirs, &mut actions);
+    let [ours_sel, theirs_sel, base_sel] = &mut view.selections;
+    let fingerprint = |version: Version| panes.serial << 2 | version as u64;
+    let mut scrolled = Vec2::ZERO;
+    scrolled += version_pane(ui, &scene, ours_rect, Version::Ours, ours_sel, fingerprint(Version::Ours), &mut actions);
+    scrolled += version_pane(ui, &scene, theirs_rect, Version::Theirs, theirs_sel, fingerprint(Version::Theirs), &mut actions);
+    if let Some(base) = base_rect {
+        if file.base.is_some() {
+            scrolled += version_pane(ui, &scene, base, Version::Base, base_sel, fingerprint(Version::Base), &mut actions);
+        } else {
+            no_ancestor(ui, base);
+        }
+    }
     let cursor = result_pane(ui, &scene, result_rect, text_w, &mut view.editing, &mut actions);
+    drop(scene);
 
     let painter = ui.painter();
-    painter.vline(middle + 0.5, sides.y_range(), Stroke::new(1.0, theme::border()));
+    for i in 1..columns_on_top {
+        painter.vline(edge(i) + 0.5, sides.y_range(), Stroke::new(1.0, theme::border()));
+    }
 
     // Scrollbars, with a tick for every conflict.
     let marks: Vec<(f32, Color32)> = view
@@ -1047,10 +1460,15 @@ fn text_ui(
     scrollbar(ui, bar, "conflict-vscroll", &mut view.scroll.y, max_y, view_h, true, &marks);
     if max_x > 0.0 {
         let bar = Rect::from_min_max(pos2(below.left() + gutter, result_rect.bottom()), below.max);
-        let width = ours_rect.width() - gutter - TEXT_PAD;
+        let width = narrow - gutter - TEXT_PAD;
         scrollbar(ui, bar, "conflict-hscroll", &mut view.scroll.x, max_x, width, false, &[]);
     }
 
+    // A selection dragged past the edge of its pane scrolls them all.
+    if scrolled != Vec2::ZERO {
+        view.scroll += scrolled;
+        ui.ctx().request_repaint();
+    }
     // Keep the text cursor in view while typing.
     if let Some(cursor) = cursor {
         if cursor.top() < result_rect.top() {
@@ -1121,8 +1539,30 @@ fn title_buttons(ui: &mut Ui, free: Rect, open: usize, dirty: bool, (saving, mer
     });
 }
 
-/// Progress, navigation and the bulk choices.
-fn toolbar(ui: &mut Ui, open: usize, total: usize, saving: bool, actions: &mut Vec<Action>) {
+/// A labelled switch of the toolbar that stays pressed while `on`; true
+/// when it was clicked.
+fn switch(ui: &mut Ui, icon: &str, label: &str, on: bool, tip: &str) -> bool {
+    let font = theme::font(12.0);
+    let text = format!("{icon} {label}");
+    let galley = ui.painter().layout_no_wrap(text, font, theme::text());
+    let (rect, response) = ui.allocate_exact_size(vec2(galley.size().x + 16.0, 24.0), Sense::click());
+    let response = response.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip);
+    let fill = if on {
+        theme::bg_selected()
+    } else if response.hovered() {
+        theme::bg_raised()
+    } else {
+        Color32::TRANSPARENT
+    };
+    ui.painter().rect(rect, 3.0, fill, Stroke::new(1.0, theme::border()), StrokeKind::Inside);
+    let color = if on { theme::text_bright() } else { theme::text_dim() };
+    let at = pos2(rect.left() + 8.0, rect.center().y - galley.size().y / 2.0);
+    ui.painter().galley(at, galley, color);
+    response.clicked()
+}
+
+/// Progress, navigation, what is shown, and the bulk choices.
+fn toolbar(ui: &mut Ui, open: usize, total: usize, saving: bool, (ancestor, wrap): (bool, bool), actions: &mut Vec<Action>) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), TOOLBAR_H), Sense::hover());
     ui.painter().rect_filled(rect, 0.0, theme::bg_panel());
     ui.painter().hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::border()));
@@ -1151,6 +1591,23 @@ fn toolbar(ui: &mut Ui, open: usize, total: usize, saving: bool, actions: &mut V
             if icon_button(ui, icons::ARROW_DOWN, 14.0, "Next conflict (Alt+Down)").clicked() {
                 actions.push(Action::Step(1));
             }
+        }
+        ui.add_space(10.0);
+        let tip = if ancestor {
+            "Hide the common ancestor's version of each conflict"
+        } else {
+            "Show what the common ancestor had in place of each conflict, between the two sides"
+        };
+        if switch(ui, icons::GIT_FORK, "Ancestor", ancestor, tip) {
+            actions.push(Action::ShowAncestor(!ancestor));
+        }
+        let tip = if wrap {
+            "Keep long lines on one row and scroll sideways (Preferences > Editor > Word Wrap)"
+        } else {
+            "Let long lines continue on the next row (Preferences > Editor > Word Wrap)"
+        };
+        if switch(ui, icons::TEXT_INDENT, "Wrap", wrap, tip) {
+            actions.push(Action::Wrap(!wrap));
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1207,24 +1664,6 @@ fn pane_header(ui: &Ui, rect: Rect, info: &SideInfo, color: Color32) {
         rect.right() - x - 8.0,
     );
     widgets::galley_left(&painter, rect, x, galley);
-}
-
-fn row_job(text: &str, font: &FontId, color: Color32) -> LayoutJob {
-    let format = TextFormat { font_id: font.clone(), color, line_height: Some(line_h()), ..Default::default() };
-    let mut job = LayoutJob::single_section(text.to_owned(), format);
-    job.wrap.max_width = f32::INFINITY;
-    job
-}
-
-/// One line of file text in a row whose top is `top`. Laid out exactly as
-/// the editor lays its text out, so opening the editor moves nothing.
-fn draw_line(painter: &Painter, x: f32, top: f32, text: &str, font: &FontId, color: Color32) {
-    let shown = match text.char_indices().nth(MAX_SHOWN) {
-        Some((end, _)) => &text[..end],
-        None => text,
-    };
-    let galley = painter.layout_job(row_job(shown, font, color));
-    painter.galley(pos2(x, top), galley, color);
 }
 
 /// The font of line numbers: the code font, a little smaller.
@@ -1291,129 +1730,321 @@ fn outline_current(painter: &Painter, pane: Rect, block: &Block, top: f32) {
     );
 }
 
-/// One side of the conflict: the merged text, with this side's version of
-/// every conflict and a checkbox to take it.
-fn side_pane(ui: &mut Ui, scene: &Scene<'_>, rect: Rect, side: Side, actions: &mut Vec<Action>) {
-    let (pane, salt, take) = match side {
-        Side::Ours => (0, "conflict-ours", "Take current"),
-        Side::Theirs => (1, "conflict-theirs", "Take incoming"),
+/// How a run of lines is painted.
+#[derive(Clone, Copy)]
+struct LineLook {
+    /// Behind each row, right of the numbers.
+    fill: Option<Color32>,
+    /// Text without a syntax colour.
+    plain: Color32,
+    /// How far every colour fades towards the background (0: not at all).
+    fade: f32,
+}
+
+impl LineLook {
+    fn plain(color: Color32) -> Self {
+        LineLook { fill: None, plain: color, fade: 0.0 }
+    }
+}
+
+/// Paints lines `lines` of `rows` one under the other from `top` in `pane`:
+/// numbered from `number`, coloured by `spans` (the styling of the hunk
+/// `rows` are from), each wrapped line on as many rows as it takes, with the
+/// part of `selection` (a selection in these very lines) behind the text.
+#[allow(clippy::too_many_arguments)]
+fn paint_lines(
+    (painter, text_painter): (&Painter, &Painter),
+    scene: &Scene<'_>,
+    pane: Rect,
+    top: f32,
+    rows: Rows<'_>,
+    spans: Option<&HunkView<'_>>,
+    lines: Range<usize>,
+    number: usize,
+    look: LineLook,
+    selection: Option<&Selection>,
+) {
+    let line_h = line_h();
+    let clip = painter.clip_rect();
+    let first = rows.start(lines.start);
+    let shown = visible_rows(top, rows.count(lines.clone()), clip);
+    if shown.is_empty() {
+        return;
+    }
+    let text_x = pane.left() + scene.gutter + TEXT_PAD - scene.scroll.x;
+    let mut line = rows.line_at(first + shown.start).max(lines.start);
+    while line < lines.end {
+        let y = top + (rows.start(line) - first) as f32 * line_h;
+        if y >= clip.bottom() {
+            break;
+        }
+        let text = &rows.lines[line].text;
+        let colours = spans.map_or(&[][..], |view| view.spans(line));
+        let parts = diff::segments(text, scene.texts.columns);
+        // Only a wrapped line needs its length for the selection.
+        let len = if parts.len() > 1 { parts.last().map_or(0, |(cols, _)| cols.end) } else { 0 };
+        for (k, (cols, bytes)) in parts.into_iter().enumerate() {
+            let row_top = y + k as f32 * line_h;
+            if row_top + line_h <= clip.top() {
+                continue;
+            }
+            if row_top >= clip.bottom() {
+                break;
+            }
+            let row = row_rect(scene.gutter, pane, row_top);
+            if let Some(fill) = look.fill {
+                painter.rect_filled(row, 0.0, fill);
+            }
+            if k == 0 {
+                draw_number(painter, scene.gutter, pane, row_top, number + line - lines.start);
+            }
+            let job = conflict_text::row_job(text, bytes, colours, &scene.font, look.plain, look.fade, line_h);
+            let galley = text_painter.layout_job(job);
+            if let Some(selection) = selection {
+                if len == 0 {
+                    selection.paint(text_painter, line, &galley, text_x, row, scene.char_w);
+                } else {
+                    selection.paint_part(text_painter, line, &galley, text_x, row, scene.char_w, cols, len);
+                }
+            }
+            text_painter.galley(pos2(text_x, row_top), galley, look.plain);
+        }
+        line += 1;
+    }
+}
+
+/// The shown column of `text` nearest to `x` (from where the text starts)
+/// in row `row` of it when wrapped.
+fn column_in(painter: &Painter, scene: &Scene<'_>, text: &str, row: usize, x: f32) -> usize {
+    let parts = diff::segments(text, scene.texts.columns);
+    let (cols, bytes) = parts[row.min(parts.len() - 1)].clone();
+    let galley = painter.layout_no_wrap(text[bytes].to_owned(), scene.font.clone(), theme::text());
+    cols.start + textsel::column_at(&galley, x)
+}
+
+/// Of lines `lines` of `rows`, the one row `row` (counted from the first of
+/// them) is on, and the shown column nearest to `x` there. Past the last
+/// row, the end of the last line.
+fn line_and_column(
+    painter: &Painter,
+    scene: &Scene<'_>,
+    rows: Rows<'_>,
+    lines: Range<usize>,
+    row: usize,
+    x: f32,
+) -> Option<(usize, usize)> {
+    let last = lines.end.checked_sub(1).filter(|last| *last >= lines.start)?;
+    let first = rows.start(lines.start);
+    if row >= rows.count(lines.clone()) {
+        return Some((last, rows.lines[last].text.chars().count()));
+    }
+    let line = rows.line_at(first + row).clamp(lines.start, last);
+    let column = column_in(painter, scene, &rows.lines[line].text, first + row - rows.start(line), x);
+    Some((line, column))
+}
+
+/// The place in `version`'s text nearest to the screen point `pos`, for
+/// selecting there.
+fn pane_pos(painter: &Painter, scene: &Scene<'_>, version: Version, pane: Rect, pos: Pos2) -> Pos {
+    let rows = scene.texts.pane(version);
+    let y = pos.y - pane.top() + scene.scroll.y;
+    let Some(block) = scene.plan.nearest(y) else { return Pos::default() };
+    let lines = scene.texts.block_lines(scene.merge, version, block);
+    let body = block.top + head_h(block);
+    let text_x = pane.left() + scene.gutter + TEXT_PAD - scene.scroll.x;
+    let start = Pos::new(lines.start.min(rows.lines.len().saturating_sub(1)), 0);
+    if y < body {
+        return start;
+    }
+    let row = ((y - body) / line_h()) as usize;
+    match line_and_column(painter, scene, rows, lines, row, pos.x - text_x) {
+        Some((line, column)) => Pos::new(line, column),
+        // A side with no lines here: where the next line begins.
+        None => start,
+    }
+}
+
+/// The strip above a side's version of a conflict: the box that takes it.
+#[allow(clippy::too_many_arguments)]
+fn take_strip(ui: &Ui, painter: &Painter, head: Rect, index: usize, side: Side, used: Used, lines: usize, actions: &mut Vec<Action>) {
+    let take = match side {
+        Side::Ours => "Take current",
+        Side::Theirs => "Take incoming",
     };
     let color = side_color(side);
+    let hit = ui.interact(head, ui.id().with(("take", index)), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
+    let strength = match (used != Used::No, hit.hovered()) {
+        (true, _) => 0.36,
+        (false, true) => 0.26,
+        (false, false) => 0.17,
+    };
+    painter.rect_filled(head, 0.0, theme::mix(theme::bg_app(), color, strength));
+    let cy = head.center().y;
+    let (icon, icon_color) = match used {
+        Used::No => (icons::SQUARE, theme::text_dim()),
+        _ => (icons::CHECK_SQUARE, theme::text_bright()),
+    };
+    painter.text(pos2(head.left() + 12.0, cy), Align2::LEFT_CENTER, icon, theme::font(16.0), icon_color);
+    let label = match used {
+        Used::First => format!("{take}  ·  placed first"),
+        Used::Second => format!("{take}  ·  placed second"),
+        _ => take.to_owned(),
+    };
+    let label_color = if used == Used::No { theme::text() } else { theme::text_bright() };
+    painter.text(pos2(head.left() + 36.0, cy), Align2::LEFT_CENTER, label, theme::font(12.5), label_color);
+    painter.text(pos2(head.right() - 10.0, cy), Align2::RIGHT_CENTER, count_lines(lines), theme::font(11.5), theme::text_dim());
+    if hit.clicked() {
+        actions.push(Action::Toggle(index, side));
+    }
+}
+
+/// The strip above the ancestor's version of a conflict.
+fn ancestor_strip(painter: &Painter, head: Rect, lines: usize) {
+    painter.rect_filled(head, 0.0, theme::mix(theme::bg_app(), ancestor_color(), 0.17));
+    let cy = head.center().y;
+    painter.text(pos2(head.left() + 12.0, cy), Align2::LEFT_CENTER, icons::GIT_FORK, theme::font(15.0), theme::text_dim());
+    painter.text(pos2(head.left() + 36.0, cy), Align2::LEFT_CENTER, "Before either side", theme::font(12.5), theme::text());
+    painter.text(pos2(head.right() - 10.0, cy), Align2::RIGHT_CENTER, count_lines(lines), theme::font(11.5), theme::text_dim());
+}
+
+fn count_lines(lines: usize) -> String {
+    match lines {
+        0 => "no lines".to_owned(),
+        1 => "1 line".to_owned(),
+        n => format!("{n} lines"),
+    }
+}
+
+/// A pane with a text of its own: one side of the conflict with a box to
+/// take its version of each conflict, or the ancestor. Its text can be
+/// selected and copied. Returns how far a selection dragged past the edge
+/// scrolls the view.
+#[allow(clippy::too_many_arguments)]
+fn version_pane(
+    ui: &mut Ui,
+    scene: &Scene<'_>,
+    rect: Rect,
+    version: Version,
+    selection: &mut Selection,
+    fingerprint: u64,
+    actions: &mut Vec<Action>,
+) -> Vec2 {
+    let (salt, side) = match version {
+        Version::Ours => ("conflict-ours", Some(Side::Ours)),
+        Version::Theirs => ("conflict-theirs", Some(Side::Theirs)),
+        Version::Base => ("conflict-base", None),
+    };
+    let color = side.map_or(ancestor_color(), side_color);
     let ui = &mut pane_ui(ui, rect, salt);
-    let background = ui.interact(rect, ui.id().with("background"), Sense::click());
     let (painter, text_painter) = pane_backdrop(ui, rect, scene.gutter);
-    let text_x = rect.left() + scene.gutter + TEXT_PAD - scene.scroll.x;
-    let clicked = background.clicked().then(|| background.interact_pointer_pos()).flatten();
+    let painters = (&painter, &text_painter);
+    let pane = &scene.texts.panes[version as usize];
+    let rows = scene.texts.pane(version);
+    let style = scene.styles[version as usize].hunk(0);
+    let line_h = line_h();
+
+    // Selecting first: the strips and line numbers on top take their own clicks.
+    let text_rect = Rect::from_min_max(pos2(rect.left() + scene.gutter, rect.top()), rect.max);
+    selection.follow(&pane.diff, ui.ctx().cumulative_frame_nr(), || fingerprint);
+    let mut scrolled = Vec2::ZERO;
+    let hit = |pos: Pos2| pane_pos(&painter, scene, version, rect, pos);
+    let response = selection.interact_scrolling(ui, ui.id().with("text"), text_rect, rect, pane, hit, |by| scrolled += by);
+    response.context_menu(|ui| selection.menu(ui, pane));
+    let selection = &*selection;
 
     for block in scene.plan.visible(scene.scroll.y, rect.height()) {
         let top = rect.top() + block.top - scene.scroll.y;
+        let lines = scene.texts.block_lines(scene.merge, version, block);
+        let number = block.above[version as usize] + 1;
+        let used_rows = rows.count(lines.clone());
         match block.kind {
-            Kind::Stable { seg, from, to } => {
-                let Segment::Stable(chunk) = &scene.merge.segments[seg] else { continue };
-                for row in visible_rows(top, to - from, rect) {
-                    let y = top + row as f32 * line_h();
-                    draw_number(&painter, scene.gutter, rect, y, block.above[pane] + row + 1);
-                    draw_line(&text_painter, text_x, y, &chunk.line(from + row), &scene.font, theme::text());
-                }
+            Kind::Stable { .. } => {
+                let look = LineLook::plain(theme::text());
+                paint_lines(painters, scene, rect, top, rows, style.as_ref(), lines, number, look, Some(selection));
             }
-            Kind::Edited { seg, line } => {
-                // The sides keep showing the line as it was merged.
-                let Segment::Stable(chunk) = &scene.merge.segments[seg] else { continue };
-                draw_number(&painter, scene.gutter, rect, top, block.above[pane] + 1);
-                draw_line(&text_painter, text_x, top, &chunk.line(line), &scene.font, theme::text());
-                for row in 1..block.rows {
-                    let filler = row_rect(scene.gutter, rect, top + row as f32 * line_h());
-                    painter.rect_filled(filler, 0.0, theme::bg_void());
+            Kind::Edited { .. } => {
+                // The panes keep showing the line as it was merged.
+                let look = LineLook::plain(theme::text());
+                paint_lines(painters, scene, rect, top, rows, style.as_ref(), lines, number, look, Some(selection));
+                for row in visible_rows(top, block.rows, painter.clip_rect()).filter(|row| *row >= used_rows) {
+                    painter.rect_filled(row_rect(scene.gutter, rect, top + row as f32 * line_h), 0.0, theme::bg_void());
                 }
             }
             Kind::Conflict { index } => {
-                let Some((ours, theirs)) = scene.merge.conflict(index) else { continue };
-                let chunk = match side {
-                    Side::Ours => ours,
-                    Side::Theirs => theirs,
-                };
                 let choice = scene.draft.choices.get(index).unwrap_or(&Resolution::Unresolved);
-                let used = used(choice, side);
+                let used = side.map_or(Used::No, |side| used(choice, side));
                 let open = *choice == Resolution::Unresolved;
-
-                // Header strip: the checkbox that takes this side.
                 let head = Rect::from_min_max(pos2(rect.left(), top), pos2(rect.right(), top + HEAD_H));
-                let hit = ui
-                    .interact(head, ui.id().with(("take", index)), Sense::click())
-                    .on_hover_cursor(CursorIcon::PointingHand);
-                let strength = match (used != Used::No, hit.hovered()) {
-                    (true, _) => 0.36,
-                    (false, true) => 0.26,
-                    (false, false) => 0.17,
-                };
-                painter.rect_filled(head, 0.0, theme::mix(theme::bg_app(), color, strength));
-                let cy = head.center().y;
-                let (icon, icon_color) = match used {
-                    Used::No => (icons::SQUARE, theme::text_dim()),
-                    _ => (icons::CHECK_SQUARE, theme::text_bright()),
-                };
-                painter.text(pos2(head.left() + 12.0, cy), Align2::LEFT_CENTER, icon, theme::font(16.0), icon_color);
-                let label = match used {
-                    Used::First => format!("{take}  ·  placed first"),
-                    Used::Second => format!("{take}  ·  placed second"),
-                    _ => take.to_owned(),
-                };
-                let label_color = if used == Used::No { theme::text() } else { theme::text_bright() };
-                let at = pos2(head.left() + 36.0, cy);
-                painter.text(at, Align2::LEFT_CENTER, label, theme::font(12.5), label_color);
-                let lines = match chunk.len() {
-                    0 => "no lines".to_owned(),
-                    1 => "1 line".to_owned(),
-                    n => format!("{n} lines"),
-                };
-                let at = pos2(head.right() - 10.0, cy);
-                painter.text(at, Align2::RIGHT_CENTER, lines, theme::font(11.5), theme::text_dim());
-                if hit.clicked() {
-                    actions.push(Action::Toggle(index, side));
+                match side {
+                    Some(side) => take_strip(ui, &painter, head, index, side, used, lines.len(), actions),
+                    None => ancestor_strip(&painter, head, lines.len()),
                 }
 
-                // This side's lines.
+                // This version's lines. A click on their numbers takes the side.
                 let body_top = top + HEAD_H;
-                let (tint, text_color) = match (used != Used::No, open) {
-                    (true, _) => (0.22, theme::text_bright()),
-                    (false, true) => (0.11, theme::text()),
-                    // Resolved without this side.
-                    (false, false) => (0.04, theme::text_dim()),
-                };
-                for row in visible_rows(body_top, block.rows, rect) {
-                    let y = body_top + row as f32 * line_h();
-                    if row < chunk.len() {
-                        let fill = theme::mix(theme::bg_app(), color, tint);
-                        painter.rect_filled(row_rect(scene.gutter, rect, y), 0.0, fill);
-                        draw_number(&painter, scene.gutter, rect, y, block.above[pane] + row + 1);
-                        draw_line(&text_painter, text_x, y, &chunk.line(row), &scene.font, text_color);
-                    } else {
-                        painter.rect_filled(row_rect(scene.gutter, rect, y), 0.0, theme::bg_void());
-                        if chunk.is_empty() && row == 0 {
-                            draw_remark(&painter, scene.gutter, rect, y, "no lines on this side", theme::text_faint());
-                        }
+                let numbers = Rect::from_min_max(
+                    pos2(rect.left(), body_top),
+                    pos2(rect.left() + scene.gutter, body_top + used_rows as f32 * line_h),
+                );
+                if let Some(side) = side
+                    && !lines.is_empty()
+                {
+                    let hint = match side {
+                        Side::Ours => "Take the current side's lines",
+                        Side::Theirs => "Take the incoming side's lines",
+                    };
+                    let hit = ui
+                        .interact(numbers, ui.id().with(("take-lines", index)), Sense::click())
+                        .on_hover_cursor(CursorIcon::PointingHand)
+                        .on_hover_text(hint);
+                    if hit.hovered() {
+                        painter.rect_filled(numbers, 0.0, theme::mix(theme::bg_panel(), color, 0.3));
+                    }
+                    if hit.clicked() {
+                        actions.push(Action::Toggle(index, side));
                     }
                 }
-                if used != Used::No && !chunk.is_empty() {
-                    let bar = Rect::from_min_size(
-                        pos2(rect.left() + scene.gutter, body_top),
-                        vec2(3.0, chunk.len() as f32 * line_h()),
-                    );
+                let (tint, plain, fade) = match (side, used != Used::No, open) {
+                    (None, _, _) => (0.08, theme::text(), 0.0),
+                    (Some(_), true, _) => (0.22, theme::text_bright(), 0.0),
+                    (Some(_), false, true) => (0.11, theme::text(), 0.0),
+                    // Resolved without this side.
+                    (Some(_), false, false) => (0.04, theme::text(), 0.45),
+                };
+                let look = LineLook { fill: Some(theme::mix(theme::bg_app(), color, tint)), plain, fade };
+                paint_lines(painters, scene, rect, body_top, rows, style.as_ref(), lines.clone(), number, look, Some(selection));
+                for row in visible_rows(body_top, block.rows, painter.clip_rect()).filter(|row| *row >= used_rows) {
+                    let y = body_top + row as f32 * line_h;
+                    painter.rect_filled(row_rect(scene.gutter, rect, y), 0.0, theme::bg_void());
+                    if lines.is_empty() && row == 0 {
+                        let remark = if side.is_some() { "no lines on this side" } else { "the ancestor had no lines here" };
+                        draw_remark(&painter, scene.gutter, rect, y, remark, theme::text_faint());
+                    }
+                }
+                if used != Used::No && !lines.is_empty() {
+                    let bar = Rect::from_min_size(pos2(rect.left() + scene.gutter, body_top), vec2(3.0, used_rows as f32 * line_h));
                     painter.rect_filled(bar, 0.0, color);
                 }
                 if index == scene.current {
                     outline_current(&painter, rect, block, top);
                 }
-                // Clicking the lines themselves takes the side too.
-                if let Some(pos) = clicked
-                    && pos.y >= body_top
-                    && pos.y < top + block.bottom - block.top
-                {
-                    actions.push(Action::Toggle(index, side));
-                }
             }
         }
     }
+    scrolled
+}
+
+/// The ancestor's pane when there is no ancestor.
+fn no_ancestor(ui: &Ui, rect: Rect) {
+    let painter = ui.painter().with_clip_rect(rect.intersect(ui.clip_rect()));
+    painter.rect_filled(rect, 0.0, theme::bg_app());
+    let center = rect.center();
+    painter.text(center - vec2(0.0, 34.0), Align2::CENTER_CENTER, icons::GIT_FORK, theme::font(28.0), theme::text_faint());
+    painter.text(center - vec2(0.0, 8.0), Align2::CENTER_CENTER, "No common ancestor", theme::bold(13.5), theme::text_dim());
+    let text = "Both sides added this file, so there is no earlier version to compare them with.";
+    let galley = painter.layout(text.to_owned(), theme::font(12.0), theme::text_faint(), (rect.width() - 32.0).max(40.0));
+    let at = pos2(center.x - galley.size().x / 2.0, center.y + 6.0);
+    painter.galley(at, galley, theme::text_faint());
 }
 
 fn state_label(choice: &Resolution) -> (&'static str, Color32) {
@@ -1426,6 +2057,40 @@ fn state_label(choice: &Resolution) -> (&'static str, Color32) {
         Resolution::Neither => ("both sides dropped", theme::text()),
         Resolution::Custom(_) => ("typed by hand", typed()),
     }
+}
+
+/// The line (counted in the editor's text) and character to put the text
+/// cursor at for a click `row` rows into the result of a conflict, `x`
+/// points into the text.
+fn conflict_place(painter: &Painter, scene: &Scene<'_>, index: usize, row: usize, x: f32) -> (usize, usize) {
+    let choice = scene.draft.choices.get(index).unwrap_or(&Resolution::Unresolved);
+    if let Resolution::Custom(_) = choice {
+        return typed_place(painter, scene, Target::Conflict(index), row, x);
+    }
+    let Some(&seg) = scene.merge.conflicts.get(index) else { return (0, 0) };
+    let (mut above_rows, mut above_lines) = (0, 0);
+    for (side, range) in scene.texts.taken(choice, seg) {
+        let version = version_of(side);
+        let rows = scene.texts.pane(version);
+        let count = rows.count(range.clone());
+        if row < above_rows + count {
+            let Some((line, column)) = line_and_column(painter, scene, rows, range.clone(), row - above_rows, x) else { break };
+            let pane = &scene.texts.panes[version as usize];
+            let source = textsel::Lines::source(pane, line).unwrap_or(&rows.lines[line].text);
+            return (above_lines + line - range.start, conflict_text::source_char(source, column, scene.tab_width));
+        }
+        above_rows += count;
+        above_lines += range.len();
+    }
+    (0, 0)
+}
+
+/// [`conflict_place`] for text typed by hand.
+fn typed_place(painter: &Painter, scene: &Scene<'_>, target: Target, row: usize, x: f32) -> (usize, usize) {
+    let Some((hunk, rows)) = scene.texts.typed(target) else { return (0, 0) };
+    let Some((line, column)) = line_and_column(painter, scene, rows, 0..rows.lines.len(), row, x) else { return (0, 0) };
+    let source = scene.texts.typed.pieces[hunk].1.split('\n').nth(line).unwrap_or_default();
+    (line, conflict_text::source_char(source, column, scene.tab_width))
 }
 
 /// The result: what the file will contain. Returns where the text cursor is
@@ -1441,46 +2106,49 @@ fn result_pane(
     let ui = &mut pane_ui(ui, rect, "conflict-result");
     let background = ui.interact(rect, ui.id().with("background"), Sense::click()).on_hover_cursor(CursorIcon::Text);
     let (painter, text_painter) = pane_backdrop(ui, rect, scene.gutter);
+    let painters = (&painter, &text_painter);
     let text_x = rect.left() + scene.gutter + TEXT_PAD - scene.scroll.x;
     let total = scene.draft.choices.len();
+    let line_h = line_h();
+    let ours = scene.texts.pane(Version::Ours);
+    let side_styles = [scene.styles[0].hunk(0), scene.styles[1].hunk(0)];
+    let side_style = |side: Side| side_styles[version_of(side) as usize].as_ref();
     let mut cursor = None;
 
     for block in scene.plan.visible(scene.scroll.y, rect.height()) {
         let top = rect.top() + block.top - scene.scroll.y;
+        let number = block.above[RESULT] + 1;
         match block.kind {
-            Kind::Stable { seg, from, to } => {
-                let Segment::Stable(chunk) = &scene.merge.segments[seg] else { continue };
-                for row in visible_rows(top, to - from, rect) {
-                    let y = top + row as f32 * line_h();
-                    draw_number(&painter, scene.gutter, rect, y, block.above[2] + row + 1);
-                    draw_line(&text_painter, text_x, y, &chunk.line(from + row), &scene.font, theme::text());
-                }
+            Kind::Stable { .. } => {
+                let lines = scene.texts.block_lines(scene.merge, Version::Ours, block);
+                let look = LineLook::plain(theme::text());
+                paint_lines(painters, scene, rect, top, ours, side_style(Side::Ours), lines, number, look, None);
             }
             Kind::Edited { seg, line } => {
                 let target = Target::Line { seg, line };
                 let area = Rect::from_min_max(
                     pos2(rect.left() + scene.gutter, top),
-                    pos2(rect.right(), top + block.rows as f32 * line_h()),
+                    pos2(rect.right(), top + block.rows as f32 * line_h),
                 );
                 painter.rect_filled(area, 0.0, theme::mix(theme::bg_app(), typed(), 0.13));
+                let piece = scene.texts.typed(target);
                 if let Some(open) = editing.as_mut().filter(|e| e.target == target) {
-                    for row in visible_rows(top, block.rows, rect) {
-                        let y = top + row as f32 * line_h();
-                        draw_number(&painter, scene.gutter, rect, y, block.above[2] + row + 1);
+                    let out = editor(ui, scene, rect, area, text_x, text_w, open, piece.map(|(hunk, _)| hunk), actions);
+                    for (k, y) in out.line_tops.iter().enumerate() {
+                        draw_number(&painter, scene.gutter, rect, *y, number + k);
                     }
-                    cursor = editor(ui, scene, rect, area, text_x, text_w, open, actions);
+                    cursor = out.cursor;
                 } else {
-                    let typed = scene.draft.edits.get(&(seg, line)).map(String::as_str).unwrap_or_default();
-                    if typed.is_empty() {
-                        draw_remark(&painter, scene.gutter, rect, top, "line removed", theme::text_dim());
-                    }
-                    for (row, text) in typed.split('\n').enumerate().take(text_rows(typed)) {
-                        let y = top + row as f32 * line_h();
-                        draw_number(&painter, scene.gutter, rect, y, block.above[2] + row + 1);
-                        draw_line(&text_painter, text_x, y, text, &scene.font, theme::text_bright());
+                    match piece {
+                        Some((hunk, rows)) if !rows.lines.is_empty() => {
+                            let view = scene.styles[TYPED].hunk(hunk);
+                            let look = LineLook::plain(theme::text_bright());
+                            paint_lines(painters, scene, rect, top, rows, view.as_ref(), 0..rows.lines.len(), number, look, None);
+                        }
+                        _ => draw_remark(&painter, scene.gutter, rect, top, "line removed", theme::text_dim()),
                     }
                     let size = tint_button_size(ui, "Restore");
-                    let corner = pos2(rect.right() - size.x - 8.0, top + (line_h() - size.y) / 2.0);
+                    let corner = pos2(rect.right() - size.x - 8.0, top + (line_h - size.y) / 2.0);
                     let button = Rect::from_min_size(corner, size);
                     if ui.rect_contains_pointer(area)
                         && tint_button_at(ui, button, "Restore", theme::red())
@@ -1493,7 +2161,7 @@ fn result_pane(
                 painter.rect_filled(Rect::from_min_size(area.min, vec2(3.0, area.height())), 0.0, typed());
             }
             Kind::Conflict { index } => {
-                let Some((ours, theirs)) = scene.merge.conflict(index) else { continue };
+                let Some(&seg) = scene.merge.conflicts.get(index) else { continue };
                 let choice = scene.draft.choices.get(index).unwrap_or(&Resolution::Unresolved);
                 let open = *choice == Resolution::Unresolved;
                 let target = Target::Conflict(index);
@@ -1552,15 +2220,16 @@ fn result_pane(
                 let body_top = top + HEAD_H;
                 let area = Rect::from_min_max(
                     pos2(rect.left() + scene.gutter, body_top),
-                    pos2(rect.right(), body_top + block.rows as f32 * line_h()),
+                    pos2(rect.right(), body_top + block.rows as f32 * line_h),
                 );
+                let piece = scene.texts.typed(target);
                 if let Some(open) = editing.as_mut().filter(|e| e.target == target) {
                     painter.rect_filled(area, 0.0, theme::mix(theme::bg_app(), typed(), 0.13));
-                    for row in visible_rows(body_top, text_rows(&open.text).max(1), rect) {
-                        let y = body_top + row as f32 * line_h();
-                        draw_number(&painter, scene.gutter, rect, y, block.above[2] + row + 1);
+                    let out = editor(ui, scene, rect, area, text_x, text_w, open, piece.map(|(hunk, _)| hunk), actions);
+                    for (k, y) in out.line_tops.iter().enumerate() {
+                        draw_number(&painter, scene.gutter, rect, *y, number + k);
                     }
-                    cursor = editor(ui, scene, rect, area, text_x, text_w, open, actions);
+                    cursor = out.cursor;
                     painter.rect_filled(Rect::from_min_size(area.min, vec2(3.0, area.height())), 0.0, typed());
                 } else if open {
                     painter.rect_filled(area, 0.0, theme::mix(theme::bg_app(), theme::orange(), 0.08));
@@ -1573,25 +2242,37 @@ fn result_pane(
                         theme::mix(theme::bg_app(), theme::orange(), 0.8),
                     );
                 } else {
-                    let count = resolved_rows(choice, ours, theirs);
-                    let rows = visible_rows(body_top, block.rows, rect);
-                    let shown = rows.start.min(count)..rows.end.min(count);
-                    let lines = resolved_lines(choice, ours, theirs, shown.clone());
-                    for (row, (text, from)) in shown.zip(lines) {
-                        let y = body_top + row as f32 * line_h();
-                        let color = from.map_or(typed(), side_color);
-                        let row_area = row_rect(scene.gutter, rect, y);
-                        painter.rect_filled(row_area, 0.0, theme::mix(theme::bg_app(), color, 0.15));
-                        painter.rect_filled(Rect::from_min_size(row_area.min, vec2(3.0, line_h())), 0.0, color);
-                        draw_number(&painter, scene.gutter, rect, y, block.above[2] + row + 1);
-                        draw_line(&text_painter, text_x, y, &text, &scene.font, theme::text_bright());
+                    // Each part of the result in the colour of where it comes
+                    // from. (The sides' styling is already held: a second
+                    // read lock on it could wait behind the highlighter.)
+                    let custom = matches!(choice, Resolution::Custom(_));
+                    let typed_view = piece.filter(|_| custom).and_then(|(hunk, _)| scene.styles[TYPED].hunk(hunk));
+                    let mut parts: Vec<(Rows<'_>, Option<&HunkView<'_>>, Range<usize>, Color32)> = Vec::new();
+                    match piece.filter(|_| custom) {
+                        Some((_, rows)) => parts.push((rows, typed_view.as_ref(), 0..rows.lines.len(), typed())),
+                        None => {
+                            for (side, range) in scene.texts.taken(choice, seg) {
+                                parts.push((scene.texts.pane(version_of(side)), side_style(side), range, side_color(side)));
+                            }
+                        }
                     }
-                    for row in rows.start.max(count)..rows.end {
-                        let y = body_top + row as f32 * line_h();
+                    let (mut row, mut line) = (0, 0);
+                    for (rows, view, range, color) in &parts {
+                        let part_top = body_top + row as f32 * line_h;
+                        let fill = Some(theme::mix(theme::bg_app(), *color, 0.15));
+                        let look = LineLook { fill, plain: theme::text_bright(), fade: 0.0 };
+                        paint_lines(painters, scene, rect, part_top, *rows, *view, range.clone(), number + line, look, None);
+                        let count = rows.count(range.clone());
+                        let bar = Rect::from_min_size(pos2(rect.left() + scene.gutter, part_top), vec2(3.0, count as f32 * line_h));
+                        painter.rect_filled(bar, 0.0, *color);
+                        row += count;
+                        line += range.len();
+                    }
+                    for filler in visible_rows(body_top, block.rows, painter.clip_rect()).filter(|r| *r >= row) {
+                        let y = body_top + filler as f32 * line_h;
                         painter.rect_filled(row_rect(scene.gutter, rect, y), 0.0, theme::bg_void());
-                        if count == 0 && row == 0 {
-                            let remark = "no lines here in the result";
-                            draw_remark(&painter, scene.gutter, rect, y, remark, theme::text_faint());
+                        if line == 0 && filler == 0 {
+                            draw_remark(&painter, scene.gutter, rect, y, "no lines here in the result", theme::text_faint());
                         }
                     }
                 }
@@ -1607,17 +2288,26 @@ fn result_pane(
         && let Some(pos) = background.interact_pointer_pos()
     {
         let y = pos.y - rect.top() + scene.scroll.y;
-        let column = ((pos.x - text_x) / scene.char_w).round().max(0.0) as usize;
+        let x = pos.x - text_x;
         if let Some(block) = scene.plan.at(y) {
-            let row = ((y - block.top) / line_h()).max(0.0) as usize;
+            let row = ((y - block.top - head_h(block)) / line_h).max(0.0) as usize;
             match block.kind {
                 Kind::Stable { seg, from, .. } => {
-                    actions.push(Action::Edit(Target::Line { seg, line: from + row }, (0, column)));
+                    let lines = scene.texts.block_lines(scene.merge, Version::Ours, block);
+                    if let Some((line, column)) = line_and_column(&painter, scene, ours, lines.clone(), row, x) {
+                        let pane = &scene.texts.panes[Version::Ours as usize];
+                        let source = textsel::Lines::source(pane, line).unwrap_or(&ours.lines[line].text);
+                        let column = conflict_text::source_char(source, column, scene.tab_width);
+                        let target = Target::Line { seg, line: from + line - lines.start };
+                        actions.push(Action::Edit(target, (0, column)));
+                    }
                 }
-                Kind::Edited { seg, line } => actions.push(Action::Edit(Target::Line { seg, line }, (row, column))),
+                Kind::Edited { seg, line } => {
+                    let target = Target::Line { seg, line };
+                    actions.push(Action::Edit(target, typed_place(&painter, scene, target, row, x)));
+                }
                 Kind::Conflict { index } if y >= block.top + HEAD_H => {
-                    let row = ((y - block.top - HEAD_H) / line_h()) as usize;
-                    actions.push(Action::Edit(Target::Conflict(index), (row, column)));
+                    actions.push(Action::Edit(Target::Conflict(index), conflict_place(&painter, scene, index, row, x)));
                 }
                 Kind::Conflict { index } => actions.push(Action::Focus(index)),
             }
@@ -1639,8 +2329,18 @@ fn char_index(text: &str, row: usize, column: usize) -> usize {
     text.chars().count()
 }
 
-/// The text editor, placed over the rows it edits. Rows have the height and
-/// font of the painted ones, so the text does not move when it opens.
+/// What the editor did this frame.
+struct EditorOut {
+    /// Where the text cursor is, when it moved.
+    cursor: Option<Rect>,
+    /// Where each line of the text starts on screen, for its number.
+    line_tops: Vec<f32>,
+}
+
+/// The text editor, placed over the rows it edits. Rows have the height,
+/// font, tab stops, colours and wrapping of the painted ones, so the text
+/// does not move when it opens. `piece` is the hunk of the typed text that
+/// was made from this editor's text, which the colours come from.
 #[allow(clippy::too_many_arguments)]
 fn editor(
     ui: &mut Ui,
@@ -1650,8 +2350,9 @@ fn editor(
     text_x: f32,
     text_w: f32,
     editing: &mut Editing,
+    piece: Option<usize>,
     actions: &mut Vec<Action>,
-) -> Option<Rect> {
+) -> EditorOut {
     let id = ui.id().with("editor");
     if let Some((row, column)) = editing.place.take() {
         let at = CCursor::new(char_index(&editing.text, row, column));
@@ -1661,18 +2362,51 @@ fn editor(
         ui.memory_mut(|memory| memory.request_focus(id));
     }
 
-    // As wide as the longest line, so typing does not hit a wrap; the pane
-    // clips it and the shared horizontal scroll moves it.
-    let width = text_w.max(editing.text.len() as f32 * scene.char_w + 40.0).max(area.right() - text_x);
+    // Colours of each line, from the highlighter once it has been through
+    // the text; a line typed since keeps the colours it had.
+    let tab_width = scene.tab_width;
+    let view = piece.and_then(|hunk| scene.styles[TYPED].hunk(hunk));
+    let known: Vec<&str> = piece.map_or_else(Vec::new, |hunk| scene.texts.typed.pieces[hunk].1.split('\n').collect());
+    let spans: Vec<Vec<Span>> = editing
+        .text
+        .split('\n')
+        .enumerate()
+        .map(|(i, line)| {
+            let fresh = view.as_ref().filter(|_| known.get(i) == Some(&line)).map(|view| view.spans(i));
+            match fresh {
+                Some(spans) if !spans.is_empty() => conflict_text::source_spans(line, spans, tab_width),
+                _ => editing.spans.get(i).cloned().unwrap_or_default(),
+            }
+        })
+        .collect();
+    drop(view);
+
+    // Wrapped, as wide as the panes wrap; else as wide as the longest line,
+    // so typing does not hit a wrap, and the pane clips it and the shared
+    // horizontal scroll moves it. The painted rows keep the space after a
+    // word that ends at the wrap width, where egui would carry the word over:
+    // one column more makes egui break where they do.
+    let width = match scene.texts.columns {
+        Some(columns) => (columns + 1) as f32 * scene.space_w + 0.5,
+        None => text_w.max(editing.text.len() as f32 * scene.char_w + 40.0).max(area.right() - text_x),
+    };
     let wide = Rect::from_min_size(pos2(text_x, area.top()), vec2(width, area.height()));
     let builder = UiBuilder::new().id_salt("editor-ui").max_rect(wide).layout(Layout::top_down(Align::Min));
     let mut child = ui.new_child(builder);
     let text_clip = Rect::from_min_max(pos2(pane.left() + scene.gutter, pane.top()), pane.max);
     child.set_clip_rect(text_clip.intersect(ui.clip_rect()));
 
-    let font = scene.font.clone();
+    let look = EditorLook {
+        font: scene.font.clone(),
+        line_h: line_h(),
+        color: theme::text_bright(),
+        space_w: scene.space_w,
+        tab_w: scene.tab_w,
+        tab_width,
+        wrap: scene.texts.columns.map(|_| width),
+    };
     let mut layouter = |ui: &Ui, buffer: &dyn TextBuffer, _wrap: f32| {
-        ui.painter().layout_job(row_job(buffer.as_str(), &font, theme::text_bright()))
+        ui.painter().layout_job(conflict_text::editor_job(buffer.as_str(), &look, &spans))
     };
     let output = TextEdit::multiline(&mut editing.text)
         .id(id)
@@ -1683,6 +2417,7 @@ fn editor(
         .lock_focus(true)
         .layouter(&mut layouter)
         .show(&mut child);
+    editing.spans = spans;
 
     let response = &output.response.response;
     if response.changed() {
@@ -1696,13 +2431,29 @@ fn editor(
     }
     editing.shown = true;
 
+    // Wrapped rows the plan should make room for.
+    let rows = output.galley.rows.len().max(1);
+    if editing.rows != Some(rows) {
+        editing.rows = Some(rows);
+        actions.push(Action::Relayout);
+    }
+    let mut line_tops = Vec::new();
+    let mut starts_line = true;
+    for placed in &output.galley.rows {
+        if starts_line {
+            line_tops.push(output.galley_pos.y + placed.pos.y);
+        }
+        starts_line = placed.ends_with_newline;
+    }
+
     let at = output.cursor_range.map(|range| range.primary);
     let moved = at.map(|c| c.index.0) != editing.cursor;
     editing.cursor = at.map(|c| c.index.0);
-    match at {
+    let cursor = match at {
         Some(at) if moved => Some(output.galley.pos_from_cursor(at).translate(output.galley_pos.to_vec2())),
         _ => None,
-    }
+    };
+    EditorOut { cursor, line_tops }
 }
 
 /// A scrollbar for one axis. `marks` are positions in content pixels to flag
@@ -1967,4 +2718,149 @@ fn side_card(ui: &mut Ui, info: &SideInfo, stage: Option<&Stage>, color: Color32
         }
     };
     widgets::text_left(&painter, bottom, rect.left() + 12.0, &text, theme::font(12.5), text_color);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use super::*;
+    use crate::git::conflict::merge_text;
+
+    fn near(found: Option<f32>, expected: f32) -> bool {
+        found.is_some_and(|y| (y - expected).abs() < 0.01)
+    }
+
+    const LONG: &str = "word word word word word word word word word word word word word word word word word word word word";
+    const THEIRS_LONG: &str = "theirs line which is long enough to wrap at twenty columns";
+
+    /// One conflict between two stretches of merged lines: one line on our
+    /// side, two on theirs, five in the ancestor.
+    fn merge() -> TextMerge {
+        let base = format!("start\n{LONG}\nb1\nb2\nb3\nb4\nb5\nend\n");
+        let ours = format!("start\n{LONG}\nours line\nend\n");
+        let theirs = format!("start\n{LONG}\n{THEIRS_LONG}\nmore theirs\nend\n");
+        let merge = merge_text(base.as_bytes(), ours.as_bytes(), theirs.as_bytes()).unwrap();
+        assert_eq!(merge.conflicts.len(), 1);
+        merge
+    }
+
+    fn panes(merge: &TextMerge) -> [PaneText; 3] {
+        [Version::Ours, Version::Theirs, Version::Base].map(|version| PaneText::new(merge, version, 4))
+    }
+
+    fn wrapped(panes: &[PaneText; 3], columns: usize) -> [Arc<Vec<u32>>; 3] {
+        panes.each_ref().map(|pane| Arc::new(diff::first_rows(pane.lines().iter().map(|l| l.text.as_str()), columns)))
+    }
+
+    fn rows(plan: &Plan) -> Vec<usize> {
+        plan.blocks.iter().map(|block| block.rows).collect()
+    }
+
+    #[test]
+    fn the_panes_stay_level_block_by_block() {
+        let merge = merge();
+        let panes = panes(&merge);
+        let typed = Typed::default();
+        let open = Draft::unresolved(&merge);
+
+        // A row per line; a conflict as tall as its tallest version, the
+        // ancestor's counting only while it is shown.
+        let plain = Texts { panes: &panes, wrapped: None, typed: &typed, columns: None };
+        assert_eq!(rows(&Plan::build(&merge, &open, None, &plain, false)), [2, 2, 1]);
+        let with_base = Plan::build(&merge, &open, None, &plain, true);
+        assert_eq!(rows(&with_base), [2, 5, 1]);
+        assert_eq!(with_base.blocks[2].above, [3, 4, 7, 2]);
+
+        // Wrapped, every pane at the same width, so the same line takes the
+        // same rows in each.
+        let columns = 20;
+        let wrap = wrapped(&panes, columns);
+        let long_rows = text::wrapped_rows(LONG, columns);
+        let theirs_rows = text::wrapped_rows(THEIRS_LONG, columns) + 1;
+        assert!(long_rows > 1 && theirs_rows > 2);
+        let texts = Texts { panes: &panes, wrapped: Some(&wrap), typed: &typed, columns: Some(columns) };
+        let plan = Plan::build(&merge, &open, None, &texts, false);
+        assert_eq!(rows(&plan), [1 + long_rows, theirs_rows, 1]);
+        assert_eq!(plan.blocks[1].top, (1 + long_rows) as f32 * line_h());
+        assert_eq!(plan.height, plan.blocks[2].bottom);
+
+        // Both sides taken: the result holds both, one after the other.
+        let both = Draft { choices: vec![Resolution::OursTheirs], edits: BTreeMap::new() };
+        let plan = Plan::build(&merge, &both, None, &texts, true);
+        assert_eq!(rows(&plan), [1 + long_rows, (1 + theirs_rows).max(5), 1]);
+        assert_eq!(plan.blocks[2].above[RESULT], 2 + 3);
+        assert_eq!(texts.resolved(&Resolution::OursTheirs, 0, 1), (3, 1 + theirs_rows));
+        assert_eq!(texts.resolved(&Resolution::Neither, 0, 1), (0, 0));
+    }
+
+    #[test]
+    fn typed_text_has_rows_of_its_own() {
+        let merge = merge();
+        let panes = panes(&merge);
+        let mut draft = Draft::unresolved(&merge);
+        draft.choices[0] = Resolution::Custom(format!("typed\n{THEIRS_LONG}"));
+        draft.edits.insert((0, 0), String::new());
+        let mut typed = Typed::default();
+        typed.update(&draft, None, Some(20));
+        let texts = Texts { panes: &panes, wrapped: None, typed: &typed, columns: Some(20) };
+
+        let (_, conflict) = texts.typed(Target::Conflict(0)).expect("the typed resolution");
+        assert_eq!(conflict.lines.len(), 2);
+        assert_eq!(conflict.all(), 1 + text::wrapped_rows(THEIRS_LONG, 20));
+        // A line typed away has no lines, and its block keeps a row.
+        let (_, removed) = texts.typed(Target::Line { seg: 0, line: 0 }).expect("the edited line");
+        assert!(removed.lines.is_empty());
+        let plan = Plan::build(&merge, &draft, None, &texts, false);
+        assert!(matches!(plan.blocks[0].kind, Kind::Edited { seg: 0, line: 0 }));
+        assert_eq!(plan.blocks[0].rows, 1);
+        assert_eq!(plan.blocks[1].above[RESULT], 0);
+
+        // The same pieces again make nothing new, so their colours stay.
+        let before = Arc::as_ptr(&typed.diff);
+        typed.update(&draft, None, Some(20));
+        assert_eq!(Arc::as_ptr(&typed.diff), before);
+        typed.update(&draft, None, None);
+        assert_eq!(Arc::as_ptr(&typed.diff), before);
+        assert!(typed.rows.is_empty());
+    }
+
+    #[test]
+    fn the_line_at_the_top_stays_when_lines_wrap() {
+        let merge = merge();
+        let panes = panes(&merge);
+        let typed = Typed::default();
+        let open = Draft::unresolved(&merge);
+        let plain = Texts { panes: &panes, wrapped: None, typed: &typed, columns: None };
+        let before = Plan::build(&merge, &open, None, &plain, false);
+        let wrap = wrapped(&panes, 20);
+        let texts = Texts { panes: &panes, wrapped: Some(&wrap), typed: &typed, columns: Some(20) };
+        let after = Plan::build(&merge, &open, None, &texts, false);
+        let h = line_h();
+
+        // Half-way down the long line, which becomes many rows.
+        let anchor = Anchor::at(&before, &plain, &merge, 1.5 * h, h).unwrap();
+        assert_eq!(anchor, Anchor { block: 0, line: Some(1), offset: 0.5 });
+        assert_eq!(anchor.find(&after, &texts, &merge), Some(1.5 * h));
+        // The last line comes after all the rows the long one took.
+        let last = Anchor::at(&before, &plain, &merge, before.blocks[2].top + 2.0, h).unwrap();
+        assert!(near(last.find(&after, &texts, &merge), after.blocks[2].top + 2.0));
+        // In a conflict, the same distance below its top, as far as it goes.
+        let inside = Anchor::at(&before, &plain, &merge, before.blocks[1].top + HEAD_H, h).unwrap();
+        assert_eq!(inside.line, None);
+        assert!(near(inside.find(&after, &texts, &merge), after.blocks[1].top + HEAD_H));
+    }
+
+    #[test]
+    fn rows_find_their_lines() {
+        let lines: Vec<DiffLine> =
+            ["a", "b", "c"].iter().map(|t| DiffLine { origin: ' ', old_no: None, new_no: None, text: (*t).to_owned() }).collect();
+        let first = [0u32, 1, 4, 5];
+        let wrapped = Rows { lines: &lines, first: Some(&first) };
+        assert_eq!((wrapped.start(1), wrapped.start(3), wrapped.all()), (1, 5, 5));
+        assert_eq!((0..5).map(|row| wrapped.line_at(row)).collect::<Vec<_>>(), [0, 1, 1, 1, 2]);
+        assert_eq!(wrapped.count(1..2), 3);
+        let flat = Rows { lines: &lines, first: None };
+        assert_eq!((flat.start(2), flat.all(), flat.line_at(2)), (2, 3, 2));
+    }
 }

@@ -98,7 +98,10 @@ pub fn show(ui: &mut Ui, page: &mut Page<'_>, state: &mut State) {
     });
     form::row(ui, "Word Wrap", |ui| {
         form::checkbox(ui, &mut prefs.word_wrap, "");
-        form::help(ui, "Long lines continue on the next row instead of scrolling sideways, in diffs and blame.");
+        form::help(
+            ui,
+            "Long lines continue on the next row instead of scrolling sideways, in diffs, blame and the conflict resolver.",
+        );
     });
 
     form::heading(ui, "Diffs");
@@ -126,6 +129,12 @@ pub fn show(ui: &mut Ui, page: &mut Page<'_>, state: &mut State) {
             ui,
             "While it is on, hunks and lines cannot be staged or discarded one by one; whole files still can.",
         );
+    });
+
+    form::heading(ui, "Conflicts");
+    form::row(ui, "Show Ancestor", |ui| {
+        form::checkbox(ui, &mut prefs.conflict_ancestor, "Show the common ancestor between the two sides");
+        form::help(ui, "What the file had before either side changed it, next to each conflict in the resolver.");
     });
 }
 

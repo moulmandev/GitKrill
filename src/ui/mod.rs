@@ -8,6 +8,7 @@ pub mod clone;
 pub mod commit_button;
 pub mod commit_options;
 pub mod conflict;
+pub mod conflict_text;
 pub mod dialogs;
 pub mod diff;
 pub mod diff_mode;

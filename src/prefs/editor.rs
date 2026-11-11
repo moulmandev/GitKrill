@@ -55,6 +55,8 @@ pub struct Editor {
     pub diff_context: DiffContext,
     /// Diffs leave out changes of whitespace alone (`git diff -w`).
     pub ignore_whitespace: bool,
+    /// The conflict resolver shows the common ancestor between the sides.
+    pub conflict_ancestor: bool,
 }
 
 /// How a diff is laid out.
@@ -105,6 +107,7 @@ impl Default for Editor {
             diff_layout: DiffLayout::Inline,
             diff_context: DiffContext::Hunks,
             ignore_whitespace: false,
+            conflict_ancestor: false,
         }
     }
 }
