@@ -278,15 +278,24 @@ be installed.
   this commit with staged changes", or "Squash into this commit", which also
   adds the message typed in the commit panel. "Autosquash", on a fixup
   commit's menu or in the command palette, folds every fixup of the branch
-  into the commit it names (`git rebase -i --autosquash`, no editor): commits
-  another branch has are never rewritten, a conflict stops it like any
-  rebase, and undo puts the branch back
+  into the commit it names (`git rebase -i --autosquash`, no editor), across
+  merges too: a fixup goes to its commit inside a merged branch if that is
+  where it is, and the merges are made again (`--rebase-merges`). Commits
+  another branch has are never rewritten, and a fixup that is left says why
+  in its menu; a conflict stops it like any rebase, and undo puts the branch
+  back
 - Interactive rebase: pick, reword, squash, fixup, drop and reorder, also
-  over merge commits (`--rebase-merges`). A merge is a row of its own: keep,
-  reword or drop it (with the commits it brought in, which its tooltip
-  lists), or fold later commits into it; what it brought in is replayed as
-  it is, and merges whose parents change are made again with their own
-  message. Commits and merges that do not change keep their SHAs
+  over merge commits (`--rebase-merges`). A merge is a row of its own, with
+  the commits it brought in listed under it, one group per merged branch
+  (its caret, or the arrow keys, fold them away): each of them takes any
+  action and moves within its group. A merge can be kept, reworded or
+  dropped (with what it brought in), take later commits folded into it, or
+  be squashed or fixed up into the commit below it, which then gets its
+  changes and is no longer a merge (the merged-in commits leave the
+  history). Merges whose parents change are made again with their own
+  message; commits and merges that do not change keep their SHAs. A base on
+  a branch that was merged in works too: the plan starts at the merge that
+  brought it in
 - Several selected commits at once, from their right-click menu, the panel
   or the command palette: cherry-pick them (oldest first) or revert them
   (newest first) in one git command, so a conflict stops at the commit that
@@ -662,10 +671,10 @@ build.rs         the Windows executable's icon and version details
 - In a fork, the sidebar lists the fork's own pull requests, issues and CI,
   not its parent's (pull requests are opened into the parent all the same);
   review states on GitHub need a sign-in
-- The interactive rebase plans a branch's own line of history: the commits
-  a merge brought in are replayed as they are, not edited one by one, a
-  merge cannot be squashed into another commit, and a base on a merged-in
-  branch is refused (with the nearest base that works offered instead)
+- The interactive rebase moves a commit only within its own line of
+  history (the branch's own, or that of one merged branch), and autosquash
+  leaves a fixup of the repository's first commit when merges follow it (its
+  menu says so)
 - UTF-16 without a byte order mark and with no Latin text in it is only
   told from other data when its first 4 KiB have a line break or a space
   (or the repository is set to UTF-16)
@@ -675,8 +684,6 @@ build.rs         the Windows executable's icon and version details
   string that runs across the start of a hunk is coloured as if it did not
 - X.509 (gpgsm) signing keys with a passphrase still need gpg-agent's own
   pinentry: GitKrill asks only for OpenPGP and SSH keys
-- Autosquash only folds fixups whose commit comes after the last merge
-  commit on the branch
 - On macOS, system notifications are shown through `osascript`, so
   Notification Center lists them under Script Editor rather than GitKrill
 

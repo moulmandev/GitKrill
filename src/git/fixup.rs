@@ -7,20 +7,30 @@
 //! after the commit it names and folds it in (and `amend!` commits, which
 //! replace its message).
 //!
-//! [`plan`] finds, from the loaded history, the fixup commits of the
-//! checked-out branch whose commit is on that branch too, and where a rebase
-//! folding them all in has to start. It matches them the way git does, so
-//! git folds exactly those. [`autosquash`] runs the rebase without an
-//! editor: `GIT_SEQUENCE_EDITOR` (`true`, set for every git command by
-//! `git::cli::command`, the same as `-c sequence.editor=:`) accepts the todo
-//! list git arranged as it is, and `GIT_EDITOR` keeps the combined message of
-//! each squash.
+//! [`survey`] finds, from the loaded history, the fixup commits of the
+//! checked-out branch (those of the branches merged into it included), the
+//! commit each one names, and where a rebase folding them in has to start;
+//! it says why it leaves the others (another branch has their commit, say).
+//! It matches them the way git does. [`autosquash`] runs the rebase without
+//! an editor. On a branch without merges after that start it is
+//! `git rebase -i --autosquash`: `GIT_SEQUENCE_EDITOR` (`true`, set for every
+//! git command by `git::cli::command`, the same as `-c sequence.editor=:`)
+//! accepts the todo list git arranged as it is, and `GIT_EDITOR` keeps the
+//! combined message of each squash. With merges, the rebase keeps them
+//! (`--rebase-merges`) with a todo list of its own (`rebase::stage_folds`),
+//! so that where a fixup goes does not depend on the order git happens to
+//! list the merged branches in: each fixup right after its commit, inside
+//! the merged branch if that is where the commit is, folded with git's own
+//! `fixup`, `squash` and `fixup -C`, so the messages come out the same.
 
 use std::collections::HashMap;
 
+use git2::Repository;
+
 use super::internal::Internal;
 use super::ops::{GitCmd, Step, UndoKind};
-use super::{Head, History, Oid, RowKind, short};
+use super::rebase::{self, Fold, FoldHow};
+use super::{CommitInfo, Head, History, Oid, RowKind, short};
 
 /// Label prefix of fixup commits. Unlike other commits they do not take the
 /// commit panel's message, so they leave it where it is.
@@ -84,8 +94,10 @@ pub fn is_fixup(subject: &str) -> bool {
 /// A rebase that folds the fixup commits of the checked-out branch in.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Autosquash {
-    /// What the rebase starts from: the parent of the oldest commit
-    /// something is folded into; `None` when that is the root commit.
+    /// What the rebase starts from: a commit of the branch's own line
+    /// (its first parents), below the oldest commit something is folded
+    /// into, or below the merge that brought that commit in; `None` when
+    /// that is the root commit.
     pub base: Option<Oid>,
     /// The fixup, squash and amend commits folded in, newest first.
     pub fixups: Vec<Oid>,
@@ -93,6 +105,21 @@ pub struct Autosquash {
     pub rewritten: usize,
     /// HEAD when planned.
     pub head: Oid,
+    /// Each one folded and what into, oldest first.
+    pub folds: Vec<Fold>,
+    /// The branch has merges after the base: the rebase keeps them, with a
+    /// todo list of its own (`rebase::stage_folds`).
+    pub merges: bool,
+}
+
+/// What autosquash makes of the fixup commits of the checked-out branch.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Survey {
+    /// The rebase folding those that can be folded; `None` when none can.
+    pub plan: Option<Autosquash>,
+    /// The fixup commits it leaves as they are, newest first, each with
+    /// the reason.
+    pub left: Vec<(Oid, String)>,
 }
 
 impl Autosquash {
@@ -116,102 +143,210 @@ impl Autosquash {
     }
 }
 
-/// Plans an autosquash of HEAD's branch, going by the loaded history.
+const NAMES_NOTHING: &str = "No earlier commit of this branch has the summary or SHA it names.";
+const SHARED: &str = "The commit it names is on another branch too, and autosquash never rewrites \
+                      what other branches have.";
+const STARTS_OTHERS: &str = "Other commits start from it, so it cannot move to the merged branch the \
+                             commit it names is on.";
+const ROOT: &str = "The commit it names is the first commit of the repository, which autosquash can \
+                    only fold into on a branch without merges.";
+
+/// What autosquash does with HEAD's branch, going by the loaded history.
 ///
-/// The branch is HEAD's first-parent line back to the first merge commit,
-/// the first commit any of `stops` reaches (the tips of the other branches:
-/// what they share is never rewritten), the end of the loaded history or
-/// [`MAX_COMMITS`]. On it, each fixup is matched to the commit it names as
-/// git does: an older commit with that exact summary (the oldest), else one
-/// whose SHA starts with it, else one whose summary starts with it. `None`
-/// when no fixup on the branch names a commit on it.
-pub fn plan(history: &History, head: Oid, stops: &[Oid]) -> Option<Autosquash> {
+/// The branch is what HEAD reaches, as far as the history is loaded and up
+/// to [`MAX_COMMITS`] commits, merged-in branches included. Each fixup
+/// (not a merge) is matched to the commit it names among those before it,
+/// as git does: one with that exact summary (the oldest), else one whose
+/// SHA starts with it, else one whose summary starts with it, looking at
+/// the commits no other branch has first. What any of `stops` (the tips of
+/// the other branches) reaches is never rewritten, so a fixup of such a
+/// commit is left. A fixup moves to wherever its commit is, into the branch
+/// a merge brought in if that is where, except when other commits start
+/// from it there (a branch merged later): those are left too.
+pub fn survey(history: &History, head: Oid, stops: &[Oid]) -> Survey {
     let row_of = |oid: &Oid| history.index_of.get(oid).map(|row| *row as usize);
-    // Rows of the branch, newest first.
-    let mut chain: Vec<usize> = Vec::new();
-    let mut row = row_of(&head)?;
-    loop {
-        let commit = &history.commits[row];
-        if commit.kind != RowKind::Commit || commit.parents.len() > 1 || chain.len() >= MAX_COMMITS {
-            break;
-        }
-        chain.push(row);
-        match commit.parents.first().and_then(row_of) {
-            Some(parent) => row = parent,
-            None => break,
-        }
-    }
-    let bottom = *chain.last()?;
+    let Some(head_row) = row_of(&head) else { return Survey::default() };
+    let rows = &history.commits;
 
-    // What the other branches reach. Rows are ordered children first, so
-    // one pass down from the highest of their tips to the bottom of the
-    // branch marks it all.
-    let tips: Vec<usize> = stops.iter().filter_map(row_of).filter(|row| *row <= bottom).collect();
-    if let Some(&top) = tips.iter().min() {
-        let mut reached = vec![false; bottom - top + 1];
-        for row in &tips {
-            reached[row - top] = true;
+    // What HEAD reaches (bit 1) and what the other branches reach (bit 2).
+    // Rows are ordered children first, so one pass down from the highest
+    // of the tips marks it all.
+    let tips: Vec<usize> = stops.iter().filter_map(row_of).collect();
+    let top = tips.iter().copied().chain([head_row]).min().unwrap_or(head_row);
+    let mut reach = vec![0u8; rows.len() - top];
+    reach[head_row - top] |= 1;
+    for tip in &tips {
+        reach[tip - top] |= 2;
+    }
+    // HEAD's commits, children first.
+    let mut window: Vec<usize> = Vec::new();
+    for row in top..rows.len() {
+        let flags = reach[row - top];
+        if flags == 0 || rows[row].kind != RowKind::Commit {
+            continue;
         }
-        for row in top..=bottom {
-            if !reached[row - top] {
-                continue;
+        if flags & 1 != 0 {
+            if window.len() >= MAX_COMMITS {
+                break;
             }
-            for parent in history.commits[row].parents.iter().filter_map(row_of) {
-                if parent <= bottom {
-                    reached[parent - top] = true;
-                }
-            }
+            window.push(row);
         }
-        if let Some(cut) = chain.iter().position(|row| *row >= top && reached[row - top]) {
-            chain.truncate(cut);
+        for parent in rows[row].parents.iter().filter_map(row_of) {
+            reach[parent - top] |= flags;
         }
     }
 
-    // Oldest first, as git lists the commits it rebases.
-    let todo: Vec<usize> = chain.iter().rev().copied().collect();
-    let summary = |i: usize| history.commits[todo[i]].summary.as_str();
-    let mut by_summary: HashMap<&str, usize> = HashMap::new();
-    // (fixup, what it is folded into), as positions in `todo`.
-    let mut folds: Vec<(usize, usize)> = Vec::new();
-    for i in 0..todo.len() {
-        let found = fixup_target(summary(i)).and_then(|text| {
-            by_summary
-                .get(text)
-                .copied()
-                .or_else(|| {
-                    let hex = text.len() >= 4 && text.bytes().all(|b| b.is_ascii_hexdigit());
-                    let text = text.to_ascii_lowercase();
-                    (0..i).find(|&j| hex && history.commits[todo[j]].oid.to_string().starts_with(&text))
-                })
-                .or_else(|| (0..i).find(|&j| summary(j).starts_with(text)))
-        });
-        match found {
-            Some(target) => folds.push((i, target)),
-            None => {
-                by_summary.entry(summary(i)).or_insert(i);
+    // Parents first from here on, as git lists the commits it rebases.
+    let order: Vec<usize> = window.iter().rev().copied().collect();
+    let n = order.len();
+    let commit = |i: usize| &rows[order[i]];
+    let index: HashMap<Oid, usize> = order.iter().enumerate().map(|(i, row)| (rows[*row].oid, i)).collect();
+    let parents: Vec<&[Oid]> = order.iter().map(|row| rows[*row].parents.as_slice()).collect();
+    let shared: Vec<bool> = order.iter().map(|row| reach[row - top] & 2 != 0).collect();
+    // The branch's own line, and how the rest falls into lines, as the
+    // interactive rebase arranges them.
+    let mut main = Vec::new();
+    let mut at = Some(head);
+    while let Some(i) = at.and_then(|oid| index.get(&oid).copied()) {
+        main.push(i);
+        at = parents[i].first().copied();
+    }
+    main.reverse();
+    let on_main: HashMap<usize, usize> = main.iter().enumerate().map(|(pos, c)| (*c, pos)).collect();
+    let (lines, line_of) = rebase::arrange(&parents, &index, main.clone(), at);
+    let needed = rebase::needed_in(&lines, &parents, &index);
+
+    let mut folded = vec![false; n];
+    // (fixup, what it is folded into, how), as indexes into `order`.
+    let mut folds: Vec<(usize, usize, FoldHow)> = Vec::new();
+    let mut left: Vec<(usize, &str)> = Vec::new();
+    for i in 0..n {
+        let summary = commit(i).summary.as_str();
+        let Some(text) = fixup_target(summary).filter(|_| parents[i].len() < 2) else { continue };
+        let how = if summary.starts_with("squash! ") {
+            FoldHow::Squash
+        } else if summary.starts_with("amend! ") {
+            FoldHow::Amend
+        } else {
+            FoldHow::Fixup
+        };
+        // The commits before it, oldest first.
+        let mut before = Vec::new();
+        let mut seen = vec![false; n];
+        let mut stack: Vec<usize> = parents[i].iter().filter_map(|p| index.get(p).copied()).collect();
+        while let Some(j) = stack.pop() {
+            if !std::mem::replace(&mut seen[j], true) {
+                before.push(j);
+                stack.extend(parents[j].iter().filter_map(|p| index.get(p).copied()));
             }
+        }
+        before.sort_unstable();
+        let hex = text.len() >= 4 && text.bytes().all(|b| b.is_ascii_hexdigit());
+        let lower = text.to_ascii_lowercase();
+        let find = |own: bool| {
+            let candidates = || before.iter().copied().filter(|j| !own || !shared[*j]);
+            candidates()
+                .find(|j| !folded[*j] && commit(*j).summary == text)
+                .or_else(|| candidates().find(|j| hex && commit(*j).oid.to_string().starts_with(&lower)))
+                .or_else(|| candidates().find(|j| commit(*j).summary.starts_with(text)))
+        };
+        let own = find(true);
+        let elsewhere = own.is_none() && find(false).is_some();
+        match own {
+            Some(target) if needed.contains(&i) && line_of[i] != line_of[target] => left.push((i, STARTS_OTHERS)),
+            Some(target) => {
+                folded[i] = true;
+                folds.push((i, target, how));
+            }
+            None if elsewhere => left.push((i, SHARED)),
+            None => left.push((i, NAMES_NOTHING)),
         }
     }
 
-    let oldest = folds.iter().map(|(_, target)| *target).min()?;
-    Some(Autosquash {
-        base: history.commits[todo[oldest]].parents.first().copied(),
-        fixups: folds.iter().rev().map(|(fixup, _)| history.commits[todo[*fixup]].oid).collect(),
-        rewritten: todo.len() - oldest,
+    // The commit of the branch's own line that brings each target in:
+    // itself, or the merge that brought it in.
+    let bringer = |mut c: usize| {
+        while let Some((merge, _)) = lines[line_of[c]].merge {
+            c = merge;
+        }
+        on_main[&c]
+    };
+    let (base, merges) = loop {
+        let Some(bottom) = folds.iter().map(|(_, target, _)| bringer(*target)).min() else {
+            return Survey { plan: None, left: newest_first(&order, &left, rows) };
+        };
+        let base = parents[main[bottom]].first().copied();
+        let merges = main[bottom..].iter().any(|c| parents[*c].len() > 1);
+        if base.is_some() || !merges {
+            break (base, merges);
+        }
+        // From the root, only git's own autosquash can fold, which does
+        // not keep merges.
+        let (root, kept): (Vec<_>, Vec<_>) = folds.into_iter().partition(|(_, target, _)| bringer(*target) == bottom);
+        left.extend(root.into_iter().map(|(fixup, _, _)| (fixup, ROOT)));
+        folds = kept;
+    };
+
+    // What changes: the targets and everything built on them.
+    let mut changed = vec![false; n];
+    for (_, target, _) in &folds {
+        changed[*target] = true;
+    }
+    for i in 0..n {
+        if !changed[i] && parents[i].iter().any(|p| index.get(p).is_some_and(|j| changed[*j])) {
+            changed[i] = true;
+        }
+    }
+    let mut fixups: Vec<usize> = folds.iter().map(|(fixup, _, _)| *fixup).collect();
+    fixups.sort_unstable_by(|a, b| b.cmp(a));
+    let plan = Autosquash {
+        base,
+        fixups: fixups.iter().map(|i| commit(*i).oid).collect(),
+        rewritten: changed.iter().filter(|c| **c).count(),
         head,
-    })
+        folds: folds
+            .iter()
+            .map(|(fixup, target, how)| Fold { commit: commit(*fixup).oid, into: commit(*target).oid, how: *how })
+            .collect(),
+        merges,
+    };
+    Survey { plan: Some(plan), left: newest_first(&order, &left, rows) }
 }
 
-/// Folds the planned fixups in with `git rebase -i --autosquash`, from
-/// HEAD as it was planned (`head`). Undone like a rebase; one that stops on
-/// a conflict is a rebase in progress, finished or aborted from the banner.
+/// The fixups left, newest first, with their reasons.
+fn newest_first(order: &[usize], left: &[(usize, &str)], rows: &[CommitInfo]) -> Vec<(Oid, String)> {
+    let mut left = left.to_vec();
+    left.sort_unstable_by_key(|(i, _)| std::cmp::Reverse(*i));
+    left.into_iter().map(|(i, why)| (rows[order[i]].oid, why.to_owned())).collect()
+}
+
+/// Folds the planned fixups in from HEAD as it was planned (`head`): with
+/// `git rebase -i --autosquash` on a branch without merges after the base,
+/// otherwise with a todo list of its own that keeps the merges and puts
+/// each fixup after its commit, wherever that is (`rebase::stage_folds`).
+/// Undone like a rebase; one that stops on a conflict is a rebase in
+/// progress, finished or aborted from the banner.
 pub fn autosquash(plan: &Autosquash, head: &Head) -> GitCmd {
-    let base = plan.base.map(|base| base.to_string());
-    let mut args = vec!["-c", "advice.mergeConflict=false", "rebase", "-i", "--autosquash", "--quiet"];
-    args.push(base.as_deref().unwrap_or("--root"));
-    let mut cmd = GitCmd::new(AUTOSQUASH_LABEL, &args)
-        .undoable(UndoKind::HeadMove)
-        .done(format!("Autosquashed {}", plan.what()));
+    let mut cmd = match plan.base.filter(|_| plan.merges) {
+        Some(base) => {
+            let folds = plan.folds.clone();
+            let mut cmd = GitCmd::empty(AUTOSQUASH_LABEL);
+            cmd.steps.push(Step::internal(Internal::new("arrange the fixups", move |workdir| {
+                let repo = Repository::open(workdir).map_err(|e| e.message().to_owned())?;
+                rebase::stage_folds(&repo, base, &folds).map(|()| String::new())
+            })));
+            cmd.steps.push(rebase::folds_step(base));
+            cmd
+        }
+        None => {
+            let base = plan.base.map(|base| base.to_string());
+            let mut args = vec!["-c", "advice.mergeConflict=false", "rebase", "-i", "--autosquash", "--quiet"];
+            args.push(base.as_deref().unwrap_or("--root"));
+            GitCmd::new(AUTOSQUASH_LABEL, &args)
+        }
+    }
+    .undoable(UndoKind::HeadMove)
+    .done(format!("Autosquashed {}", plan.what()));
     // Git's last words are the summary of the last squash it committed;
     // the toast says what happened instead.
     let into = if plan.fixups.len() == 1 { "its commit" } else { "their commits" };
@@ -282,6 +417,30 @@ mod tests {
         snap.branches.iter().filter(|b| !b.is_head).filter_map(|b| b.oid).collect()
     }
 
+    fn plan(history: &History, head: Oid, stops: &[Oid]) -> Option<Autosquash> {
+        survey(history, head, stops).plan
+    }
+
+    /// Each commit HEAD reaches as "subject <- parent + parent" (by
+    /// subject), sorted.
+    fn shape(fx: &Fixture) -> Vec<String> {
+        let out = git(&fx.dir, &["log", "--format=%s|%p"]);
+        let mut lines: Vec<String> = out
+            .lines()
+            .map(|line| {
+                let (subject, parents) = line.split_once('|').unwrap();
+                let parents: Vec<String> = parents
+                    .split(' ')
+                    .filter(|p| !p.is_empty())
+                    .map(|p| git(&fx.dir, &["log", "-1", "--format=%s", p]))
+                    .collect();
+                format!("{subject} <- {}", parents.join(" + "))
+            })
+            .collect();
+        lines.sort();
+        lines
+    }
+
     #[test]
     fn fixups_are_planned_and_folded_into_their_commits() {
         let fx = branch_with_fixups("fixup-autosquash");
@@ -327,7 +486,7 @@ mod tests {
     }
 
     #[test]
-    fn a_merge_commit_ends_the_branch() {
+    fn the_first_commit_is_left_on_a_branch_with_merges() {
         let fx = Fixture::new("fixup-merge");
         fx.write("a.txt", "a\n");
         fx.commit_all("Add a");
@@ -339,11 +498,15 @@ mod tests {
         git(&fx.dir, &["branch", "-D", "side"]);
         fx.write("a.txt", "a2\n");
         git(&fx.dir, &["add", "-A"]);
+        // "Add a", the merge's first parent, is the root commit.
         fx.run(fixup(sha(&fx, "HEAD~1")));
         let snap = fx.snapshot();
-        assert_eq!(plan(&snap.history, snap.head.oid.unwrap(), &[]), None, "its commit is past the merge");
+        let found = survey(&snap.history, snap.head.oid.unwrap(), &[]);
+        assert_eq!(found.plan, None);
+        assert_eq!(found.left, [(sha(&fx, "HEAD"), ROOT.to_owned())]);
 
-        // A fixup of a commit after the merge folds onto the merge.
+        // A fixup of a commit after the merge folds onto the merge, with
+        // git's own autosquash.
         fx.write("b.txt", "b\n");
         fx.commit_all("Add b");
         fx.write("b.txt", "b2\n");
@@ -352,8 +515,167 @@ mod tests {
         let snap = fx.snapshot();
         let planned = plan(&snap.history, snap.head.oid.unwrap(), &[]).unwrap();
         assert_eq!(planned.base, Some(sha(&fx, "HEAD~2")));
+        assert!(!planned.merges);
         fx.run(autosquash(&planned, &snap.head));
         assert_eq!(subjects(&fx)[..3], ["Add b", "fixup! Add a", "Merge side"]);
+    }
+
+    /// Base, then "Add a" on main; "side" from there with "Side one" and a
+    /// fixup of "Add a"; "Main work" on main, the merge of side, then a
+    /// squash into "Side one" made on main. The side branch is deleted.
+    fn fixups_across_a_merge(fx: &Fixture) {
+        fx.write("base.txt", "base\n");
+        fx.commit_all("Base");
+        fx.write("a.txt", "a\n");
+        fx.commit_all("Add a");
+        git(&fx.dir, &["checkout", "-q", "-b", "side"]);
+        fx.write("s.txt", "one\n");
+        fx.commit_all("Side one");
+        fx.write("a.txt", "a, fixed on the side\n");
+        git(&fx.dir, &["add", "-A"]);
+        fx.run(fixup(sha(fx, "main")));
+        git(&fx.dir, &["checkout", "-q", "main"]);
+        fx.write("m.txt", "main\n");
+        fx.commit_all("Main work");
+        git(&fx.dir, &["merge", "-q", "--no-ff", "-m", "Merge side", "side"]);
+        git(&fx.dir, &["branch", "-q", "-D", "side"]);
+        fx.write("s.txt", "one, fixed on main\n");
+        git(&fx.dir, &["add", "-A"]);
+        fx.run(squash_into(sha(fx, "HEAD^2~1"), "Side one handles more."));
+    }
+
+    #[test]
+    fn fixups_on_both_sides_of_a_merge_fold_into_their_commits() {
+        let fx = Fixture::new("fixup-across");
+        fixups_across_a_merge(&fx);
+        let snap = fx.snapshot();
+        let head = snap.head.oid.unwrap();
+        let (on_main, on_side) = (sha(&fx, "HEAD"), sha(&fx, "HEAD~1^2"));
+        let found = survey(&snap.history, head, &stops(&snap));
+        assert!(found.left.is_empty(), "{:?}", found.left);
+        let planned = found.plan.expect("both fold");
+        assert_eq!(planned.fixups, [on_main, on_side]);
+        assert_eq!(planned.base, Some(sha(&fx, "HEAD~4")));
+        assert!(planned.merges);
+        assert_eq!(planned.rewritten, 6);
+        assert_eq!(
+            planned.folds,
+            [
+                Fold { commit: on_side, into: sha(&fx, "HEAD~3"), how: FoldHow::Fixup },
+                Fold { commit: on_main, into: sha(&fx, "HEAD~1^2~1"), how: FoldHow::Squash },
+            ]
+        );
+
+        let done = fx.run(autosquash(&planned, &snap.head));
+        let said = format!("Folded 2 fixup commits into their commits; 6 commits rewritten after {}.", short(planned.base.unwrap()));
+        assert!(done.result.as_ref().unwrap().ends_with(&said), "{:?}", done.result);
+        // Each fix went where its commit is, and the merge was made again.
+        assert_eq!(
+            shape(&fx),
+            ["Add a <- Base", "Base <- ", "Main work <- Add a", "Merge side <- Main work + Side one", "Side one <- Add a"]
+        );
+        assert_eq!(git(&fx.dir, &["show", "HEAD~1:a.txt"]), "a, fixed on the side");
+        assert_eq!(git(&fx.dir, &["show", "HEAD^2:s.txt"]), "one, fixed on main");
+        // git's own squash message: the squash commit's text after its subject.
+        assert_eq!(git(&fx.dir, &["log", "-1", "--format=%B", "HEAD^2"]), "Side one\n\nSide one handles more.");
+        assert_eq!(fx.read("a.txt"), "a, fixed on the side\n");
+        assert!(plan(&done.snap.history, done.snap.head.oid.unwrap(), &[]).is_none(), "nothing left to fold");
+
+        let entry = done.undo.expect("autosquash is undoable");
+        fx.run_as(entry.undo.clone(), Origin::Undo(entry));
+        assert_eq!(sha(&fx, "HEAD"), head);
+    }
+
+    #[test]
+    fn a_fold_into_a_merged_branch_that_conflicts_carries_on_after_continue() {
+        let fx = Fixture::new("fixup-across-conflict");
+        fx.write("base.txt", "base\n");
+        fx.commit_all("Base");
+        git(&fx.dir, &["checkout", "-q", "-b", "side"]);
+        fx.write("s.txt", "1\n");
+        fx.commit_all("Side one");
+        fx.write("s.txt", "2\n");
+        fx.commit_all("Side two");
+        git(&fx.dir, &["checkout", "-q", "main"]);
+        fx.write("m.txt", "main\n");
+        fx.commit_all("Main work");
+        git(&fx.dir, &["merge", "-q", "--no-ff", "-m", "Merge side", "side"]);
+        git(&fx.dir, &["branch", "-q", "-D", "side"]);
+        // Changes the line "Side two" wrote: next to "Side one" it conflicts.
+        fx.write("s.txt", "3\n");
+        git(&fx.dir, &["add", "-A"]);
+        fx.run(fixup(sha(&fx, "HEAD^2~1")));
+        let snap = fx.snapshot();
+        let head = snap.head.oid.unwrap();
+        let planned = plan(&snap.history, head, &[]).unwrap();
+        assert!(planned.merges);
+
+        let stopped = fx.run_as(autosquash(&planned, &snap.head), Origin::User);
+        let message = stopped.result.expect_err("the fixup conflicts");
+        assert!(message.contains("CONFLICT") || message.contains("could not apply"), "{message}");
+        assert_eq!(stopped.snap.state, RepoState::Rebase);
+        assert!(stopped.undo.is_none());
+        fx.write("s.txt", "1, fixed\n");
+        git(&fx.dir, &["add", "s.txt"]);
+        // "Side two" then conflicts with the resolution in turn.
+        let next = fx.run_as(crate::git::ops::continue_op(RepoState::Rebase).unwrap(), Origin::User);
+        if next.snap.state == RepoState::Rebase {
+            fx.write("s.txt", "2\n");
+            git(&fx.dir, &["add", "s.txt"]);
+            let done = fx.run(crate::git::ops::continue_op(RepoState::Rebase).unwrap());
+            assert_eq!(done.snap.state, RepoState::Clean);
+            check_finished(&fx, done.undo, head);
+        } else {
+            next.result.expect("finished");
+            check_finished(&fx, next.undo, head);
+        }
+    }
+
+    /// After the conflict above: "Side one" has the fix, the fixup is gone,
+    /// and undo puts the branch back where it was.
+    fn check_finished(fx: &Fixture, undo: Option<crate::git::ops::UndoEntry>, head: Oid) {
+        assert_eq!(subjects(fx), ["Merge side", "Side two", "Side one", "Main work", "Base"]);
+        assert_eq!(git(&fx.dir, &["show", "HEAD^2~1:s.txt"]), "1, fixed");
+        assert_eq!(fx.read("s.txt"), "2\n");
+        let entry = undo.expect("undoable once finished");
+        fx.run_as(entry.undo.clone(), Origin::Undo(entry));
+        assert_eq!(sha(fx, "HEAD"), head);
+    }
+
+    #[test]
+    fn fixups_that_cannot_be_folded_say_why() {
+        let fx = Fixture::new("fixup-left");
+        fixups_across_a_merge(&fx);
+        // The merged branch is back: what it has stays as it is, the fixup
+        // made on it included.
+        git(&fx.dir, &["branch", "side", "HEAD~1^2"]);
+        let snap = fx.snapshot();
+        let found = survey(&snap.history, snap.head.oid.unwrap(), &stops(&snap));
+        assert_eq!(found.plan, None);
+        assert_eq!(found.left, [(sha(&fx, "HEAD"), SHARED.to_owned()), (sha(&fx, "HEAD~1^2"), SHARED.to_owned())]);
+        git(&fx.dir, &["branch", "-D", "side"]);
+
+        // A branch merged later starts from a fixup whose commit is on
+        // another line: it cannot move there.
+        git(&fx.dir, &["reset", "-q", "--hard", "HEAD~1"]);
+        fx.write("s.txt", "one, fixed\n");
+        git(&fx.dir, &["add", "-A"]);
+        fx.run(fixup(sha(&fx, "HEAD^2~1")));
+        git(&fx.dir, &["checkout", "-q", "-b", "later"]);
+        fx.write("l.txt", "later\n");
+        fx.commit_all("Later work");
+        git(&fx.dir, &["checkout", "-q", "main"]);
+        fx.write("n.txt", "next\n");
+        fx.commit_all("Next");
+        git(&fx.dir, &["merge", "-q", "--no-ff", "-m", "Merge later", "later"]);
+        git(&fx.dir, &["branch", "-q", "-D", "later"]);
+        let snap = fx.snapshot();
+        let found = survey(&snap.history, snap.head.oid.unwrap(), &[]);
+        let fork = sha(&fx, "HEAD~2");
+        assert!(found.left.contains(&(fork, STARTS_OTHERS.to_owned())), "{:?}", found.left);
+        // The fixup made on the side still folds.
+        let planned = found.plan.expect("the side's fixup folds");
+        assert_eq!(planned.fixups, [sha(&fx, "HEAD~3^2")]);
     }
 
     #[test]
@@ -396,7 +718,9 @@ mod tests {
         git(&fx.dir, &["add", "-A"]);
         git(&fx.dir, &["commit", "-q", "-m", "fixup! Something long gone"]);
         let snap = fx.snapshot();
-        let planned = plan(&snap.history, snap.head.oid.unwrap(), &[]).unwrap();
+        let found = survey(&snap.history, snap.head.oid.unwrap(), &[]);
+        assert_eq!(found.left, [(sha(&fx, "HEAD"), NAMES_NOTHING.to_owned())]);
+        let planned = found.plan.unwrap();
         assert_eq!(planned.fixups, [sha(&fx, "HEAD~1"), sha(&fx, "HEAD~2")]);
         assert_eq!(planned.base, None);
         fx.run(autosquash(&planned, &snap.head));

@@ -1,12 +1,12 @@
 //! Fixup commits from the graph, and autosquash (`git::fixup`): a commit's
 //! right-click menu records the staged changes as a fixup of it (or a
 //! squash, with the message typed in the commit panel), and a fixup
-//! commit's menu folds every fixup of the branch into its commit. The
-//! command palette offers both.
+//! commit's menu folds every fixup of the branch into its commit, or says
+//! why that one cannot be folded. The command palette offers both.
 
 use eframe::egui::Ui;
 
-use crate::git::fixup::{self, AUTOSQUASH_LABEL, Autosquash};
+use crate::git::fixup::{self, AUTOSQUASH_LABEL, Autosquash, Survey};
 use crate::git::{CommitInfo, Oid, RepoSnapshot, RepoState, short};
 use crate::state::{RepoTab, Selection, Shared};
 use crate::theme::icons;
@@ -15,11 +15,18 @@ use crate::ui::merge::entry;
 use crate::ui::palette::Entry;
 
 /// The autosquash the checked-out branch allows, going by the loaded
-/// history. The other branches bound it, except the branch's own upstream
-/// and its namesakes on the remotes: fixups already pushed for review are
-/// still folded (and then force-pushed), what another branch shares never.
+/// history.
 pub fn plan(snap: &RepoSnapshot) -> Option<Autosquash> {
-    let head = snap.head.oid?;
+    survey(snap).plan
+}
+
+/// What autosquash makes of the checked-out branch's fixups, going by the
+/// loaded history. The other branches bound it, except the branch's own
+/// upstream and its namesakes on the remotes: fixups already pushed for
+/// review are still folded (and then force-pushed), what another branch
+/// shares never.
+pub fn survey(snap: &RepoSnapshot) -> Survey {
+    let Some(head) = snap.head.oid else { return Survey::default() };
     let own = snap.current_branch();
     let upstream = own.and_then(|b| b.upstream.as_deref());
     let locals = snap.branches.iter().filter(|b| !b.is_head).filter_map(|b| b.oid);
@@ -31,7 +38,7 @@ pub fn plan(snap: &RepoSnapshot) -> Option<Autosquash> {
     // A branch at HEAD itself shares everything and would stop the plan
     // before it starts; it keeps the old commits, as a backup would.
     let stops: Vec<Oid> = locals.chain(remotes).filter(|oid| *oid != head).collect();
-    fixup::plan(&snap.history, head, &stops)
+    fixup::survey(&snap.history, head, &stops)
 }
 
 /// Why `commit` cannot get a fixup now, if it cannot; `None` also when the
@@ -105,18 +112,24 @@ pub fn menu_items(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Re
             squash_into(tab, shared, commit.oid, &message);
         }
     }
-    if fixup::is_fixup(&commit.summary)
-        && let Some(plan) = plan(snap).filter(|plan| plan.fixups.contains(&commit.oid))
-    {
+    if !fixup::is_fixup(&commit.summary) {
+        return;
+    }
+    let survey = survey(snap);
+    if let Some(plan) = survey.plan.filter(|plan| plan.fixups.contains(&commit.oid)) {
         let branch = snap.head_label();
         let blocked = autosquash_blocker(tab, snap);
-        let hover = format!(
-            "Folds every fixup commit of {branch} into the commit it names (git rebase -i --autosquash); {}.",
-            plan.cost()
-        );
+        let how = if plan.merges {
+            ", inside a merged branch where that is, and keeps the merges (git rebase -i --rebase-merges)"
+        } else {
+            " (git rebase -i --autosquash)"
+        };
+        let hover = format!("Folds every fixup commit of {branch} into the commit it names{how}; {}.", plan.cost());
         if entry(ui, icons::MAGIC_WAND, &format!("Autosquash {}", plan.what()), blocked.as_deref(), &hover) {
             run_autosquash(tab);
         }
+    } else if let Some((_, why)) = survey.left.iter().find(|(oid, _)| *oid == commit.oid) {
+        entry(ui, icons::MAGIC_WAND, "Autosquash", Some(why), "");
     }
 }
 

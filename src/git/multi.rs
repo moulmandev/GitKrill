@@ -210,17 +210,22 @@ const ROOT: &str = "The interactive rebase starts from the commit below the olde
 /// Sets `plan` up to squash `run` (oldest first, as [`check_squash`] gives
 /// it) into the oldest of them; every other commit keeps its action. The
 /// combined message is the one git proposes until the user edits it.
-/// Returns the plan position of the commit they fold into, or `None` (and
-/// the plan untouched) when one of them is not in the plan.
-pub fn squash_plan(plan: &mut Plan, run: &[Oid]) -> Option<usize> {
-    let positions: Vec<usize> = run
+/// Returns the line and position in the plan of the commit they fold into,
+/// or `None` (and the plan untouched) when one of them is not in the plan,
+/// or they are not all on one line of it.
+pub fn squash_plan(plan: &mut Plan, run: &[Oid]) -> Option<(usize, usize)> {
+    let places: Vec<(usize, usize)> = run
         .iter()
-        .map(|oid| plan.items.iter().position(|item| plan.range.commits[item.source].oid == *oid))
+        .map(|oid| plan.range.index_of(*oid).and_then(|source| plan.find(source)))
         .collect::<Option<_>>()?;
-    for (i, pos) in positions.iter().enumerate() {
-        plan.items[*pos].action = if i == 0 { Action::Pick } else { Action::Squash };
+    let line = places.first()?.0;
+    if places.iter().any(|(other, _)| *other != line) {
+        return None;
     }
-    positions.first().copied()
+    for (i, (_, pos)) in places.iter().enumerate() {
+        plan.lines[line][*pos].action = if i == 0 { Action::Pick } else { Action::Squash };
+    }
+    places.first().copied()
 }
 
 // ---- what the loaded history says ---------------------------------------------
@@ -557,11 +562,11 @@ mod tests {
         let base = squash.base;
         let range: Range = fx.job(move |loader| rebase::load_range(loader.repo(), base)).unwrap();
         let mut plan = Plan::new(Arc::new(range));
-        assert_eq!(squash_plan(&mut plan, &squash.run), Some(0));
+        assert_eq!(squash_plan(&mut plan, &squash.run), Some((0, 0)));
         assert_eq!(squash_plan(&mut plan.clone(), &[sha(&fx, "HEAD~4")]), None, "the base is not in the plan");
-        let group = plan.groups().into_iter().find(|g| !g.members.is_empty()).unwrap();
+        let group = plan.groups(0).into_iter().find(|g| !g.members.is_empty()).unwrap();
         assert_eq!(plan.default_combined(&group), "a\n\nbody of a\n\nb\n\nbody of b\n\nc\n\nbody of c\n");
-        plan.items[group.leader].combined = Some("a, b and c\n\ntogether".to_owned());
+        plan.lines[0][group.leader].combined = Some("a, b and c\n\ntogether".to_owned());
         let cmd = fx.job(move |loader| plan.prepare(loader.repo())).unwrap();
         fx.run(cmd);
 
