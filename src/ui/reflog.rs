@@ -397,8 +397,22 @@ fn paint_row(ui: &Ui, rect: Rect, refname: &str, entry: &Entry, selected: bool, 
         detail_right = chip.left() - 10.0;
     }
 
-    let detail = if entry.detail.is_empty() { entry.summary.clone().unwrap_or_default() } else { entry.detail.clone() };
-    let galley = widgets::elided(&painter, &detail, theme::font(12.5), theme::text(), detail_right - x);
+    // Git's message, then the commit's summary when the message does not
+    // already name it ("moving from main to topic"  Fix the login form).
+    let summary = entry.summary.as_deref().unwrap_or_default();
+    let (detail, after) = if entry.detail.is_empty() {
+        (summary, "")
+    } else if entry.detail == summary {
+        (entry.detail.as_str(), "")
+    } else {
+        (entry.detail.as_str(), summary)
+    };
+    let galley = widgets::elided_pair(
+        &painter,
+        (detail, theme::font(12.5), theme::text()),
+        (after, theme::font(12.5), theme::text_dim()),
+        detail_right - x,
+    );
     widgets::galley_left(&painter, rect, x, galley);
 }
 
