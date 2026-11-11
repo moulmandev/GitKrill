@@ -27,7 +27,18 @@ sha2 = "0.11.1"
 # Already in the build through egui (it parses fonts with it); used directly
 # to check a font file before egui loads it (Preferences > Editor).
 skrifa = { version = "0.44", default-features = false, features = ["std"] }
-syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+# Syntax colours. Only the parser and the pure-Rust regex engine: the
+# grammars come from two-face, and the few of our own are read from YAML.
+syntect = { version = "5.3.0", default-features = false, features = ["parsing", "regex-fancy", "yaml-load", "dump-load"] }
+# Grammars for syntax colours: syntect's own set plus bat's (TypeScript and
+# TSX, Kotlin, Swift, Dart, Dockerfile, TOML, Vue, Zig and many more), in a
+# dump built for the regex engine above. Loaded on the highlighter's thread
+# the first time a diff is coloured.
+two-face = { version = "0.5.2", default-features = false, features = ["syntect-fancy"] }
+# SVG changes shown as pictures in the image preview. Text is drawn with
+# the fonts built into the app (no system font scan); pictures embedded in
+# an SVG are left out.
+resvg = { version = "0.49", default-features = false, features = ["text"] }
 ureq = "3.5.1"
 
 # Replacing the running executable when a portable copy updates itself

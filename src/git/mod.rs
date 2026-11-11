@@ -24,6 +24,7 @@ pub mod remotes;
 pub mod repo;
 pub mod stash;
 pub mod text;
+pub mod utf16;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -339,6 +340,16 @@ pub struct FileDiff {
     /// The whole file was asked for, but it is too long to show: only the
     /// hunks are there.
     pub too_long_for_whole_file: bool,
+    /// Both versions of a file diffed as decoded text (UTF-16), for applying
+    /// its hunks and lines: see `FileDiff::apply_part`. `None` for every
+    /// other diff, and for one whose parts cannot be written back exactly.
+    pub transcoded: Option<Arc<utf16::Sides>>,
+    /// Every line of both versions of the file as one hunk (context, removed
+    /// and added lines in file order), for syntax colours that follow the
+    /// whole file. Only in a diff of the hunks, of a file small enough
+    /// (`diff::WHOLE_FOR_COLOURS_BYTES`); a whole-file diff has them all
+    /// already.
+    pub whole: Option<Arc<Hunk>>,
 }
 
 impl FileDiff {

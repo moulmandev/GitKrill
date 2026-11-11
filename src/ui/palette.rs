@@ -416,6 +416,7 @@ pub fn entries(tabs: &[RepoTab], active: usize, settings: &Settings) -> Vec<Entr
     // rest of the UI uses for it, and leave the entry out when it cannot run.
     editor_actions(&mut list, settings);
     crate::ui::diff_mode::palette_entries(&mut list, settings);
+    crate::ui::image_diff::palette_entries(&mut list);
     if let Some(shown) = tab.and_then(|tab| tab.hosting.connected()) {
         let service = shown.repo.service;
         list.push(

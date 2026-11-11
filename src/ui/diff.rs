@@ -84,6 +84,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
             Some(images) => crate::ui::image_diff::show(ui, images),
             None => widgets::placeholder(ui, "Binary file - no text diff to show"),
         },
+        Some(Ok(diff)) if crate::ui::image_diff::shows_svg(&diff) => crate::ui::image_diff::show_svg(ui, &diff),
         Some(Ok(diff)) if diff.hunks.is_empty() && diff.only_whitespace => only_whitespace(ui, shared),
         Some(Ok(diff)) if diff.hunks.is_empty() => {
             widgets::placeholder(ui, "No content changes (the file mode or name changed)")
@@ -96,6 +97,9 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
 /// history. `target` must have a commit as its source. A diff that
 /// ignoring whitespace left empty gets the placeholder that says so.
 pub fn read_only(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget, diff: &Arc<FileDiff>) {
+    if crate::ui::image_diff::shows_svg(diff) {
+        return crate::ui::image_diff::show_svg(ui, diff);
+    }
     if diff.hunks.is_empty() && diff.only_whitespace {
         return only_whitespace(ui, shared);
     }
@@ -163,7 +167,7 @@ fn title_bar(
                 ui.label(egui::RichText::new(format!("+{}", diff.additions)).color(theme::green()).font(theme::mono(12.0)));
             }
             // Images have modes of their own.
-            if !diff.is_some_and(|diff| diff.binary) {
+            if !diff.is_some_and(|diff| diff.binary || crate::ui::image_diff::shows_svg(diff)) {
                 ui.add_space(8.0);
                 crate::ui::diff_mode::controls(ui, &mut shared.settings.editor, rect.width() < COMPACT_BELOW);
             }
@@ -705,6 +709,9 @@ fn notices(ui: &mut Ui, shared: &mut Shared, target: &DiffTarget, diff: &FileDif
     {
         shared.settings.editor.diff_context = editor::DiffContext::Hunks;
     }
+    if crate::ui::image_diff::is_svg(diff) && notice(ui, icons::FILE_SVG, "This SVG is shown as text.", Some("Show Picture")) {
+        crate::ui::image_diff::set_svg_as_text(false);
+    }
 }
 
 /// One strip of [`notices`]; true when its button was clicked.
@@ -1180,7 +1187,7 @@ fn hunk_buttons(
             DiffSource::Unstaged => {
                 if place(ui, &format!("Stage {lines}"), theme::green()) {
                     match patch(LineApply::Forward) {
-                        Some(patch) => tab.run(ops::apply_patch(STAGE_LINES, patch, true, false)),
+                        Some(patch) => tab.run(diff.apply_part(STAGE_LINES, patch, true, false)),
                         None => stale(shared),
                     }
                 }
@@ -1193,7 +1200,7 @@ fn hunk_buttons(
                                 lines = if count == 1 { "line".to_owned() } else { lines.clone() },
                             ),
                             "Discard",
-                            ops::apply_patch(DISCARD_LINES, patch, false, true),
+                            diff.apply_part(DISCARD_LINES, patch, false, true),
                         )),
                         None => stale(shared),
                     }
@@ -1202,7 +1209,7 @@ fn hunk_buttons(
             DiffSource::Staged => {
                 if place(ui, &format!("Unstage {lines}"), theme::red()) {
                     match patch(LineApply::Reverse) {
-                        Some(patch) => tab.run(ops::apply_patch(UNSTAGE_LINES, patch, true, true)),
+                        Some(patch) => tab.run(diff.apply_part(UNSTAGE_LINES, patch, true, true)),
                         None => stale(shared),
                     }
                 }
@@ -1218,20 +1225,20 @@ fn hunk_buttons(
     match target.source {
         DiffSource::Unstaged => {
             if place(ui, "Stage Hunk", theme::green()) {
-                tab.run(ops::apply_patch("Stage hunk", patch.clone(), true, false));
+                tab.run(diff.apply_part("Stage hunk", patch.clone(), true, false));
             }
             if place(ui, "Discard Hunk", theme::red()) {
                 shared.show(Dialog::confirm(
                     "Discard hunk",
                     "Discard this hunk from the working tree? This cannot be undone.",
                     "Discard",
-                    ops::apply_patch("Discard hunk", patch, false, true),
+                    diff.apply_part("Discard hunk", patch, false, true),
                 ));
             }
         }
         DiffSource::Staged => {
             if place(ui, "Unstage Hunk", theme::red()) {
-                tab.run(ops::apply_patch("Unstage hunk", patch, true, true));
+                tab.run(diff.apply_part("Unstage hunk", patch, true, true));
             }
         }
         DiffSource::Commit(_) | DiffSource::Compare { .. } => {}

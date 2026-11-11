@@ -54,6 +54,10 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Show the text of a file (not git's own data) | Decode it in the background with `git::text::format_for(workdir)` (the repository's encoding and the tab width: `display_text_in`, `decode_file`), keep the `Format` with the result, and load again when `text::generation()` has moved on (`ui/diff.rs` does). |
 | Show a diff of one file | `tab.open_diff(target)` (or `tab.diff = Some(DiffView { target, data: None })` plus `handle.diff(target)`). The reader works it out in the mode set in Preferences > Editor (`git::diff::mode()`: whole file, ignore whitespace) and the answer says which (`FileDiff::mode`); the view asks again when they differ. From a job, `loader.diff_with(&target, git::diff::mode())`, and load again when `diff.mode` is no longer `git::diff::mode()` (`ui/history.rs` does); `loader.diff(&target)` is the plain diff of three lines of context, the one to build patches from. A whole-file diff has `Hunk::gap` hunks between the real ones (unchanged lines, no header, nothing to stage); a diff with whitespace ignored must not be applied (`ui::diff::can_apply_parts`). `ui::diff::read_only` paints one in the layout chosen (`ui::diff_split` for side by side). |
 | Paint code | `prefs::editor::look()` (one atomic load): `font()`, `small()`, `line_height()`, `numbers`, `wrap`, `highlight`. `theme::code(size)` is the code font; `ui::diff::{first_rows, wrap_rows, segments}` wrap lines with rows kept from frame to frame. |
+| Stage, unstage or discard hunks or lines | Build the patch with `FileDiff::hunk_patch` or `lines_patch`, then run `diff.apply_part(label, patch, cached, reverse)`, not `ops::apply_patch`: for a diff of decoded text (UTF-16, `FileDiff::transcoded`) it writes the result in the file's own encoding instead of calling `git apply` (`git::utf16`). |
+| Read a file that may be UTF-16 | `text::utf16_encoding(bytes, repo_encoding)` says whether and how (a byte order mark, the repository's setting, or `looks_like_utf16`); `text::decode_as(bytes, found)` decodes, `found.encode(text)` writes back. Blame does this itself (`git::utf16::blame_lines`). |
+| Colour code | `ui::highlight::style_for(ctx, diff, path, on)` once per frame, then `style.hunk(h)?.spans(i)` per line. A diff whose lines are the whole file, or that carries `FileDiff::whole` (the loader adds it to diffs of the hunks of files up to `git::diff::WHOLE_FOR_COLOURS_BYTES`, 1 MiB), is coloured from the file's first line on; above that, or past `highlight::STREAM_MAX_LINES` (20,000) / `STREAM_MAX_BYTES`, each hunk is parsed on its own from the syntax's initial state. Grammars are two-face's (bat's set, built for the pure-Rust regex engine) plus ours in `highlight.rs` (`TOML_SYNTAX`, `POWERSHELL_SYNTAX`, `.sublime-syntax` YAML); `ALIASES` maps more extensions onto them. |
+| Show an SVG change as pictures | The loader draws both versions of a `.svg` diff (`git::picture::load_svg`, resvg) into `FileDiff::images`, the text diff staying as it is; `ui::image_diff::shows_svg(diff)` / `show_svg(ui, diff)` paint it, `set_svg_as_text` switches (for the session). |
 | Do network or other non-repository background work | Spawn your own thread, send results over a channel, call `ctx.request_repaint()` when something arrives, and poll the channel from your UI code. Never block in UI code. |
 
 Fetch commands start from `ops::fetch(&[...])`, which adds `--prune`
@@ -170,6 +174,11 @@ front, and the global and repository git configuration files.
   (`git::stash::staged_check` dry-runs that); a path only HEAD has (a
   staged deletion, a rename's old name) is refused, or with
   `--include-untracked` the stash is saved and then the command fails.
+- **syntect** runs the pure-Rust regex engine (`fancy-regex`), so grammars
+  that need Oniguruma are left out of two-face's dump (bat's PowerShell is
+  one; `highlight.rs` has a smaller one of its own). Keep our grammars in
+  their own `SyntaxSet`: adding them to two-face's (`into_builder`) makes
+  syntect link all two hundred again, half a second on the first diff.
 - **git-lfs sets itself up** in a repository on most commands, even ones
   that only list (`git lfs track`, `git lfs ls-files`): it installs its
   hooks and writes `lfs.repositoryformatversion` to `.git/config`. Ask

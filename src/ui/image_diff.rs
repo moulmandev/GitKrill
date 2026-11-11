@@ -2,16 +2,26 @@
 //! between them, or one faded over the other (onion skin). An added or
 //! deleted image is shown on its own.
 //!
+//! An SVG change is shown the same way, drawn by the reader thread, with a
+//! button to its text diff (where hunks and lines are staged) and one back
+//! (`Show Picture` above the text). Which of the two is a habit, kept for
+//! the session; the command palette switches it too.
+//!
 //! Pixels arrive decoded from the reader thread (`git::picture`); this only
 //! uploads them as textures, keeps the last few, and lays them out.
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use eframe::egui::{
     self, Align2, Color32, ColorImage, Context, CornerRadius, Id, Mesh, Pos2, Rect, Sense, Shape, Stroke, StrokeKind,
     TextureHandle, TextureOptions, Ui, Vec2, pos2, vec2,
 };
 
+use crate::git::FileDiff;
 use crate::git::picture::{ImageDiff, Picture, Side};
 use crate::theme::{self, icons};
+use crate::ui::palette::{Entry, Env, Kind};
+use crate::ui::widgets;
 
 /// Textures kept: the two sides of the image shown, plus the previous pair
 /// so stepping back and forth through files does not upload again.
@@ -50,7 +60,53 @@ impl Default for Choice {
     }
 }
 
+/// SVG changes are shown as their text rather than as pictures.
+static SVG_AS_TEXT: AtomicBool = AtomicBool::new(false);
+
+pub fn svg_as_text() -> bool {
+    SVG_AS_TEXT.load(Ordering::Relaxed)
+}
+
+pub fn set_svg_as_text(text: bool) {
+    SVG_AS_TEXT.store(text, Ordering::Relaxed);
+}
+
+/// Whether `diff` is of an SVG file, drawn as pictures (`git::picture`).
+pub fn is_svg(diff: &FileDiff) -> bool {
+    !diff.binary && diff.images.is_some()
+}
+
+/// Whether `diff` is of an SVG file and is to be shown as pictures now.
+pub fn shows_svg(diff: &FileDiff) -> bool {
+    is_svg(diff) && !svg_as_text()
+}
+
+/// An SVG change as pictures ([`shows_svg`]), with a button to its text.
+pub fn show_svg(ui: &mut Ui, diff: &FileDiff) {
+    if let Some(images) = &diff.images {
+        show_in(ui, images, true);
+    }
+}
+
+/// Switching between pictures and text for SVG changes, in the command
+/// palette.
+pub fn palette_entries(list: &mut Vec<Entry>) {
+    let label = if svg_as_text() { "Show SVG changes as pictures" } else { "Show SVG changes as text" };
+    list.push(
+        Entry::new(Kind::Action, "svg-view", icons::FILE_SVG, label, |env: &mut Env<'_>| {
+            set_svg_as_text(!svg_as_text());
+            env.ctx.request_repaint();
+        })
+        .keywords("svg image picture vector drawing source text diff preview"),
+    );
+}
+
 pub fn show(ui: &mut Ui, images: &ImageDiff) {
+    show_in(ui, images, false);
+}
+
+/// The preview; `svg` adds the button that shows the text instead.
+fn show_in(ui: &mut Ui, images: &ImageDiff, svg: bool) {
     let choice_id = Id::new("image-diff-choice");
     let mut choice: Choice = ui.data(|d| d.get_temp(choice_id)).unwrap_or_default();
 
@@ -59,12 +115,26 @@ pub fn show(ui: &mut Ui, images: &ImageDiff) {
     ui.allocate_rect(area, Sense::hover());
     ui.painter().rect_filled(area, 0.0, theme::bg_app());
 
-    // Toolbar: the comparison modes, when there are two pictures to compare.
+    // Toolbar: the comparison modes, when there are two pictures to compare,
+    // and for an SVG the way to its text.
     let mut body = area;
-    if both {
+    if both || svg {
         let bar = Rect::from_min_size(area.min, vec2(area.width(), TOOLBAR_H));
         body.min.y = bar.bottom();
         ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, Stroke::new(1.0, theme::border()));
+        if svg {
+            let label = format!("{} Show Text", icons::CODE);
+            let size = widgets::tint_button_size(ui, &label);
+            let button = Rect::from_min_size(pos2(bar.right() - 12.0 - size.x, bar.center().y - size.y / 2.0), size);
+            let response = widgets::tint_button_at(ui, button, &label, theme::accent())
+                .on_hover_text("Show the SVG's text, where hunks and lines can be staged");
+            if response.clicked() {
+                set_svg_as_text(true);
+            }
+        }
+    }
+    if both {
+        let bar = Rect::from_min_size(area.min, vec2(area.width(), TOOLBAR_H));
         let modes = [
             (Mode::SideBySide, icons::COLUMNS, "Side by side"),
             (Mode::Swipe, icons::ARROWS_HORIZONTAL, "Swipe"),
