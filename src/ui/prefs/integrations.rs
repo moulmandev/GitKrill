@@ -1,9 +1,10 @@
 //! Preferences > Integrations: the hosting accounts GitKrill talks to.
 //!
 //! A column of services (GitHub, GitHub Enterprise Server, GitLab, GitLab
-//! Self-Managed, with the servers connected under the last two) beside the
-//! one chosen: the sign-in GitKrill finds there and where it came from, the
-//! account it belongs to, and that account's SSH keys.
+//! Self-Managed, Bitbucket, Azure DevOps, Codeberg, Gitea, Forgejo, with the
+//! servers connected under the self-hosted ones) beside the one chosen: the
+//! sign-in GitKrill finds there and where it came from, the account it
+//! belongs to, and that account's SSH keys.
 //!
 //! Nothing is looked up before an account is shown, and nothing at all while
 //! the hosting integration is off. Each account's lookups run on a thread of
@@ -37,6 +38,13 @@ enum Entry {
     GitLab,
     /// Self-managed GitLab servers: one of them, or (`None`) the list.
     SelfManaged(Option<String>),
+    Bitbucket,
+    Azure,
+    Codeberg,
+    /// Gitea servers: one of them, or (`None`) the list.
+    Gitea(Option<String>),
+    /// Forgejo servers: one of them, or (`None`) the list.
+    Forgejo(Option<String>),
 }
 
 /// Servers the remotes of the open repositories point at, read once in the
@@ -77,11 +85,11 @@ pub fn show(ui: &mut Ui, page: &mut Page<'_>, state: &mut State) {
     );
     let settings = &mut page.shared.settings;
     form::row(ui, "Hosting integration", |ui| {
-        form::checkbox(ui, &mut settings.hosting_integration, "Pull requests, issues and CI from GitHub and GitLab");
+        form::checkbox(ui, &mut settings.hosting_integration, "Pull requests, issues and CI from your hosting services");
         if !settings.hosting_integration {
             form::help(
                 ui,
-                "Integration is off: GitKrill sends nothing to GitHub or GitLab, so no account is shown here. \
+                "Integration is off: GitKrill sends nothing to any hosting service, so no account is shown here. \
                  Turn it on to see your accounts.",
             );
         }
@@ -121,6 +129,12 @@ fn follow_settings(page: &Page<'_>, state: &mut State) {
         Entry::SelfManaged(Some(host)) if servers.get(host) != Some(&ServerKind::GitLab) => {
             state.entry = Entry::SelfManaged(None);
         }
+        Entry::Gitea(Some(host)) if servers.get(host) != Some(&ServerKind::Gitea) => {
+            state.entry = Entry::Gitea(None);
+        }
+        Entry::Forgejo(Some(host)) if servers.get(host) != Some(&ServerKind::Forgejo) => {
+            state.entry = Entry::Forgejo(None);
+        }
         _ => {}
     }
 }
@@ -128,6 +142,8 @@ fn follow_settings(page: &Page<'_>, state: &mut State) {
 fn entry_for(kind: ServerKind, host: Option<String>) -> Entry {
     match kind {
         ServerKind::GitLab => Entry::SelfManaged(host),
+        ServerKind::Gitea => Entry::Gitea(host),
+        ServerKind::Forgejo => Entry::Forgejo(host),
         _ => Entry::Enterprise(host),
     }
 }
@@ -143,14 +159,35 @@ fn servers_of(page: &Page<'_>, kind: ServerKind) -> Vec<String> {
 fn services(ui: &mut Ui, page: &Page<'_>, state: &mut State) {
     let enterprise = servers_of(page, ServerKind::GitHubEnterprise);
     let gitlab = servers_of(page, ServerKind::GitLab);
+    let gitea = servers_of(page, ServerKind::Gitea);
+    let forgejo = servers_of(page, ServerKind::Forgejo);
     Frame::new()
         .fill(theme::bg_panel())
         .corner_radius(6.0)
         .inner_margin(Margin::symmetric(0, 6))
         .show(ui, |ui| {
             // Top to bottom, inside the page's left-to-right row.
-            ui.with_layout(Layout::top_down(Align::Min), |ui| column(ui, state, enterprise, gitlab));
+            ui.with_layout(Layout::top_down(Align::Min), |ui| {
+                column(ui, state, enterprise, gitlab);
+                more_services(ui, state, gitea, forgejo);
+            });
         });
+}
+
+/// Bitbucket, Azure DevOps, Codeberg, then Gitea and Forgejo with their
+/// servers.
+fn more_services(ui: &mut Ui, state: &mut State, gitea: Vec<String>, forgejo: Vec<String>) {
+    service_row(ui, state, Entry::Bitbucket, icons::PAINT_BUCKET, "Bitbucket", false);
+    service_row(ui, state, Entry::Azure, icons::INFINITY, "Azure DevOps", false);
+    service_row(ui, state, Entry::Codeberg, icons::MOUNTAINS, "Codeberg", false);
+    service_row(ui, state, Entry::Gitea(None), icons::COFFEE, "Gitea", false);
+    for host in gitea {
+        service_row(ui, state, Entry::Gitea(Some(host.clone())), icons::HARD_DRIVES, &host, true);
+    }
+    service_row(ui, state, Entry::Forgejo(None), icons::HAMMER, "Forgejo", false);
+    for host in forgejo {
+        service_row(ui, state, Entry::Forgejo(Some(host.clone())), icons::HARD_DRIVES, &host, true);
+    }
 }
 
 /// The services, each followed by its servers.
@@ -208,6 +245,22 @@ fn detail(ui: &mut Ui, page: &mut Page<'_>, state: &mut State) {
             server_page(ui, page, state, AccountId { service: Service::GitHubEnterprise, host });
         }
         Entry::SelfManaged(Some(host)) => server_page(ui, page, state, AccountId { service: Service::GitLab, host }),
+        Entry::Bitbucket => {
+            title(ui, "Bitbucket", Some("Bitbucket Cloud, on bitbucket.org."));
+            account_rows(ui, page, state, AccountId::bitbucket());
+        }
+        Entry::Azure => {
+            title(ui, "Azure DevOps", Some("Azure Repos, Pipelines and Boards, on dev.azure.com."));
+            account_rows(ui, page, state, AccountId::azure());
+        }
+        Entry::Codeberg => {
+            title(ui, "Codeberg", None);
+            account_rows(ui, page, state, AccountId::codeberg());
+        }
+        Entry::Gitea(None) => server_list(ui, page, state, ServerKind::Gitea),
+        Entry::Forgejo(None) => server_list(ui, page, state, ServerKind::Forgejo),
+        Entry::Gitea(Some(host)) => server_page(ui, page, state, AccountId { service: Service::Gitea, host }),
+        Entry::Forgejo(Some(host)) => server_page(ui, page, state, AccountId { service: Service::Forgejo, host }),
     }
 }
 
@@ -258,7 +311,17 @@ fn account_rows(ui: &mut Ui, page: &mut Page<'_>, state: &mut State, account: Ac
         Some(CardAct::Connect) | None => {}
     }
     if matches!(session.view.profile, Some(Ok(_))) {
-        key_rows(ui, session, title, key_path, key_path_set);
+        if account.keys_supported() {
+            key_rows(ui, session, title, key_path, key_path_set);
+        } else {
+            form::row(ui, "SSH Keys", |ui| {
+                form::help(
+                    ui,
+                    "Azure DevOps has no API for SSH keys. Add yours in User settings > SSH public keys \
+                     on dev.azure.com; Preferences > SSH can generate a key and copy its public half.",
+                );
+            });
+        }
     }
 }
 
@@ -429,6 +492,8 @@ fn source_words(account: &AccountId, source: TokenSource) -> String {
     match source {
         TokenSource::Env(name) => format!("${name}"),
         TokenSource::Cli if account.service.is_gitlab() => "the GitLab CLI (glab)".to_owned(),
+        TokenSource::Cli if account.service.is_gitea() => "the Gitea CLI (tea)".to_owned(),
+        TokenSource::Cli if account.service == Service::AzureDevOps => "the Azure CLI (az)".to_owned(),
         TokenSource::Cli => "the GitHub CLI (gh)".to_owned(),
         TokenSource::CredentialHelper => "Git's credential manager".to_owned(),
     }
@@ -449,6 +514,31 @@ fn sign_in_help(account: &AccountId) -> String {
         Service::GitLab => (
             format!("$GITLAB_TOKEN while $GITLAB_HOST is {host}"),
             format!("the GitLab CLI (run `glab auth login --hostname {host}`)"),
+        ),
+        Service::Bitbucket => {
+            return "GitKrill looks for a sign-in for bitbucket.org in $BITBUCKET_ACCESS_TOKEN (a repository or \
+                    workspace access token), then $BITBUCKET_API_TOKEN with $BITBUCKET_EMAIL (an Atlassian API \
+                    token with Bitbucket scopes; reading your account needs read:user, your keys \
+                    read:ssh-key), then Git's credential manager, which keeps one after a push or fetch over \
+                    HTTPS. Sign in one of these ways, then click Check again."
+                .to_owned();
+        }
+        Service::AzureDevOps => {
+            return "GitKrill looks for a sign-in for Azure DevOps in $AZURE_DEVOPS_EXT_PAT (a personal access \
+                    token; reading your profile needs its User Profile scope), then the Azure CLI (run `az \
+                    login`), then Git's credential manager. The credential manager signs in per organisation, \
+                    so its sign-in is used in the sidebar of each repository but cannot be shown here. Sign in \
+                    one of these ways, then click Check again."
+                .to_owned();
+        }
+        Service::Codeberg => ("$CODEBERG_TOKEN".to_owned(), "tea's sign-in (run `tea login add`)".to_owned()),
+        Service::Gitea => (
+            format!("$GITEA_TOKEN while $GITEA_HOST is {host}"),
+            format!("tea's sign-in (run `tea login add --url https://{host}`)"),
+        ),
+        Service::Forgejo => (
+            format!("$FORGEJO_TOKEN while $FORGEJO_HOST is {host}"),
+            format!("tea's sign-in (run `tea login add --url https://{host}`)"),
         ),
     };
     format!(
@@ -631,6 +721,8 @@ fn date(epoch: i64) -> String {
 fn kind_name(kind: ServerKind) -> &'static str {
     match kind {
         ServerKind::GitLab => "GitLab Self-Managed",
+        ServerKind::Gitea => "Gitea",
+        ServerKind::Forgejo => "Forgejo",
         _ => "GitHub Enterprise Server",
     }
 }
@@ -737,7 +829,7 @@ fn server_list(ui: &mut Ui, page: &mut Page<'_>, state: &mut State, kind: Server
 
 /// One server's account, and a way to forget the server.
 fn server_page(ui: &mut Ui, page: &mut Page<'_>, state: &mut State, account: AccountId) {
-    let kind = if account.service.is_gitlab() { ServerKind::GitLab } else { ServerKind::GitHubEnterprise };
+    let kind = ServerKind::of(account.service).unwrap_or(ServerKind::GitHubEnterprise);
     let under = format!("{}. Requests go to {} only.", kind_name(kind), account.api());
     title(ui, &account.host, Some(&under));
     let host = account.host.clone();

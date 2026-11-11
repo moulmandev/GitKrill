@@ -49,6 +49,7 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Hand a file or folder to the user's merge tool, diff tool, editor or terminal | `crate::external`: `merge(tools, file)` gives a `GitCmd` for `tab.run`; `diff`, `edit` and `terminal` start the program on a short-lived thread. Pass `&shared.settings.tools`. Failures come back as toasts; a `GITKRILL_SHOT` run prints the command instead. To support another tool, add it to `KNOWN` (where to look, its command lines). |
 | Give every git command an environment variable | `git::cli::set_session_env` (the SSH key and author of the profile in use). It replaces the whole set and `prefs::identity::apply` owns it: add what you need to `identity::session_env` rather than calling it from elsewhere. |
 | Change what the commit button does | `src/ui/commit_button.rs`: the split button (`show`), what runs once a commit succeeded (`follow_up`), the commit template in the message fields (`prefill`). |
+| Add a hosting service | A backend file in `src/hosting/` behind the `Backend` trait, built on `signin::Api` (sign-in found, refused and replaced, rate limit, redirects inside the API, `classify` for the usual statuses); a `Service` variant with its words (`pull_word`, `ci_title`, `issues_title`, `pull_number`, `has_pull_refs`), its remote URLs in `parse_remote`/`public`, its token sources in `find_token`, and its arms in `connect`, `headers`, `api_base`, the `RepoId` links and `account.rs`. A token that is not a bearer token is `Token::basic(user, secret)`. `checkout_pull_request` checks a pull request out on any service. |
 | Ask a hosting account something (who is signed in, its SSH keys) | `hosting::account::AccountSession::start(account, ctx)`, polled from the UI; `account::local_keys`, `parse_public_key` and `fingerprint` read `.pub` files. A host in `settings.hosting_disconnected` is never signed in to. |
 | Know who commits | `prefs::identity`: `settings.identity.current()` is the profile in use; `identity::generation()` changes whenever the identity git commands get may have changed (ask git again then, as `ui::prefs::profiles::commit_author` does). |
 | Show the text of a file (not git's own data) | Decode it in the background with `git::text::format_for(workdir)` (the repository's encoding and the tab width: `display_text_in`, `decode_file`), keep the `Format` with the result, and load again when `text::generation()` has moved on (`ui/diff.rs` does). |
@@ -209,7 +210,10 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   modifiers: write `key:shift+ArrowDown`, not `hold:shift;key:ArrowDown`.
 - `GITKRILL_HOSTING_FIXTURE=<dir>` makes the hosting sidebar answer from
   `<dir>/<endpoint>.json` instead of the network: `pulls`, `issues` and
-  `runs` for GitHub, `merge_requests`, `issues` and `pipelines` for GitLab,
+  `runs` for GitHub, Gitea and Forgejo (`tasks` for servers older than the
+  runs endpoint), `merge_requests`, `issues` and `pipelines` for GitLab,
+  `pullrequests`, `issues` and `pipelines` for Bitbucket, `pullrequests`,
+  `wiql`, `workitems`, `builds` and `repositories` for Azure DevOps,
   in each API's own JSON. `<endpoint>.head` stages a status and headers
   (a rate limit, an outage). To show a GitLab or self-hosted remote, point
   the demo's origin at it (`git remote set-url origin
@@ -219,7 +223,8 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   connects a made-up server without clicking through the offer.
 - Opening a pull request is answered from `create.json` (and `create.head`
   for another status), the request body is written to `create.sent.json`,
-  and `pulls.after.json` replaces `pulls.json` once one was opened. An empty
+  and `pulls.after.json` replaces `pulls.json` once one was opened
+  (`pullrequests.after.json` on Bitbucket and Azure DevOps). An empty
   file named `signed-in` stands in for a token; without it the fixture is
   signed out. Browser links clicked during a `GITKRILL_SHOT` run are
   printed, not opened.
@@ -229,8 +234,10 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   really installed, so set the run's choices in `cfg/settings.json`
   (`"tools": {"merge": {"program": {"id": "vscode", ...}}}`) or click them.
 - Preferences > Integrations reads the account from `user.json` (`GET
-  /user`, in the service's own JSON: `login` for GitHub, `username` for
-  GitLab) and its keys from `keys.json` (`keys.head` stages a refusal such
+  /user`, in the service's own JSON: `login` for GitHub, Gitea and Forgejo,
+  `username` for GitLab, `username` and `uuid` for Bitbucket, Azure DevOps'
+  profile with `displayName` and `emailAddress`) and its keys from
+  `keys.json` (Bitbucket's `/users/{uuid}/ssh-keys` too; `keys.head` stages a refusal such
   as a missing scope: `404` with `x-accepted-oauth-scopes`, or GitLab's
   `403`). Adding a key is answered from `keys.post.json` (201 unless
   `keys.post.head` says otherwise), the body sent is written to

@@ -47,7 +47,7 @@ pub fn open(tab: &mut RepoTab, shared: &mut Shared, branch: Option<Branch>) {
         shared.toast(
             ToastKind::Error,
             "No pull or merge requests here",
-            "This repository has no remote on GitHub or GitLab, or the integration is switched off in the View menu.",
+            "This repository has no remote on a hosting service GitKrill knows, or the integration is switched off in the View menu.",
         );
         return;
     };
