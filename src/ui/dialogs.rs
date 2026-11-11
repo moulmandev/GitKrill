@@ -8,7 +8,7 @@ use eframe::egui::{
 };
 
 use crate::git::ops::{self, PullMode};
-use crate::state::{AppAction, Dialog, RepoTab, Shared, ToastKind};
+use crate::state::{Dialog, RepoTab, Shared, ToastKind};
 use crate::theme::{self, icons};
 use crate::ui::toolbar::push_cmd;
 use crate::ui::widgets::icon_button;
@@ -26,6 +26,7 @@ pub fn show(ctx: &egui::Context, shared: &mut Shared, mut tab: Option<&mut RepoT
     let width = match dialog {
         Dialog::NewPull(_) => 520.0,
         Dialog::Update(_) | Dialog::GitSetup | Dialog::DeleteFolder(_) | Dialog::Remote(_) | Dialog::Ignore(_) => 460.0,
+        Dialog::ApplyPatch(_) | Dialog::Clone(_) => 460.0,
         _ => 400.0,
     };
 
@@ -248,29 +249,18 @@ fn body(
             outcome
         }
 
-        Dialog::Clone { url, dest } => {
-            title(ui, "Clone repository");
-            field(ui, url, "Repository URL (https or ssh)", fresh);
-            ui.horizontal(|ui| {
-                if ui.button("Browse…").clicked()
-                    && let Some(dir) = rfd::FileDialog::new().set_directory(dest.as_str()).pick_folder() {
-                        *dest = dir.display().to_string();
-                    }
-                ui.add(TextEdit::singleline(dest).hint_text("Clone into this folder").desired_width(f32::INFINITY));
-            });
-            let ready = !url.trim().is_empty() && std::path::Path::new(dest.trim()).is_dir();
-            match buttons(ui, "Clone", ready, false) {
-                Some(true) => {
-                    shared.actions.push(AppAction::Clone {
-                        url: url.trim().to_owned(),
-                        dest: dest.trim().into(),
-                    });
-                    Outcome::Close
-                }
-                Some(false) => Outcome::Close,
-                None => Outcome::Keep,
-            }
-        }
+        Dialog::Clone(form) => match crate::ui::clone::dialog(ui, form, shared, fresh) {
+            crate::ui::clone::Next::Keep => Outcome::Keep,
+            crate::ui::clone::Next::Close => Outcome::Close,
+        },
+        Dialog::ApplyPatch(form) => match crate::ui::patch::dialog(ui, form, tab) {
+            crate::ui::patch::Next::Keep => Outcome::Keep,
+            crate::ui::patch::Next::Close => Outcome::Close,
+        },
+        Dialog::DeleteTag(form) => match crate::ui::tags::dialog(ui, form, tab) {
+            crate::ui::tags::Next::Keep => Outcome::Keep,
+            crate::ui::tags::Next::Close => Outcome::Close,
+        },
 
         Dialog::ConnectServer { host, path, choice } => {
             match crate::ui::hosting::connect_body(ui, shared, host, path, choice) {

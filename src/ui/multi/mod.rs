@@ -368,6 +368,7 @@ pub fn menu(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, oid: Oid) -> bo
     if n == 2 && menu_item(ui, icons::ARROWS_DOWN_UP, "Swap the comparison") {
         swap(tab);
     }
+    crate::ui::patch::multi_items(ui, tab, snap, &facts.commits);
     ui.separator();
     if menu_item(ui, icons::COPY, &format!("Copy {n} SHAs")) {
         copy_shas(ui.ctx(), &facts);

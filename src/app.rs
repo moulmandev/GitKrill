@@ -134,22 +134,12 @@ impl App {
         }
     }
 
-    fn start_clone(&mut self, ctx: &egui::Context, url: String, dest: PathBuf) {
-        let name = url
-            .trim_end_matches('/')
-            .rsplit(['/', ':'])
-            .next()
-            .unwrap_or("repository")
-            .trim_end_matches(".git")
-            .to_owned();
-        let target = dest.join(&name);
+    fn start_clone(&mut self, ctx: &egui::Context, url: String, dest: PathBuf, options: crate::git::clone::CloneOptions) {
+        let label = format!("Cloning {}", crate::git::clone::folder_name(&url));
         let (tx, rx) = channel();
         let ctx = ctx.clone();
-        let label = format!("Cloning {name}");
         std::thread::spawn(move || {
-            let args = vec!["clone".to_owned(), url, target.display().to_string()];
-            let result = cli::run(&dest, &args, cli::Options::default()).map(|_| target);
-            let _ = tx.send(result);
+            let _ = tx.send(crate::git::clone::run(&dest, &url, &options));
             ctx.request_repaint();
         });
         self.cloning = Some((label, rx));
@@ -178,7 +168,7 @@ impl App {
                         self.active = i;
                     }
                 }
-                AppAction::Clone { url, dest } => self.start_clone(ctx, url, dest),
+                AppAction::Clone { url, dest, options } => self.start_clone(ctx, url, dest, options),
                 AppAction::InitDialog => {
                     let picked = crate::shot::Shot::picked_folder()
                         .or_else(|| rfd::FileDialog::new().set_title("Initialise a repository in…").pick_folder());
@@ -341,6 +331,12 @@ impl App {
                     shared.actions.push(AppAction::InitDialog);
                 }
                 ui.separator();
+                if let Some(tab) = tabs.get_mut(*active) {
+                    if ui.button("Apply Patch…").clicked() {
+                        ui::patch::open_apply(tab, shared);
+                    }
+                    ui.separator();
+                }
                 if ui.button("Add Folder of Repositories…").clicked() {
                     shared.actions.push(AppAction::AddWorkspace(Opens::Here));
                 }

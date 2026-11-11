@@ -5,9 +5,11 @@
 //! talks to a remote goes through the `git` CLI so hooks, signing, credential
 //! helpers, LFS and the user's config behave exactly as they do in a terminal.
 
+pub mod archive;
 pub mod blame;
 pub mod branch_folder;
 pub mod cli;
+pub mod clone;
 pub mod conflict;
 pub mod diff;
 pub mod gitflow;
@@ -18,11 +20,13 @@ pub mod internal;
 pub mod lfs;
 pub mod multi;
 pub mod ops;
+pub mod patch;
 pub mod picture;
 pub mod rebase;
 pub mod remotes;
 pub mod repo;
 pub mod stash;
+pub mod tags;
 pub mod text;
 
 use std::collections::HashMap;
@@ -166,6 +170,8 @@ pub enum RepoState {
     CherryPick,
     Revert,
     Bisect,
+    /// `git am` stopped on a mail that did not apply (`git::patch`).
+    ApplyMailbox,
     Other,
 }
 
@@ -178,6 +184,7 @@ impl RepoState {
             RepoState::CherryPick => Some("Cherry-pick in progress"),
             RepoState::Revert => Some("Revert in progress"),
             RepoState::Bisect => Some("Bisect in progress"),
+            RepoState::ApplyMailbox => Some("Applying patches"),
             RepoState::Other => Some("Operation in progress"),
         }
     }

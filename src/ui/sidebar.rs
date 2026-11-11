@@ -148,6 +148,7 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
             if hide_item(ui, all_hidden, "all tags in graph") {
                 tab.set_hidden(&mut shared.settings, TAGS, !all_hidden);
             }
+            crate::ui::tags::header_items(ui, tab, &snap);
         });
         if open {
             for tag in tags {
@@ -172,14 +173,11 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                             tab.run(ops::push_tag(remote, &tag.name));
                         }
                     crate::ui::multi::compare_item(ui, tab, shared, &snap, Some(tag.oid));
+                    crate::ui::archive::item(ui, tab, &format!("refs/tags/{}", tag.name), &tag.name);
                     ui.separator();
+                    crate::ui::tags::remote_items(ui, shared, &snap, &tag.name);
                     if menu_item(ui, icons::TRASH, &format!("Delete {}", tag.name)) {
-                        shared.show(Dialog::confirm(
-                            "Delete tag",
-                            format!("Delete the tag \"{}\" from this repository?", tag.name),
-                            "Delete",
-                            ops::delete_tag(&tag.name),
-                        ));
+                        crate::ui::tags::delete(shared, &snap, &tag.name);
                     }
                     ui.separator();
                     if hide_item(ui, is_hidden, "in graph") {
@@ -624,6 +622,7 @@ pub fn local_branch_menu(
         ));
     }
     crate::ui::gitflow::branch_menu(ui, tab, shared, snap, branch);
+    crate::ui::archive::item(ui, tab, &format!("refs/heads/{}", branch.name), &branch.name);
     ui.separator();
     hide_items(ui, tab, shared, HEADS, &branch.name, !branch.is_head);
     if menu_item(ui, icons::COPY, "Copy branch name") {
@@ -691,6 +690,7 @@ pub fn remote_branch_menu(
             }
     }
     crate::ui::multi::compare_item(ui, tab, shared, snap, Some(branch.oid));
+    crate::ui::archive::item(ui, tab, &format!("refs/remotes/{}", branch.full), &branch.full);
     // Only for the hosted remote: a fork's branch would need its owner too.
     if let Some(shown) = tab.hosting.connected().filter(|shown| shown.remote == branch.remote) {
         ui.separator();

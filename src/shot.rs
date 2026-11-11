@@ -5,6 +5,7 @@
 //! GITKRILL_SHOT=out.png        final screenshot; the app exits after writing it
 //! GITKRILL_SHOT_SIZE=1500x860  window size in points
 //! GITKRILL_SHOT_FOLDER=dir     what folder dialogs answer instead of asking
+//! GITKRILL_SHOT_FILE=path      what file dialogs (open and save) answer
 //! GITKRILL_SHOT_ROW=3          select this graph row once the repository loads
 //! GITKRILL_SHOT_SCRIPT=...     semicolon-separated steps, run after loading:
 //!     click:x,y  rclick:x,y  dclick:x,y  move:x,y     (points, not pixels)
@@ -140,6 +141,13 @@ impl Shot {
     pub fn picked_folder() -> Option<PathBuf> {
         std::env::var_os("GITKRILL_SHOT")?;
         std::env::var_os("GITKRILL_SHOT_FOLDER").map(PathBuf::from)
+    }
+
+    /// What a file dialog answers in a scripted run, which cannot click
+    /// one: `GITKRILL_SHOT_FILE`. `None` outside scripted runs.
+    pub fn picked_file() -> Option<PathBuf> {
+        std::env::var_os("GITKRILL_SHOT")?;
+        std::env::var_os("GITKRILL_SHOT_FILE").map(PathBuf::from)
     }
 
     pub fn from_env() -> Option<Self> {

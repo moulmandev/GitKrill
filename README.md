@@ -190,7 +190,28 @@ be installed.
   to squash and their combined message ready to edit, and warns when the
   upstream already has some of them); copy their SHAs
 - File history (following renames) and blame, from any file's context menu
-- Tags: create (lightweight or annotated), delete, push
+- Tags: create (lightweight or annotated), delete, push. Push all of them
+  at once from the TAGS header's right-click menu or the command palette
+  (choosing the remote when there are several), delete one on a remote from
+  its right-click menu ("Delete from origin…"), and delete one here and, if
+  ticked, on the remotes too
+- Patch files: "Save as patch…" on a commit's right-click menu (`git
+  format-patch`); several selected commits save one file each in a folder,
+  numbered oldest first, or all in one file. "Save changes as a patch…" on
+  the WIP row's menu (all, staged or unstaged changes, untracked files as new
+  files) and on the right-click of the Unstaged and Staged headers
+- **File > Apply Patch…** (or "Apply patch…" in the command palette) checks
+  the file first and says whether it applies cleanly, needs a three-way merge
+  (naming the files that will have conflicts) or does not apply (naming each
+  file and why). Mails from `git format-patch` can be committed with their
+  authors and messages (`git am`); any patch can go into the working tree,
+  staged or not, and what does not apply is saved beside its file as a
+  `.rej`. Applying to the working tree is undoable; a `git am` stopped on a
+  conflict waits with Continue, Skip and Abort
+- "Export as archive…" on a commit's, branch's or tag's right-click menu
+  (the command palette exports what is checked out): a zip, tar.gz or tar of
+  its files, by the extension of the name you give, in a folder named after
+  the repository and the commit
 - Stash, apply, pop, delete. The stash dialog (right-click the WIP row, or
   "Stash…" in the command palette) takes a message and can leave untracked
   files out, keep the staged changes, or stash only the staged changes
@@ -203,7 +224,8 @@ be installed.
   fast-forward, tags releases and hotfixes, and can be undone; one that stops
   on a conflict carries on from there when run again
 - Undo / redo for commits, checkouts, merges, resets, rebases, branch create
-  and delete, and adding, editing and removing remotes
+  and delete, adding, editing and removing remotes, deleting a tag and
+  applying a patch to the working tree
 
 **Remotes**
 - Fetch, pull (default / ff-only / rebase), push, force push with lease
@@ -262,7 +284,9 @@ be installed.
   workspace › repository › branch breadcrumb in the toolbar
 - Preferences > Notifications: the taskbar button flashes (the Dock icon
   bounces) when an operation ends while GitKrill is in the background
-- Clone and init
+- Clone and init. The clone dialog's Options pick the branch to check out
+  (listed from the remote once the address is typed), a shallow history of
+  the last so many commits, only that branch's history, and the submodules
 - External tools (**Preferences > External Tools**): a merge tool, a diff
   tool, an editor and a terminal, picked from those installed (VS Code,
   Beyond Compare, KDiff3, Meld, P4Merge, WinMerge, Sublime Merge, JetBrains
@@ -286,6 +310,9 @@ in the **Help** menu, the others in the **View** menu.
 | Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, and the requests you open, with a token when one is found for that host (below). While Preferences > Integrations shows an account: whose token it is, its SSH keys, and the public keys you add there | api.github.com, gitlab.com, and only the servers you connected |
 | Automatic fetch | `git fetch --prune --all` (without `--prune` when Auto-Prune is off), as you would run it | your remotes |
 | Updates | A request for the latest release shortly after start and every six hours; the download when there is a newer one | api.github.com, github.com and its download host |
+
+The clone dialog's Options ask the address typed there for its branches
+(`git ls-remote`, never asking for a password) once you open them.
 
 A server other than github.com and gitlab.com is never sent anything until
 you have said what it runs; the answer is kept in the settings file
@@ -363,6 +390,10 @@ src/
     conflict.rs  three-way conflict regions and resolutions
     rebase.rs    interactive rebase plans
     multi.rs     cherry-pick, revert and squash several commits
+    patch.rs     saving, checking and applying patch files
+    archive.rs   exporting a commit as zip or tar.gz
+    clone.rs     clone options, listing a remote's branches
+    tags.rs      pushing all tags, deleting tags on remotes
     blame.rs     file history and blame
     picture.rs   decoding images for the image preview
     cli.rs       running git
@@ -379,6 +410,9 @@ src/
     gitflow.rs   Gitflow dialogs, menus and palette entries
     multi/       several selected commits: selecting (pick.rs), their
                  panel, comparison, menu and palette entries
+    patch.rs     patch menus and the apply dialog
+    clone.rs     clone dialog        tags.rs     tags on remotes
+    archive.rs   "Export as archive…"
     palette.rs   command palette (Ctrl+P)
     image_diff.rs  image preview     update.rs   update offer, status bar
     widgets.rs   shared widgets
@@ -430,12 +464,6 @@ build.rs         the Windows executable's icon and version details
   from where two branches forked (what a branch adds on its own)
 - A commit's whole file tree cannot be browsed, and a file cannot be opened,
   saved or restored as it was in an older commit
-- No creating or applying patch files, and no exporting a commit as an
-  archive
-- Clone has no options: no shallow or single-branch clone, no choice of
-  branch, no submodules
-- All tags cannot be pushed at once, and a tag cannot be deleted on a
-  remote
 - The graph can hide branches but not show one branch alone
 - Pushing and pulling over HTTPS needs a credential helper: without one
   (Windows comes with Git Credential Manager) GitKrill does not ask for a
