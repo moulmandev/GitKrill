@@ -105,8 +105,9 @@ fn describe(repo: &Repository, oid: Oid) -> String {
 
 /// Checks against the repository that `oids` can be squashed into one
 /// commit: they are an unbroken line of commits without merges on the
-/// checked-out branch, with nothing but ordinary commits between them and its
-/// tip, which is what the interactive rebase can rewrite.
+/// checked-out branch's own line of history (its first parents), which is
+/// what the interactive rebase can rewrite. Merges between them and the tip
+/// are made again by the rebase.
 ///
 /// Touches the disk: call it from a reader-thread job.
 pub fn check_squash(repo: &Repository, oids: &[Oid]) -> Result<Squash, String> {
@@ -129,6 +130,10 @@ pub fn check_squash(repo: &Repository, oids: &[Oid]) -> Result<Squash, String> {
     let mut run = Vec::new();
     let mut at = tip;
     let mut steps = 0;
+    let mut past_merge = false;
+    let merged_in = || {
+        format!("These commits came into {branch} through a merge, so they are not on its own line of history. Squash them on the branch they were made on.")
+    };
     loop {
         let commit = repo.find_commit(at).map_err(err)?;
         let selected = wanted.contains(&at);
@@ -143,13 +148,10 @@ pub fn check_squash(repo: &Repository, oids: &[Oid]) -> Result<Squash, String> {
             if selected {
                 return Err(format!("{} is a merge commit. {MERGE}", describe(repo, at)));
             }
-            if !reachable() {
+            if !past_merge && !reachable() {
                 return Err(elsewhere());
             }
-            return Err(format!(
-                "There is a merge commit, {}, between them and the tip of {branch}. {MERGE}",
-                describe(repo, at)
-            ));
+            past_merge = true;
         }
         if selected {
             run.push(at);
@@ -159,6 +161,9 @@ pub fn check_squash(repo: &Repository, oids: &[Oid]) -> Result<Squash, String> {
         }
         steps += 1;
         if steps > MAX_COMMITS {
+            if past_merge && reachable() {
+                return Err(merged_in());
+            }
             return Err(format!(
                 "There are more than {MAX_COMMITS} commits between these and the tip of {branch}, \
                  more than an interactive rebase takes."
@@ -166,6 +171,7 @@ pub fn check_squash(repo: &Repository, oids: &[Oid]) -> Result<Squash, String> {
         }
         at = match commit.parent_id(0) {
             Ok(parent) => parent,
+            Err(_) if past_merge && reachable() => return Err(merged_in()),
             Err(_) => return Err(elsewhere()),
         };
     }
@@ -325,16 +331,18 @@ fn squash_from(
                     between too, or squash fewer."
             .to_owned());
     }
-    // From the tip down the first-parent line to the newest of them, through
-    // ordinary commits only.
+    // From the tip down the first-parent line to the newest of them. Merges
+    // on the way are made again by the interactive rebase.
     let newest = rows[0];
     let mut at = head.oid.and_then(|oid| history.index_of.get(&oid)).map(|i| *i as usize);
+    let mut past_merge = false;
     while let Some(r) = at.filter(|r| *r < newest) {
         let parents = &history.commits[r].parents;
-        if parents.len() > 1 {
-            return Err(format!("There is a merge commit, {}, between them and the tip of {branch}. {MERGE}", info(r)));
-        }
+        past_merge |= parents.len() > 1;
         at = parents.first().and_then(|p| history.index_of.get(p)).map(|i| *i as usize);
+    }
+    if at != Some(newest) && past_merge {
+        return Err(format!("These commits came into {branch} through a merge, so they are not on its own line of history. Squash them on the branch they were made on."));
     }
     if at != Some(newest) {
         return Err(format!("Not all of these commits are on {branch}. Check out the branch they are on to squash them."));
@@ -599,8 +607,18 @@ mod tests {
         assert!(merge.contains("\"merge topic\" is a merge commit"), "{merge}");
         fx.write("e.txt", "e\n");
         fx.commit_all("e");
-        let between = check(&fx, &["HEAD~3", "HEAD~2"]).unwrap_err();
-        assert!(between.contains("merge commit,") && between.contains("between them and the tip of main"), "{between}");
+        // Below a merge on main's own line: the rebase makes the merge again.
+        let below = check(&fx, &["HEAD~3", "HEAD~2"]).expect("a merge above is no obstacle");
+        assert_eq!(below.run, [sha(&fx, "HEAD~3"), sha(&fx, "HEAD~2")]);
+        // ... but not on the side the merge brought in.
+        git(&fx.dir, &["checkout", "-q", "topic"]);
+        fx.write("topic2.txt", "topic two\n");
+        fx.commit_all("topic two");
+        git(&fx.dir, &["checkout", "-q", "main"]);
+        git(&fx.dir, &["merge", "-q", "--no-ff", "-m", "merge topic again", "topic"]);
+        let side = check(&fx, &["topic", "topic~1"]).unwrap_err();
+        assert!(side.contains("came into main through a merge"), "{side}");
+        git(&fx.dir, &["reset", "-q", "--hard", "HEAD~1"]);
 
         // Commits of a branch that was never merged.
         git(&fx.dir, &["checkout", "-q", "-b", "other", "HEAD~4"]);
@@ -726,8 +744,10 @@ mod tests {
         assert!(squash(head(10), &[3, 2]).unwrap_err().contains("first commit of the repository"));
         // 7 is a merge; 6 and 4 sit below it on main.
         assert!(squash(head(8), &[8, 7]).unwrap_err().contains("\"commit 7\" is a merge commit"));
-        let between = squash(head(8), &[6, 4]).unwrap_err();
-        assert!(between.contains("merge commit, ") && between.contains("\"commit 7\""), "{between}");
+        // Below the merge on main's own line; the rebase makes 7 again.
+        assert_eq!(squash(head(8), &[6, 4]), Ok(oid(3)));
+        // 5 came in through the merge.
+        assert!(squash(head(8), &[5, 4]).unwrap_err().contains("came into main through a merge"));
         assert!(squash(head(8), &[10, 3]).unwrap_err().starts_with("Not all of these commits are on main"));
         assert!(squash(head(10), &[10, 2]).unwrap_err().contains("not one unbroken line"));
         let detached = Head { detached: true, ..head(10) };

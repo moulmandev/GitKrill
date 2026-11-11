@@ -4,6 +4,11 @@
 //! with the base commit (which is not touched) underneath. The plan itself
 //! lives in `git::rebase` and is kept oldest first, the order git works in;
 //! this module only turns row positions around when it draws.
+//!
+//! Merge commits are rows like the others. What a merge brought in is not
+//! listed (it is replayed as it is); the row says how much that is, and its
+//! tooltip lists it. Squash and fixup are disabled on merges, with the
+//! reason in the menu (`Plan::refusal`).
 
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -374,9 +379,15 @@ enum Edit {
 }
 
 fn set_action(plan: &mut Plan, controls: &mut Controls, pos: usize, action: Action) {
-    plan.items[pos].action = action;
     let source = plan.items[pos].source;
     controls.selected = Some(source);
+    // Only reachable from the keyboard: the menu disables these.
+    if let Some(reason) = plan.refusal(pos, action) {
+        let commit = plan.commit(pos);
+        controls.error = Some(format!("{} \"{}\": {reason}", short(commit.oid), commit.summary));
+        return;
+    }
+    plan.items[pos].action = action;
     match action {
         Action::Reword => {
             controls.folded.remove(&source);
@@ -555,6 +566,23 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, plan: &mut Plan, co
                                 ));
                             }
                             line(ui, icons::LIST_NUMBERS, theme::text_bright(), &text);
+                            let remade = plan.remade_merges();
+                            if remade > 0 {
+                                let what = if remade == 1 {
+                                    "The merge above the first change is made again".to_owned()
+                                } else {
+                                    format!("The {remade} merges above the first change are made again")
+                                };
+                                line(
+                                    ui,
+                                    icons::GIT_MERGE,
+                                    theme::text_dim(),
+                                    &format!(
+                                        "{what}, with the commits they brought in replayed as they are. A merge \
+                                         that needed conflicts resolved stops for them again."
+                                    ),
+                                );
+                            }
                         }
                     }
                     if controls.restored {
@@ -663,6 +691,36 @@ fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, plan: &mut Plan, co
     outcome
 }
 
+/// The action menu's explanations, for a merge commit.
+fn merge_explain(action: Action) -> &'static str {
+    match action {
+        Action::Pick => "Keep the merge and what it brings in",
+        Action::Reword => "Keep the merge, change its message",
+        Action::Drop => "Remove the merge and the commits it brought in",
+        Action::Squash | Action::Fixup => action.explain(),
+    }
+}
+
+fn capitalised(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
+/// What a merge row's tooltip lists: the commits the merge brought in.
+fn merged_tooltip(ui: &mut Ui, plan: &Plan, side: &rebase::Side) {
+    const SHOWN: usize = 12;
+    ui.set_max_width(420.0);
+    ui.label(RichText::new("Merged with it, and replayed as they are:").color(theme::text_dim()));
+    // Newest first, like the list.
+    for i in side.reach.iter().rev().take(SHOWN) {
+        let commit = &plan.range.merged[*i];
+        ui.label(format!("{}  {}", short(commit.oid), commit.summary));
+    }
+    if side.reach.len() > SHOWN {
+        ui.label(RichText::new(format!("and {} more", side.reach.len() - SHOWN)).color(theme::text_dim()));
+    }
+}
+
 fn subject(message: &str) -> &str {
     message.lines().next().unwrap_or_default()
 }
@@ -762,6 +820,12 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
                 controls.selected = Some(source);
             }
             let response = if locked { response } else { response.on_hover_cursor(CursorIcon::Grab) };
+            let response = match plan.range.sides.get(&source) {
+                Some(side) if controls.drag.is_none() && !side.reach.is_empty() => {
+                    response.on_hover_ui(|ui| merged_tooltip(ui, plan, side))
+                }
+                _ => response,
+            };
 
             widgets::row_background(&painter, rect, controls.selected == Some(source), response.hovered());
             painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::bg_panel()));
@@ -808,13 +872,19 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
                     theme::font(10.0),
                     theme::text_dim(),
                 );
+                let is_merge = plan.commit(pos).is_merge;
                 Popup::menu(&chip_response).show(|ui| {
                     ui.set_min_width(300.0);
                     for choice in Action::ALL {
                         let (icon, _, key) = action_style(choice);
-                        let button = Button::new(format!("{icon}  {}  -  {}", choice.label(), choice.explain()))
+                        let explain = if is_merge { merge_explain(choice) } else { choice.explain() };
+                        let button = Button::new(format!("{icon}  {}  -  {explain}", choice.label()))
                             .shortcut_text(key.name());
-                        if ui.add(button).clicked() {
+                        let refusal = plan.refusal(pos, choice);
+                        let response = ui.add_enabled(refusal.is_none(), button);
+                        if let Some(reason) = refusal {
+                            response.on_disabled_hover_text(capitalised(reason));
+                        } else if response.clicked() {
                             edit = Some(Edit::Action(pos, choice));
                         }
                     }
@@ -836,8 +906,7 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
                 painter.text(pos2(x, mid), Align2::LEFT_CENTER, arrow, theme::font(13.0), fade(tint));
                 x += 20.0;
             } else if commit.is_merge {
-                // The reason the range cannot be rebased here.
-                painter.text(pos2(x, mid), Align2::LEFT_CENTER, icons::GIT_MERGE, theme::font(13.0), theme::orange());
+                painter.text(pos2(x, mid), Align2::LEFT_CENTER, icons::GIT_MERGE, theme::font(13.0), fade(theme::accent()));
                 x += 20.0;
             }
             // A commit that gets a new message shows that message.
@@ -854,6 +923,14 @@ fn list(ui: &mut Ui, plan: &mut Plan, controls: &mut Controls, locked: bool) -> 
                 && !groups[g].members.is_empty()
             {
                 note = format!("{} commits become this one", groups[g].members.len() + 1);
+            }
+            let side = plan.range.sides.get(&source);
+            if let Some(side) = side.filter(|side| side.brings > 0) {
+                let brings = match side.brings {
+                    1 => "brings in 1 commit".to_owned(),
+                    n => format!("brings in {n} commits"),
+                };
+                note = if note.is_empty() { brings } else { format!("{note}  ·  {brings}") };
             }
             if d == 0 {
                 note = if note.is_empty() { "newest".to_owned() } else { format!("{note}  ·  newest") };

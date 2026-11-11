@@ -11,17 +11,28 @@
 //!   into git's own `rebase-merge` state directory. Git deletes that
 //!   directory when the rebase finishes or is aborted, so nothing is left
 //!   behind however the rebase ends.
-//! * The todo list only uses `pick`, `fixup`, `drop` and `exec`. A new
-//!   message (reword, or the message of a squash group) is applied by an
+//! * The todo list only uses `pick`, `fixup`, `drop` and `exec`, plus
+//!   `label`, `reset` and `merge` when the range has merges. A new message
+//!   (reword, or the message of a squash group) is applied by an
 //!   `exec git commit --amend -F <file>` line after the commits it belongs
 //!   to. Everything the plan needs is therefore in the todo list itself: a
 //!   rebase that stops on a conflict carries on correctly with a plain
 //!   `git rebase --continue`, from this app or from a terminal, and no
 //!   editor is ever involved, so messages arrive byte for byte.
+//! * Merges (`--rebase-merges`): the plan lists the branch's own line of
+//!   history, the first parents from HEAD down to the base, merge commits
+//!   included. The commits a merge brought in from its other side are not
+//!   planned one by one; they are replayed as they are, onto whatever they
+//!   branched off from, and the merge is made again with its own message
+//!   (`merge -C`). Commits and merges whose parents did not change are not
+//!   rewritten at all. A merge can be kept, reworded or dropped (with what
+//!   it brought in), and commits can be folded into it, but it cannot be
+//!   folded into another commit; see [`Plan::refusal`].
 //! * Paths never appear in a command line. The staging folder travels in an
 //!   environment variable and the `exec` lines ask git where its state
 //!   directory is, so spaces, quotes and backslashes need no escaping.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -129,6 +140,8 @@ pub struct RangeCommit {
     pub author: String,
     pub email: String,
     pub is_merge: bool,
+    /// First parent first, as git records them.
+    pub parents: Vec<Oid>,
 }
 
 /// The commits an interactive rebase from `base` would replay.
@@ -138,12 +151,41 @@ pub struct Range {
     pub base_summary: String,
     /// HEAD when the range was read; the plan is only valid while it holds.
     pub head: Head,
-    /// Oldest first, which is the order git applies them in.
+    /// The commits the plan arranges, oldest first, which is the order git
+    /// applies them in: the first parents from HEAD down to the base, merge
+    /// commits included. Without merges, simply every commit after the base.
     pub commits: Vec<RangeCommit>,
+    /// The commits merges in `commits` brought in from their other side,
+    /// oldest first in an order git can replay them in. They are not
+    /// planned one by one: see [`Side`].
+    pub merged: Vec<RangeCommit>,
+    /// What each merge in `commits` brings in, by its index there.
+    pub sides: HashMap<usize, Side>,
     /// Why this range cannot be rebased interactively, whatever the plan.
     pub blocker: Option<String>,
     /// A later base from which the range would be acceptable.
     pub suggested_base: Option<Oid>,
+}
+
+/// The other side of one merge of the plan.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Side {
+    /// Indexes into [`Range::merged`] of every commit the merge's other
+    /// parents lead to, oldest first. Kept merges replay them as they are.
+    pub reach: Vec<usize>,
+    /// Indexes into [`Range::commits`] of the commits those branch off from
+    /// (or that the merge has as another parent): the merge has to come
+    /// after them.
+    pub forks: Vec<usize>,
+    /// How many of `reach` no older merge of the line brings in already:
+    /// what the merge's row says it brings in.
+    pub brings: usize,
+}
+
+impl Range {
+    pub fn has_merges(&self) -> bool {
+        self.commits.iter().any(|c| c.is_merge)
+    }
 }
 
 fn err(e: git2::Error) -> String {
@@ -159,6 +201,7 @@ fn range_commit(commit: &git2::Commit<'_>) -> RangeCommit {
         author: lossy(author.name_bytes()),
         email: lossy(author.email_bytes()),
         is_merge: commit.parent_count() > 1,
+        parents: commit.parent_ids().collect(),
     }
 }
 
@@ -173,7 +216,8 @@ fn too_many() -> String {
 ///
 /// Fails when there is no such range at all (the commit is not in HEAD's
 /// history, or the range is absurdly long). A range that exists but cannot
-/// be rebased interactively, because it contains merges, is returned with
+/// be rebased interactively from this base, because the base came in through
+/// a merge rather than lying on the branch's own line, is returned with
 /// [`Range::blocker`] set so the UI can show what is in the way.
 pub fn load_range(repo: &Repository, base: Oid) -> Result<Range, String> {
     // A plan that was prepared but never started (git refused to begin)
@@ -195,16 +239,26 @@ pub fn load_range(repo: &Repository, base: Oid) -> Result<Range, String> {
             short(base)
         )
     };
+    let range = |commits, merged, sides, blocker, suggested_base| Range {
+        base,
+        base_summary: base_summary.clone(),
+        head: head.clone(),
+        commits,
+        merged,
+        sides,
+        blocker,
+        suggested_base,
+    };
 
     // A range without merges is the first-parent chain from HEAD down to
     // the base, which costs one object read per commit.
     let mut chain = Vec::new();
-    let mut first_merge = None;
+    let mut has_merge = false;
     let mut at = tip;
     while at != base {
         let commit = repo.find_commit(at).map_err(err)?;
         if commit.parent_count() > 1 {
-            first_merge = Some(at);
+            has_merge = true;
             break;
         }
         if chain.len() >= MAX_COMMITS {
@@ -214,14 +268,12 @@ pub fn load_range(repo: &Repository, base: Oid) -> Result<Range, String> {
         // Reached the root without meeting the base.
         at = commit.parent_id(0).map_err(|_| not_ancestor())?;
     }
-
-    let Some(merge) = first_merge else {
+    if !has_merge {
         chain.reverse();
-        return Ok(Range { base, base_summary, head, commits: chain, blocker: None, suggested_base: None });
-    };
+        return Ok(range(chain, Vec::new(), HashMap::new(), None, None));
+    }
 
-    // Merges in the way: list everything `base..HEAD` contains so the user
-    // can see them, but the range will not be offered for rebasing.
+    // Merges: everything `base..HEAD` contains, parents before children.
     if !repo.graph_descendant_of(tip, base).map_err(err)? {
         return Err(not_ancestor());
     }
@@ -236,35 +288,69 @@ pub fn load_range(repo: &Repository, base: Oid) -> Result<Range, String> {
     if walk(Sort::NONE)?.take(MAX_COMMITS + 1).count() > MAX_COMMITS {
         return Err(too_many());
     }
-    let mut commits = Vec::new();
+    let mut all = Vec::new();
     for oid in walk(Sort::TOPOLOGICAL | Sort::REVERSE)? {
         let commit = repo.find_commit(oid.map_err(err)?).map_err(err)?;
-        commits.push(range_commit(&commit));
+        all.push(range_commit(&commit));
     }
+    let index: HashMap<Oid, usize> = all.iter().enumerate().map(|(i, c)| (c.oid, i)).collect();
 
-    let merges: Vec<&RangeCommit> = commits.iter().filter(|c| c.is_merge).collect();
-    let mut names: Vec<String> =
-        merges.iter().take(3).map(|c| format!("{} \"{}\"", short(c.oid), c.summary)).collect();
-    if merges.len() > names.len() {
-        names.push(format!("{} more", merges.len() - names.len()));
+    // The branch's own line: first parents from HEAD while in the range.
+    let mut line = Vec::new();
+    let mut next = Some(tip);
+    while let Some(i) = next.and_then(|oid| index.get(&oid).copied()) {
+        line.push(i);
+        next = all[i].parents.first().copied();
     }
-    let blocker = format!(
-        "This range contains {}: {}. An interactive rebase replays commits one by one in a \
-         straight line, which would dissolve the merge and re-apply both sides, so it is not \
-         offered here. Start from a commit above the newest merge instead.",
-        if merges.len() == 1 { "a merge commit".to_owned() } else { format!("{} merge commits", merges.len()) },
-        names.join(", "),
-    );
-    Ok(Range {
-        base,
-        base_summary,
-        head,
-        commits,
-        blocker: Some(blocker),
-        // Everything above the newest merge on the first-parent chain is a
-        // straight line, unless that merge is HEAD itself.
-        suggested_base: (merge != tip).then_some(merge),
-    })
+    if next != Some(base) {
+        // The base came in through a merge: what follows it is not one
+        // line the plan could list. Where the line leaves the range is the
+        // nearest base that works, since it comes before this one.
+        let blocker = format!(
+            "{} is not on the line of {name} itself (the first parents from its tip) but on a              branch merged into it, so the commits after it do not form one line to plan. Start              from a commit on {name}'s own line instead.",
+            short(base)
+        );
+        return Ok(range(all, Vec::new(), HashMap::new(), Some(blocker), next));
+    }
+    line.reverse();
+    Ok(split(all, &line, range))
+}
+
+/// Splits `all` (the range, parents first) into the line the plan lists
+/// (`line`, indexes into `all`, oldest first) and what its merges bring in.
+fn split(
+    all: Vec<RangeCommit>,
+    line: &[usize],
+    range: impl FnOnce(Vec<RangeCommit>, Vec<RangeCommit>, HashMap<usize, Side>, Option<String>, Option<Oid>) -> Range,
+) -> Range {
+    let on_line: HashMap<Oid, usize> = line.iter().enumerate().map(|(pos, i)| (all[*i].oid, pos)).collect();
+    let commits: Vec<RangeCommit> = line.iter().map(|i| all[*i].clone()).collect();
+    let merged: Vec<RangeCommit> = all.into_iter().filter(|c| !on_line.contains_key(&c.oid)).collect();
+    let in_merged: HashMap<Oid, usize> = merged.iter().enumerate().map(|(i, c)| (c.oid, i)).collect();
+
+    let mut sides = HashMap::new();
+    let mut claimed: HashSet<usize> = HashSet::new();
+    for (pos, commit) in commits.iter().enumerate().filter(|(_, c)| c.is_merge) {
+        let mut reach = HashSet::new();
+        let mut forks = HashSet::new();
+        let mut stack: Vec<Oid> = commit.parents[1..].to_vec();
+        while let Some(oid) = stack.pop() {
+            if let Some(&i) = in_merged.get(&oid) {
+                if reach.insert(i) {
+                    stack.extend(merged[i].parents.iter().copied());
+                }
+            } else if let Some(&p) = on_line.get(&oid) {
+                forks.insert(p);
+            }
+        }
+        let mut reach: Vec<usize> = reach.into_iter().collect();
+        reach.sort_unstable();
+        let mut forks: Vec<usize> = forks.into_iter().collect();
+        forks.sort_unstable();
+        let brings = reach.iter().filter(|i| claimed.insert(**i)).count();
+        sides.insert(pos, Side { reach, forks, brings });
+    }
+    range(commits, merged, sides, None, None)
 }
 
 /// What happens to one commit of the range.
@@ -379,6 +465,164 @@ pub struct Script {
     pub todo: String,
     /// `messages[n - 1]` is the content of `msg-n`.
     pub messages: Vec<String>,
+}
+
+/// Writes a [`Script`], keeping track of what the merges need.
+struct Todo<'a> {
+    range: &'a Range,
+    todo: String,
+    messages: Vec<String>,
+    /// Message number to apply once the current group is complete.
+    pending: Option<usize>,
+    /// Labels to set once the current group is complete.
+    deferred: Vec<String>,
+    /// A group (a kept commit and what is folded into it) is being written.
+    open: bool,
+    /// Rewritten commits that something later starts from or merges, by
+    /// the original commit.
+    labels: HashMap<Oid, String>,
+    /// Merged-in commits already replayed.
+    done: HashSet<Oid>,
+    /// Every commit of the range that has each commit as a parent, with
+    /// which parent it is.
+    children: HashMap<Oid, Vec<(Oid, usize)>>,
+    serial: usize,
+}
+
+impl<'a> Todo<'a> {
+    fn new(range: &'a Range) -> Self {
+        let mut children: HashMap<Oid, Vec<(Oid, usize)>> = HashMap::new();
+        if range.has_merges() {
+            for commit in range.commits.iter().chain(&range.merged) {
+                for (n, parent) in commit.parents.iter().enumerate() {
+                    children.entry(*parent).or_default().push((commit.oid, n));
+                }
+            }
+        }
+        Todo {
+            range,
+            todo: String::new(),
+            messages: Vec::new(),
+            pending: None,
+            deferred: Vec::new(),
+            open: false,
+            labels: HashMap::new(),
+            done: HashSet::new(),
+            children,
+            serial: 0,
+        }
+    }
+
+    fn line(&mut self, line: &str) {
+        let _ = writeln!(self.todo, "{line}");
+    }
+
+    /// Applies the message of the group just written and sets the labels
+    /// waiting for it.
+    fn close_group(&mut self) {
+        if let Some(n) = self.pending.take() {
+            let _ = writeln!(self.todo, "{}", amend_line(n));
+        }
+        for label in std::mem::take(&mut self.deferred) {
+            self.line(&format!("label {label}"));
+        }
+        self.open = false;
+    }
+
+    fn new_label(&mut self, kind: &str) -> String {
+        self.serial += 1;
+        format!("gitkrill-{kind}-{}", self.serial)
+    }
+
+    /// Labels what HEAD is once the current group is complete as the
+    /// rewritten `oid`.
+    fn label_line(&mut self, oid: Oid) {
+        let label = self.new_label("fork");
+        self.labels.insert(oid, label.clone());
+        if self.open {
+            self.deferred.push(label);
+        } else {
+            self.line(&format!("label {label}"));
+        }
+    }
+
+    /// How the todo list names the rewritten `oid`: its label, or the commit
+    /// itself when it is not rewritten (it is outside the range).
+    fn name(&self, oid: Oid) -> String {
+        self.labels.get(&oid).cloned().unwrap_or_else(|| oid.to_string())
+    }
+
+    /// Replays what the merge at `source` brings in that is not replayed
+    /// yet, then comes back to the line.
+    fn side_of(&mut self, source: usize) {
+        let range = self.range;
+        let Some(side) = range.sides.get(&source) else { return };
+        let todo: Vec<&RangeCommit> =
+            side.reach.iter().map(|i| &range.merged[*i]).filter(|c| !self.done.contains(&c.oid)).collect();
+        if todo.is_empty() {
+            return;
+        }
+        let back = self.new_label("line");
+        self.line(&format!("label {back}"));
+        let mut head: Option<Oid> = None;
+        for (k, commit) in todo.iter().enumerate() {
+            if let Some(&first) = commit.parents.first()
+                && head != Some(first)
+            {
+                let line = format!("reset {}", self.name(first));
+                self.line(&line);
+            }
+            if commit.is_merge {
+                self.merge(commit);
+            } else {
+                self.line(&format!("pick {}", commit.oid));
+            }
+            self.done.insert(commit.oid);
+            head = Some(commit.oid);
+            // Labelled when anything but the next commit, as its first
+            // parent, builds on it.
+            let next = todo.get(k + 1).map(|c| c.oid);
+            let needed = self.children.get(&commit.oid).is_some_and(|children| {
+                children.iter().any(|(child, n)| !(Some(*child) == next && *n == 0))
+            });
+            if needed {
+                let label = self.new_label("side");
+                self.line(&format!("label {label}"));
+                self.labels.insert(commit.oid, label);
+            }
+        }
+        self.line(&format!("reset {back}"));
+    }
+
+    /// Makes `commit` again as a merge of HEAD and its other parents, with
+    /// its own message.
+    fn merge(&mut self, commit: &RangeCommit) {
+        let mut line = format!("merge -C {}", commit.oid);
+        for parent in &commit.parents[1..] {
+            line.push(' ');
+            line.push_str(&self.name(*parent));
+        }
+        // Git shows the rest of the line when the merge stops on conflicts.
+        let summary: String = commit.summary.chars().filter(|c| !c.is_control()).collect();
+        if !summary.is_empty() {
+            line.push_str(" # ");
+            line.push_str(&summary);
+        }
+        self.line(&line);
+    }
+
+    fn finish(mut self) -> Script {
+        if let Some(n) = self.pending.take() {
+            let _ = writeln!(self.todo, "{}", amend_line(n));
+        }
+        // What dropped merges brought in is listed too (see `drop` above).
+        for commit in &self.range.merged {
+            if !self.done.contains(&commit.oid) {
+                let _ = writeln!(self.todo, "drop {}", commit.oid);
+            }
+        }
+        Script { todo: self.todo, messages: self.messages }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -524,6 +768,14 @@ impl Plan {
             Some(_) => {}
         }
 
+        for (pos, item) in self.items.iter().enumerate() {
+            if let Some(reason) = self.refusal(pos, item.action) {
+                let commit = self.commit(pos);
+                problems.push(format!("{} \"{}\": {reason}", short(commit.oid), commit.summary));
+            }
+        }
+        problems.extend(self.order_problems());
+
         for group in self.groups() {
             // Only a message the plan writes: a commit that already has an
             // empty one may keep it.
@@ -540,47 +792,114 @@ impl Plan {
         problems
     }
 
-    /// The todo list and message files that carry out the plan.
-    pub fn script(&self) -> Script {
-        let groups = self.groups();
-        let mut todo = String::new();
-        let mut messages = Vec::new();
+    /// Why the commit at `pos` cannot be given `action`, or `None` when it
+    /// can. Only merges refuse anything: git makes them again as merges, so
+    /// they cannot be folded into an older commit.
+    pub fn refusal(&self, pos: usize, action: Action) -> Option<&'static str> {
+        (self.commit(pos).is_merge && action.folds()).then_some(MERGE_FOLDS)
+    }
 
-        let mut next_group = 0;
-        // Message number to apply once the current group is complete.
-        let mut pending: Option<usize> = None;
+    /// Merges moved below a commit their other side branches off from.
+    fn order_problems(&self) -> Vec<String> {
+        let at: HashMap<usize, usize> = self.items.iter().enumerate().map(|(pos, item)| (item.source, pos)).collect();
+        let mut problems = Vec::new();
         for (pos, item) in self.items.iter().enumerate() {
-            let sha = self.commit(pos).oid;
-            match item.action {
-                Action::Pick | Action::Reword => {
-                    if let Some(n) = pending.take() {
-                        let _ = writeln!(todo, "{}", amend_line(n));
-                    }
-                    let group = &groups[next_group];
-                    next_group += 1;
-                    if let Some(message) = self.new_message(group) {
-                        messages.push(message);
-                        pending = Some(messages.len());
-                        let _ = writeln!(todo, "{MARK}");
-                    }
-                    let _ = writeln!(todo, "pick {sha}");
-                }
-                // The combined message is applied afterwards in one go, so
-                // squashes need no message handling of their own here.
-                Action::Squash | Action::Fixup => {
-                    let _ = writeln!(todo, "fixup {sha}");
-                }
-                // Listed rather than left out, so git's check for commits
-                // missing from the list (rebase.missingCommitsCheck) is happy.
-                Action::Drop => {
-                    let _ = writeln!(todo, "drop {sha}");
+            let Some(side) = self.range.sides.get(&item.source) else { continue };
+            if item.action == Action::Drop {
+                continue;
+            }
+            for fork in &side.forks {
+                if at.get(fork).is_some_and(|fork_pos| *fork_pos > pos) {
+                    let (merge, fork) = (self.commit(pos), &self.range.commits[*fork]);
+                    problems.push(format!(
+                        "{} \"{}\" merges commits that branch off from {} \"{}\", so it has to stay \
+                         above that commit.",
+                        short(merge.oid),
+                        merge.summary,
+                        short(fork.oid),
+                        fork.summary,
+                    ));
                 }
             }
         }
-        if let Some(n) = pending {
-            let _ = writeln!(todo, "{}", amend_line(n));
+        problems
+    }
+
+    /// How many kept merges the plan makes again, because something below
+    /// them changes: a merge that needed conflicts resolved stops for them
+    /// again. (Merges whose parents stay the same are kept as they are.)
+    pub fn remade_merges(&self) -> usize {
+        let changed = |pos: usize, item: &Item| {
+            item.source != pos
+                || match item.action {
+                    Action::Pick => false,
+                    Action::Reword => item.reword.as_ref().is_some_and(|text| {
+                        normalize(text) != normalize(&self.range.commits[item.source].message)
+                    }),
+                    _ => true,
+                }
+        };
+        let Some(first) = self.items.iter().enumerate().position(|(pos, item)| changed(pos, item)) else {
+            return 0;
+        };
+        self.items
+            .iter()
+            .skip(first + 1)
+            .filter(|item| item.action != Action::Drop && self.range.commits[item.source].is_merge)
+            .count()
+    }
+
+    /// The todo list and message files that carry out the plan.
+    pub fn script(&self) -> Script {
+        let groups = self.groups();
+        let mut out = Todo::new(&self.range);
+        // Commits of the line that kept merges branch off from: each gets a
+        // label once its group is complete, for the merged side to start
+        // from.
+        let forks: HashSet<usize> = self
+            .items
+            .iter()
+            .filter(|item| item.action != Action::Drop)
+            .filter_map(|item| self.range.sides.get(&item.source))
+            .flat_map(|side| side.forks.iter().copied())
+            .collect();
+
+        let mut next_group = 0;
+        for (pos, item) in self.items.iter().enumerate() {
+            let commit = self.commit(pos);
+            let sha = commit.oid;
+            match item.action {
+                Action::Pick | Action::Reword => {
+                    out.close_group();
+                    let group = &groups[next_group];
+                    next_group += 1;
+                    if commit.is_merge {
+                        out.side_of(item.source);
+                    }
+                    if let Some(message) = self.new_message(group) {
+                        out.messages.push(message);
+                        out.pending = Some(out.messages.len());
+                        out.line(MARK);
+                    }
+                    if commit.is_merge {
+                        out.merge(commit);
+                    } else {
+                        out.line(&format!("pick {sha}"));
+                    }
+                    out.open = true;
+                }
+                // The combined message is applied afterwards in one go, so
+                // squashes need no message handling of their own here.
+                Action::Squash | Action::Fixup => out.line(&format!("fixup {sha}")),
+                // Listed rather than left out, so git's check for commits
+                // missing from the list (rebase.missingCommitsCheck) is happy.
+                Action::Drop => out.line(&format!("drop {sha}")),
+            }
+            if forks.contains(&item.source) {
+                out.label_line(sha);
+            }
         }
-        Script { todo, messages }
+        out.finish()
     }
 
     /// Checks the plan against the repository as it is right now, writes the
@@ -632,11 +951,16 @@ impl Plan {
         // together on one line, or a paragraph about terminal commands,
         // rather than the conflict or the hook's complaint. The "Rebase in
         // progress" banner offers those commands as buttons.
-        let base = self.range.base.to_string();
-        let args =
-            ["-c", "advice.mergeConflict=false", "rebase", "-i", "--quiet", "--reschedule-failed-exec", &base]
+        let mut args: Vec<String> =
+            ["-c", "advice.mergeConflict=false", "rebase", "-i", "--quiet", "--reschedule-failed-exec"]
                 .map(str::to_owned)
                 .to_vec();
+        // The todo list makes the merges again either way; this tells git
+        // the rebase is one that keeps them.
+        if self.range.has_merges() {
+            args.push("--rebase-merges".to_owned());
+        }
+        args.push(self.range.base.to_string());
         let step = Step::new(args, None)
             .env("GIT_SEQUENCE_EDITOR", SEQUENCE_EDITOR)
             // Forward slashes: the value is read by git's POSIX shell tools.
@@ -651,6 +975,9 @@ impl Plan {
         Ok(cmd)
     }
 }
+
+const MERGE_FOLDS: &str = "a merge commit cannot be squashed or fixed up into another commit, because \
+                           the rebase makes it again as a merge. Keep, reword or drop it instead.";
 
 const DIRTY: &str = "There are uncommitted changes to tracked files. Commit or stash them before \
                      rebasing: the rebase rewrites the files in the working tree.";
@@ -706,6 +1033,7 @@ mod tests {
                 author: "A".to_owned(),
                 email: "a@example.com".to_owned(),
                 is_merge: false,
+                parents: vec![oid(i as u8)],
             })
             .collect();
         Arc::new(Range {
@@ -713,6 +1041,8 @@ mod tests {
             base_summary: "base".to_owned(),
             head: Head { branch: Some("main".to_owned()), oid: Some(oid(99)), detached: false },
             commits,
+            merged: Vec::new(),
+            sides: HashMap::new(),
             blocker: None,
             suggested_base: None,
         })
@@ -1166,6 +1496,15 @@ mod tests {
         assert_eq!(tree(&fx, "HEAD"), ["f.txt", "one.txt", "other.txt", "three.txt", "two.txt"]);
         assert!(done.snap.status.is_clean());
         assert_no_leftovers(&fx);
+
+        // Finished after three stops, it is still undone in one step.
+        let entry = done.undo.expect("the finished plan is undoable");
+        assert_eq!(entry.label, LABEL);
+        let undone = fx.run_as(entry.undo.clone(), Origin::Undo(entry));
+        undone.result.expect("undo works");
+        assert_eq!(undone.snap.head.oid, Some(tip));
+        assert_eq!(fx.read("f.txt"), "three\n");
+        assert_eq!(log(&fx, base), ["set three", "set two", "set one"]);
     }
 
     #[test]
@@ -1249,41 +1588,335 @@ mod tests {
         assert_no_leftovers(&fx);
     }
 
-    #[test]
-    fn merges_in_the_range_are_refused_with_a_way_out() {
-        let fx = Fixture::new("rebase-merge");
-        let base = repo_with(&fx, &["one"]);
+    /// base - one - main work - Merge side - after the merge, where "side
+    /// work" branched off from "one" and was merged. Returns the base.
+    fn with_merge(fx: &Fixture) -> Oid {
+        let base = repo_with(fx, &["one"]);
         git(&fx.dir, &["checkout", "-q", "-b", "side"]);
-        fx.write("side.txt", "side\n");
+        fx.write("side file.txt", "side\n");
         fx.commit_all("side work");
         git(&fx.dir, &["checkout", "-q", "main"]);
         fx.write("main.txt", "main\n");
         fx.commit_all("main work");
-        git(&fx.dir, &["merge", "-q", "--no-ff", "-m", "Merge side", "side"]);
-        let merge = fx.snapshot().head.oid.unwrap();
+        git(&fx.dir, &["merge", "-q", "--no-ff", "-m", "Merge side\n\nwith a body", "side"]);
         fx.write("after.txt", "after\n");
         fx.commit_all("after the merge");
+        base
+    }
+
+    fn rev(fx: &Fixture, name: &str) -> String {
+        git(&fx.dir, &["rev-parse", name])
+    }
+
+    /// Each commit from HEAD down to `base` as "subject <- parent + parent"
+    /// (by subject), sorted.
+    fn shape(fx: &Fixture, base: Oid) -> Vec<String> {
+        let out = git(&fx.dir, &["log", "--topo-order", "--format=%s|%p", &format!("{base}..HEAD")]);
+        let name = |sha: &str| {
+            if sha.is_empty() {
+                return String::new();
+            }
+            git(&fx.dir, &["log", "-1", "--format=%s", sha])
+        };
+        let mut lines: Vec<String> = out
+            .lines()
+            .map(|line| {
+                let (subject, parents) = line.split_once('|').unwrap();
+                let parents: Vec<String> = parents.split(' ').map(name).collect();
+                format!("{subject} <- {}", parents.join(" + "))
+            })
+            .collect();
+        lines.sort();
+        lines
+    }
+
+    fn sorted<const N: usize>(lines: [&str; N]) -> Vec<String> {
+        let mut lines: Vec<String> = lines.iter().map(|l| (*l).to_owned()).collect();
+        lines.sort();
+        lines
+    }
+
+    #[test]
+    fn a_merge_is_a_row_and_what_it_brought_in_is_kept_with_it() {
+        let fx = Fixture::new("rebase-merge-range");
+        let base = with_merge(&fx);
+        let plan = load(&fx, base);
+        let range = &plan.range;
+        assert!(range.blocker.is_none());
+        let line: Vec<&str> = range.commits.iter().map(|c| c.summary.as_str()).collect();
+        assert_eq!(line, ["add one", "main work", "Merge side", "after the merge"]);
+        assert!(range.commits[2].is_merge && range.has_merges());
+        let merged: Vec<&str> = range.merged.iter().map(|c| c.summary.as_str()).collect();
+        assert_eq!(merged, ["side work"]);
+        // "side work" branched off from "add one", so the merge must stay above it.
+        assert_eq!(range.sides[&2], Side { reach: vec![0], forks: vec![0], brings: 1 });
+        assert!(plan.problems().is_empty());
+        assert_eq!(plan.refusal(2, Action::Squash), Some(MERGE_FOLDS));
+        assert_eq!(plan.refusal(2, Action::Reword), None);
+        assert_eq!(plan.refusal(3, Action::Squash), None);
+    }
+
+    #[test]
+    fn rewording_above_a_merge_leaves_the_merge_alone() {
+        let fx = Fixture::new("rebase-merge-above");
+        let base = with_merge(&fx);
+        let merge = rev(&fx, "HEAD~1");
+        let mut plan = load(&fx, base);
+        plan.items[3].action = Action::Reword;
+        plan.items[3].reword = Some("after, reworded".to_owned());
+        assert_eq!(plan.remade_merges(), 0);
+        let cmd = prepare(&fx, &plan).unwrap();
+        assert!(cmd.steps[0].args.iter().any(|a| a == "--rebase-merges"));
+        fx.run(cmd);
+        // The merge and everything under it were not rewritten at all.
+        assert_eq!(rev(&fx, "HEAD~1"), merge);
+        assert_eq!(git(&fx.dir, &["log", "-1", "--format=%s"]), "after, reworded");
+        assert_no_leftovers(&fx);
+        assert!(git(&fx.dir, &["for-each-ref", "refs/rewritten"]).is_empty());
+    }
+
+    #[test]
+    fn rewording_below_a_merge_replays_its_side_and_merges_again() {
+        let fx = Fixture::new("rebase-merge-below");
+        let base = with_merge(&fx);
+        let tip = fx.snapshot().head.oid.unwrap();
+        let mut plan = load(&fx, base);
+        plan.items[0].action = Action::Reword;
+        plan.items[0].reword = Some("one, reworded".to_owned());
+        plan.items[2].action = Action::Reword;
+        plan.items[2].reword = Some("Merge side, reworded".to_owned());
+        assert_eq!(plan.remade_merges(), 1);
+        let done = fx.run(prepare(&fx, &plan).unwrap());
+        assert_eq!(
+            shape(&fx, base),
+            sorted([
+                "after the merge <- Merge side, reworded",
+                "Merge side, reworded <- main work + side work",
+                "side work <- one, reworded",
+                "main work <- one, reworded",
+                "one, reworded <- base",
+            ])
+        );
+        assert_eq!(tree(&fx, "HEAD"), ["after.txt", "base.txt", "main.txt", "one.txt", "side file.txt"]);
+        assert_no_leftovers(&fx);
+        assert!(git(&fx.dir, &["for-each-ref", "refs/rewritten"]).is_empty());
+        // The side branch itself still points at the old commits.
+        assert_eq!(git(&fx.dir, &["log", "-1", "--format=%s", "side~1"]), "add one");
+
+        let entry = done.undo.expect("undoable");
+        let undone = fx.run_as(entry.undo.clone(), Origin::Undo(entry));
+        undone.result.expect("undo works");
+        assert_eq!(undone.snap.head.oid, Some(tip));
+    }
+
+    #[test]
+    fn dropping_a_merge_drops_what_it_brought_in() {
+        let fx = Fixture::new("rebase-merge-drop");
+        let base = with_merge(&fx);
+        let mut plan = load(&fx, base);
+        plan.items[2].action = Action::Drop;
+        assert_eq!(plan.summary().text(), "3 commits kept, 1 dropped");
+        let script = plan.script();
+        let side = plan.range.merged[0].oid;
+        assert!(script.todo.ends_with(&format!("drop {side}\n")), "{}", script.todo);
+        fx.run(prepare(&fx, &plan).unwrap());
+        assert_eq!(shape(&fx, base), sorted(["after the merge <- main work", "main work <- add one", "add one <- base"]));
+        assert!(!fx.dir.join("side file.txt").exists());
+        assert_no_leftovers(&fx);
+    }
+
+    #[test]
+    fn commits_fold_into_a_merge_and_move_around_it() {
+        let fx = Fixture::new("rebase-merge-fold");
+        let base = with_merge(&fx);
+        let mut plan = load(&fx, base);
+        // "after the merge" folded into the merge; "main work" moved below "one".
+        plan.items[3].action = Action::Fixup;
+        plan.items.swap(0, 1);
+        assert!(plan.problems().is_empty(), "{:?}", plan.problems());
+        fx.run(prepare(&fx, &plan).unwrap());
+        assert_eq!(
+            shape(&fx, base),
+            sorted([
+                "Merge side <- add one + side work",
+                "side work <- add one",
+                "add one <- main work",
+                "main work <- base",
+            ])
+        );
+        assert_eq!(git(&fx.dir, &["log", "-1", "--format=%B"]), "Merge side\n\nwith a body");
+        assert_eq!(tree(&fx, "HEAD"), ["after.txt", "base.txt", "main.txt", "one.txt", "side file.txt"]);
+        assert_no_leftovers(&fx);
+    }
+
+    #[test]
+    fn squashing_where_a_merged_branch_began_moves_it_onto_the_result() {
+        let fx = Fixture::new("rebase-merge-squash-fork");
+        let base = with_merge(&fx);
+        // "main work" squashed into "add one", which "side work" started from.
+        let mut plan = load(&fx, base);
+        let run = [plan.range.commits[0].oid, plan.range.commits[1].oid];
+        assert_eq!(crate::git::multi::squash_plan(&mut plan, &run), Some(0));
+        plan.items[0].combined = Some("one and main".to_owned());
+        let script = plan.script();
+        // The label for the side to start from comes after the new message.
+        let amend = script.todo.find("--amend").unwrap();
+        let label = script.todo.find("label gitkrill-fork").unwrap();
+        assert!(label > amend, "{}", script.todo);
+        fx.run(prepare(&fx, &plan).unwrap());
+        assert_eq!(
+            shape(&fx, base),
+            sorted([
+                "after the merge <- Merge side",
+                "Merge side <- one and main + side work",
+                "side work <- one and main",
+                "one and main <- base",
+            ])
+        );
+        assert_no_leftovers(&fx);
+    }
+
+    #[test]
+    fn a_merge_cannot_go_below_where_its_side_began_or_fold_away() {
+        let fx = Fixture::new("rebase-merge-limits");
+        let base = with_merge(&fx);
+        let mut plan = load(&fx, base);
+        // Merge side below "add one", which side work branched off from.
+        let merge = plan.items.remove(2);
+        plan.items.insert(0, merge);
+        let problems = plan.problems();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("\"Merge side\" merges commits that branch off from"), "{problems:?}");
+        assert!(problems[0].contains("\"add one\""), "{problems:?}");
+        assert!(prepare(&fx, &plan).is_err());
+        // Dropped, it no longer needs that commit.
+        plan.items[0].action = Action::Drop;
+        assert!(plan.problems().is_empty());
+
+        let mut plan = load(&fx, base);
+        plan.items[2].action = Action::Squash;
+        assert!(plan.problems()[0].contains("cannot be squashed or fixed up"), "{:?}", plan.problems());
+    }
+
+    #[test]
+    fn a_merge_made_again_stops_on_its_conflicts_and_carries_on() {
+        let fx = Fixture::new("rebase-merge-conflict");
+        fx.write("f.txt", "base\n");
+        fx.commit_all("base");
+        let base = fx.snapshot().head.oid.unwrap();
+        git(&fx.dir, &["checkout", "-q", "-b", "side"]);
+        fx.write("f.txt", "side\n");
+        fx.commit_all("side work");
+        git(&fx.dir, &["checkout", "-q", "main"]);
+        fx.write("f.txt", "main\n");
+        fx.commit_all("main work");
+        let _ = std::process::Command::new("git").current_dir(&fx.dir).args(["merge", "-q", "side"]).output();
+        fx.write("f.txt", "resolved by hand\n");
+        git(&fx.dir, &["add", "f.txt"]);
+        git(&fx.dir, &["commit", "-q", "-m", "Merge side"]);
+        fx.write("g.txt", "g\n");
+        fx.commit_all("after");
         let tip = fx.snapshot().head.oid.unwrap();
 
-        let plan = load(&fx, base);
-        assert_eq!(plan.range.commits.len(), 5);
-        let blocker = plan.range.blocker.as_deref().expect("merges block the range");
-        assert!(blocker.contains("a merge commit") && blocker.contains("Merge side"), "{blocker}");
-        assert_eq!(plan.range.suggested_base, Some(merge));
+        let mut plan = load(&fx, base);
+        plan.items[0].action = Action::Reword;
+        plan.items[0].reword = Some("main work, reworded".to_owned());
+        let stopped = fx.run_as(prepare(&fx, &plan).unwrap(), Origin::User);
+        let message = stopped.result.expect_err("the merge conflicts again");
+        assert!(message.contains("CONFLICT"), "{message}");
+        assert_eq!(stopped.snap.state, RepoState::Rebase);
+
+        resolve(&fx, "resolved again\n");
+        let done = fx.run(ops::continue_op(RepoState::Rebase).unwrap());
+        assert_eq!(done.snap.state, RepoState::Clean);
+        assert_eq!(
+            shape(&fx, base),
+            sorted(["after <- Merge side", "Merge side <- main work, reworded + side work", "main work, reworded <- base", "side work <- base"])
+        );
+        assert_eq!(fx.read("f.txt"), "resolved again\n");
+        assert_no_leftovers(&fx);
+
+        let entry = done.undo.expect("undoable once finished");
+        let undone = fx.run_as(entry.undo.clone(), Origin::Undo(entry));
+        undone.result.expect("undo works");
+        assert_eq!(undone.snap.head.oid, Some(tip));
+        assert_eq!(fx.read("f.txt"), "resolved by hand\n");
+    }
+
+    #[test]
+    fn a_base_that_came_in_through_a_merge_is_refused_with_a_way_out() {
+        let fx = Fixture::new("rebase-merge-base");
+        with_merge(&fx);
+        let side = Oid::from_str(&rev(&fx, "side")).unwrap();
+        let one = Oid::from_str(&rev(&fx, "side~1")).unwrap();
+        let tip = fx.snapshot().head.oid.unwrap();
+
+        let plan = load(&fx, side);
+        let blocker = plan.range.blocker.as_deref().expect("not on the line");
+        assert!(blocker.contains("not on the line of main itself"), "{blocker}");
+        assert_eq!(plan.range.suggested_base, Some(one));
         assert_eq!(plan.problems(), [blocker.to_owned()]);
         assert_eq!(prepare(&fx, &plan).unwrap_err(), blocker);
         assert_eq!(fx.snapshot().head.oid, Some(tip));
-
-        // From the merge onwards the range is a straight line again.
-        let above = load(&fx, merge);
-        assert!(above.range.blocker.is_none());
-        assert_eq!(above.range.commits.len(), 1);
+        // From the suggestion, the merge is planned as usual.
+        assert!(load(&fx, one).range.blocker.is_none());
 
         // A commit that is not in HEAD's history at all.
         git(&fx.dir, &["checkout", "-q", "--orphan", "elsewhere"]);
         fx.commit_all("unrelated root");
-        let unrelated = fx.job(move |loader| load_range(loader.repo(), base)).unwrap_err();
+        let unrelated = fx.job(move |loader| load_range(loader.repo(), side)).unwrap_err();
         assert!(unrelated.contains("not part of the history of elsewhere"), "{unrelated}");
+    }
+
+    #[test]
+    fn merges_on_the_merged_side_and_merged_twice_are_replayed_too() {
+        // main:  base - a - M1(side at s1) - b - M2(side at s3)
+        // side:  base - s1 - M(main at a) - s3
+        let fx = Fixture::new("rebase-merge-twice");
+        fx.write("base.txt", "base\n");
+        fx.commit_all("base");
+        let base = fx.snapshot().head.oid.unwrap();
+        git(&fx.dir, &["checkout", "-q", "-b", "side"]);
+        fx.write("s1.txt", "s1\n");
+        fx.commit_all("s1");
+        git(&fx.dir, &["checkout", "-q", "main"]);
+        fx.write("a.txt", "a\n");
+        fx.commit_all("a");
+        git(&fx.dir, &["checkout", "-q", "side"]);
+        git(&fx.dir, &["merge", "-q", "--no-ff", "-m", "side takes main", "main"]);
+        fx.write("s3.txt", "s3\n");
+        fx.commit_all("s3");
+        git(&fx.dir, &["checkout", "-q", "main"]);
+        git(&fx.dir, &["merge", "-q", "--no-ff", "-m", "M1", "side~2"]);
+        fx.write("b.txt", "b\n");
+        fx.commit_all("b");
+        git(&fx.dir, &["merge", "-q", "--no-ff", "-m", "M2", "side"]);
+
+        let mut plan = load(&fx, base);
+        let line: Vec<&str> = plan.range.commits.iter().map(|c| c.summary.as_str()).collect();
+        assert_eq!(line, ["a", "M1", "b", "M2"]);
+        assert_eq!(plan.range.sides[&1].brings, 1);
+        assert_eq!(plan.range.sides[&3].brings, 2);
+        // "side takes main" merged "a": M2 has to stay above it as well.
+        assert_eq!(plan.range.sides[&3].forks, [0]);
+
+        plan.items[0].action = Action::Reword;
+        plan.items[0].reword = Some("A".to_owned());
+        fx.run(prepare(&fx, &plan).unwrap());
+        assert_eq!(
+            shape(&fx, base),
+            sorted([
+                "M2 <- b + s3",
+                "s3 <- side takes main",
+                "side takes main <- s1 + A",
+                "b <- M1",
+                "M1 <- A + s1",
+                "A <- base",
+                "s1 <- base",
+            ])
+        );
+        assert_eq!(tree(&fx, "HEAD"), ["a.txt", "b.txt", "base.txt", "s1.txt", "s3.txt"]);
+        assert_no_leftovers(&fx);
     }
 
     #[test]
