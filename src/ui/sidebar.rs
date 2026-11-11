@@ -190,13 +190,9 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
             }
         }
 
-        // ---- submodules ----
-        let total = snap.submodules.len();
-        if section(ui, tab, "SUBMODULES", icons::STACK, total, total) {
-            for sub in &snap.submodules {
-                leaf(ui, 0, false, icons::PACKAGE, &sub.name, theme::text(), "").on_hover_text(&sub.path);
-            }
-        }
+        // ---- submodules, worktrees ----
+        crate::ui::submodules::section(ui, tab, shared, &snap);
+        crate::ui::worktrees::section(ui, tab, shared, &snap);
 
         // Pull requests, issues and CI runs, when the remote is a known host.
         crate::ui::hosting::sections(ui, tab, shared, &snap);
@@ -517,7 +513,15 @@ fn local_row(
     depth: usize,
 ) -> Response {
     let mut trailing = String::new();
+    // Checked out in another worktree.
+    let elsewhere = crate::ui::worktrees::elsewhere(snap, &branch.name);
+    if elsewhere.is_some() {
+        trailing.push_str(icons::FOLDERS);
+    }
     if branch.ahead > 0 {
+        if !trailing.is_empty() {
+            trailing.push(' ');
+        }
         trailing.push_str(&format!("{}{}", branch.ahead, icons::ARROW_UP));
     }
     if branch.behind > 0 {
@@ -549,15 +553,19 @@ fn local_row(
     if eye {
         tab.set_hidden(&mut shared.settings, &hidden::local(&branch.name), !is_hidden);
     } else if response.double_clicked() && !branch.is_head {
-        tab.run(ops::checkout(&branch.name));
+        crate::ui::worktrees::checkout(tab, shared, snap, branch);
     } else if response.clicked()
         && let Some(oid) = branch.oid {
             tab.jump_to(oid);
         }
-    let response = match &branch.upstream {
-        Some(upstream) => response.on_hover_text(format!("{}  {}  {upstream}", branch.name, icons::ARROW_RIGHT)),
-        None => response.on_hover_text(format!("{} (no upstream)", branch.name)),
+    let mut tip = match &branch.upstream {
+        Some(upstream) => format!("{}  {}  {upstream}", branch.name, icons::ARROW_RIGHT),
+        None => format!("{} (no upstream)", branch.name),
     };
+    if let Some(wt) = elsewhere {
+        tip.push_str(&format!("\nChecked out in the worktree at {}", wt.display()));
+    }
+    let response = response.on_hover_text(tip);
     response.context_menu(|ui| local_branch_menu(ui, tab, shared, snap, branch));
     response
 }
@@ -575,8 +583,9 @@ pub fn local_branch_menu(
 
     if !branch.is_head {
         if menu_item(ui, icons::CHECK, &format!("Checkout {}", branch.name)) {
-            tab.run(ops::checkout(&branch.name));
+            crate::ui::worktrees::checkout(tab, shared, snap, branch);
         }
+        crate::ui::worktrees::branch_items(ui, tab, shared, snap, branch);
         if let Some(current) = &current {
             ui.separator();
             if menu_item(ui, icons::GIT_MERGE, &format!("Merge {} into {current}", branch.name)) {

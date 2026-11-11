@@ -71,6 +71,9 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Ask a hosting account something (who is signed in, its SSH keys) | `hosting::account::AccountSession::start(account, ctx)`, polled from the UI; `account::local_keys`, `parse_public_key` and `fingerprint` read `.pub` files. A host in `settings.hosting_disconnected` is never signed in to. |
 | Know who commits | `prefs::identity`: `settings.identity.current()` is the profile in use; `identity::generation()` changes whenever the identity git commands get may have changed (ask git again then, as `ui::prefs::profiles::commit_author` does). |
 | Show the text of a file (not git's own data) | Decode it in the background with `git::text::format_for(workdir)` (the repository's encoding and the tab width: `display_text_in`, `decode_file`), keep the `Format` with the result, and load again when `text::generation()` has moved on (`ui/diff.rs` does). |
+| Know a repository's submodules or worktrees | `snap.submodules` (`git::submodule::SubmoduleInfo`: the recorded and checked-out commits, `State`, `modified`) and `snap.worktrees` (`git::worktree::WorktreeInfo`, the main one first), read with every snapshot through libgit2 without starting git. `git::worktree::elsewhere(&snap.worktrees, branch)` is the other worktree a branch is checked out in. |
+| Check out a local branch | `ui::worktrees::checkout(tab, shared, snap, branch)`: says where the branch is instead when another worktree has it checked out. A checkout git refuses for that reason anyway (from the palette, the graph) is explained the same way from the error path of finished operations (`ui::worktrees::refused`). |
+| Know a file's Git LFS lock | `ui::lfs_locks::get(ctx, workdir, minutes)` (`Locks::on(path)`; kept per repository and filled in by a thread of its own, since asking is network work), `ui::lfs_locks::reload` to ask the server again. `git::lfs_lock` has the listing and the lock and unlock commands. |
 | Show a diff of one file | `tab.open_diff(target)` (or `tab.diff = Some(DiffView { target, data: None })` plus `handle.diff(target)`). The reader works it out in the mode set in Preferences > Editor (`git::diff::mode()`: whole file, ignore whitespace) and the answer says which (`FileDiff::mode`); the view asks again when they differ. From a job, `loader.diff_with(&target, git::diff::mode())`, and load again when `diff.mode` is no longer `git::diff::mode()` (`ui/history.rs` does); `loader.diff(&target)` is the plain diff of three lines of context, the one to build patches from. A whole-file diff has `Hunk::gap` hunks between the real ones (unchanged lines, no header, nothing to stage); a diff with whitespace ignored must not be applied (`ui::diff::can_apply_parts`). `ui::diff::read_only` paints one in the layout chosen (`ui::diff_split` for side by side). |
 | Compare a commit with the working tree, or show a file as it is in a commit | `DiffSource::WorkingTree { from }`: read-only like `Compare`, loaded again with every snapshot; its file list is `loader.working_tree_files(from)`. `DiffSource::At(commit)`: the whole file as one gap hunk (`loader.file_at`), painted by `ui::file_view` with one column of numbers. `is_committed()` is true for both, so nothing in them is staged; `reads_working_tree()` says the new side is read from disk. `loader.forked_files(other, tip)` gives the merge base and the files `tip` changed since (`other...tip`). |
 | Show a comparison in the right panel | `ui::multi::compare(tab, shared, a, b)` (tree to tree), `compare_forked(tab, shared, tip, other)` (what `tip` adds since their merge base), `compare_with_working_tree(tab, shared, oid)`. Each loads more history first when a commit is not in the graph yet. |
@@ -214,7 +217,17 @@ front, and the global and repository git configuration files.
   that only list (`git lfs track`, `git lfs ls-files`): it installs its
   hooks and writes `lfs.repositoryformatversion` to `.git/config`. Ask
   `git::lfs::status` whether a repository uses LFS (it looks without
-  git-lfs) before running anything else of it.
+  git-lfs) before running anything else of it (`git::lfs::in_use` is the
+  same answer alone).
+- **`git lfs locks`** reads a 404 from the server as "no locks", and lists
+  none for a remote that is a folder (with a hint on standard error), so
+  whether a server supports locking only shows when a file is locked.
+  `git::lfs_lock::list` turns the folder case into an error.
+- A diff of a submodule's path (`FileDiff::submodule`) is the commits it
+  moved between, not lines: it has no hunks to stage, and the diff view
+  paints it with `ui::submodules::diff_view`. git refuses to clone local
+  folders for submodules unless `protocol.file.allow` is `always`; tests
+  pass it through `GIT_CONFIG_COUNT` rather than a configuration file.
 
 ## Checking your work
 

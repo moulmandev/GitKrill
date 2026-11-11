@@ -27,6 +27,7 @@ pub fn show(ctx: &egui::Context, shared: &mut Shared, mut tab: Option<&mut RepoT
         Dialog::NewPull(_) => 520.0,
         Dialog::Update(_) | Dialog::GitSetup | Dialog::DeleteFolder(_) | Dialog::Remote(_) | Dialog::Ignore(_) => 460.0,
         Dialog::ApplyPatch(_) | Dialog::Clone(_) => 460.0,
+        Dialog::Submodule(_) | Dialog::Worktree(_) => 460.0,
         _ => 400.0,
     };
 
@@ -289,6 +290,15 @@ fn body(
         Dialog::Remote(form) => match crate::ui::remotes::dialog(ui, form, tab, fresh) {
             crate::ui::remotes::Next::Keep => Outcome::Keep,
             crate::ui::remotes::Next::Close => Outcome::Close,
+        },
+        Dialog::Submodule(form) => match crate::ui::submodules::dialog(ui, form, tab, fresh) {
+            crate::ui::submodules::Next::Keep => Outcome::Keep,
+            crate::ui::submodules::Next::Close => Outcome::Close,
+        },
+        Dialog::Worktree(form) => match crate::ui::worktrees::dialog(ui, form, tab, shared, fresh) {
+            crate::ui::worktrees::Next::Keep => Outcome::Keep,
+            crate::ui::worktrees::Next::Close => Outcome::Close,
+            crate::ui::worktrees::Next::Hold => Outcome::Hold,
         },
 
         Dialog::Update(release) => {

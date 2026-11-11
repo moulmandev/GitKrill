@@ -117,7 +117,7 @@ fn plan_with(
 
 /// Whether `git worktree remove` would refuse the worktree at `path` for
 /// modified or untracked files. When that cannot be told, it is assumed.
-fn has_changes(path: &Path) -> bool {
+pub fn has_changes(path: &Path) -> bool {
     let Ok(repo) = git2::Repository::open(path) else { return true };
     let mut options = git2::StatusOptions::new();
     options.include_untracked(true).include_ignored(false).recurse_untracked_dirs(false).exclude_submodules(false);

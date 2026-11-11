@@ -185,6 +185,30 @@ be installed.
 - Git LFS (Preferences > LFS): set it up in a repository, add and remove
   tracked patterns (or "Track *.psd with LFS" from a file's menu), fetch and
   pull LFS objects
+- Git LFS file locking: "Lock file" and "Unlock file" in a changed file's
+  right-click menu, and "Force unlock" (after a confirmation) for someone
+  else's lock. Locked files carry a lock in the file lists (blue when it is
+  yours) and say who holds it and since when; Preferences > LFS (or "Show
+  LFS locks" in the command palette) lists every lock with its unlock
+  button. Offered in repositories that use LFS; a server without locking
+  says so when a file is locked
+- Submodules (SUBMODULES in the sidebar): each one's state, not
+  initialized, at the recorded commit, checked out at another commit or
+  modified inside. Right-click one to initialize and update it (submodules
+  inside included), update it to the recorded commit, open it in a new tab,
+  sync its URL or remove it; add one (URL, path, optional branch) with the
+  section's + or the command palette. A submodule that moved shows in the
+  changed-file lists with a package icon and in the diff as "Moved from
+  abc1234 to def5678" with both commits' summaries and the commits in
+  between; staging it records the new commit
+- Worktrees (WORKTREES in the sidebar): every working tree of the
+  repository with its branch, locked or missing. Right-click one to open it
+  in a new tab or its folder, lock or unlock it, remove it (refused while it
+  has changes, with Force remove to delete them), or prune missing ones;
+  add one (a folder, a new or existing branch) with the + or the command
+  palette, and it opens in a new tab. Branches checked out in another
+  worktree carry a folder mark, and checking one out says where it is and
+  offers to open that worktree
 - Ignore a changed file from its right-click menu: the file itself, every
   file with its extension, or one of its folders (folder rows have "Ignore
   folder" too). The pattern can be edited before it goes in the root
@@ -435,8 +459,9 @@ pull requests) for the relevant actions. Double-click a branch to check it out.
 
 ## Network and privacy
 
-Four features talk to the network on their own. Each has a switch: updates
-in the **Help** menu, the others in the **View** menu.
+Five features talk to the network on their own. Each has a switch: updates
+in the **Help** menu, LFS locks with the automatic fetch, the others in the
+**View** menu.
 
 | Feature | What is sent | Where |
 | --- | --- | --- |
@@ -444,6 +469,7 @@ in the **Help** menu, the others in the **View** menu.
 | Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, and the requests you open, with a token when one is found for that host (below). Then, for the requests that changed since: their review states (one GraphQL request on GitHub, signed in only; each merge request's approvals on GitLab), the projects GitLab merge requests come from, and once whether the repository is a fork. While Preferences > Integrations shows an account: whose token it is, its SSH keys, and the public keys you add there | api.github.com, gitlab.com, api.bitbucket.org, codeberg.org, dev.azure.com (app.vssps.visualstudio.com for your Azure DevOps profile), and only the servers you connected |
 | Automatic fetch | `git fetch --prune --all` (without `--prune` when Auto-Prune is off), as you would run it | your remotes |
 | Updates | A request for the latest release shortly after start and every six hours; the download when there is a newer one | api.github.com, github.com and its download host |
+| LFS locks | In repositories that use LFS, `git lfs locks` when the file lists show and then at the automatic fetch interval; with automatic fetch off, only when Preferences > LFS opens or a file is locked or unlocked | your LFS server |
 
 The clone dialog's Options ask the address typed there for its branches
 (`git ls-remote`, never asking for a password) once you open them.
@@ -550,6 +576,9 @@ src/
     archive.rs   exporting a commit as zip or tar.gz
     clone.rs     clone options, listing a remote's branches
     tags.rs      pushing all tags, deleting tags on remotes
+    submodule.rs submodules: their state, moves in diffs, commands
+    worktree.rs  worktrees: listing them, add, lock, remove, prune
+    lfs_lock.rs  Git LFS file locks
     blame.rs     file history and blame
     versions.rs  a commit's file tree, files as they were in a commit
     picture.rs   decoding images for the image preview
@@ -571,6 +600,8 @@ src/
     reflog.rs    the reflog panel
     toolbar.rs   toolbar             dialogs.rs  modals and toasts
     gitflow.rs   Gitflow dialogs, menus and palette entries
+    submodules.rs, worktrees.rs  their sidebar sections, menus, dialogs
+    lfs_locks.rs LFS locks: file menus, lock icons, the list of locks
     multi/       several selected commits: selecting (pick.rs), their
                  panel, comparison, menu and palette entries
     merge.rs     merge options, the squash merge banner
@@ -618,8 +649,7 @@ build.rs         the Windows executable's icon and version details
   JavaScript, and Kotlin, Swift, Dart and PowerShell stay plain
 - X.509 (gpgsm) signing keys with a passphrase still need gpg-agent's own
   pinentry: GitKrill asks only for OpenPGP and SSH keys
-- Submodule management, worktrees, Git LFS file locking; SVG changes show
-  as text
+- SVG changes show as text
 - Autosquash only folds fixups whose commit comes after the last merge
   commit on the branch
 - On macOS, system notifications are shown through `osascript`, so

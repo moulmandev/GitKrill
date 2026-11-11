@@ -22,6 +22,7 @@ pub mod graph;
 pub mod highlight;
 pub mod history;
 pub mod image_diff;
+pub mod lfs_locks;
 pub mod merge;
 pub mod multi;
 pub mod hosting;
@@ -38,6 +39,7 @@ pub mod remotes;
 pub mod sidebar;
 pub mod solo;
 pub mod stash;
+pub mod submodules;
 pub mod tags;
 pub mod textsel;
 pub mod toolbar;
@@ -45,6 +47,7 @@ pub mod update;
 pub mod versions;
 pub mod widgets;
 pub mod workspace;
+pub mod worktrees;
 
 use eframe::egui::Ui;
 

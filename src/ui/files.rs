@@ -100,6 +100,7 @@ pub fn file_list(
     let mut version_act: Option<crate::ui::versions::Act> = None;
     let unborn = tab.snap.as_ref().is_some_and(|s| s.head.oid.is_none());
     let workdir = tab.path.clone();
+    let locks = crate::ui::lfs_locks::for_lists(ui.ctx(), tab, shared.settings.auto_fetch_minutes);
 
     ui.spacing_mut().item_spacing.y = 0.0;
     ScrollArea::vertical()
@@ -160,7 +161,8 @@ pub fn file_list(
                         widgets::row_background(&painter, rect, selected, response.hovered());
 
                         let x = rect.left() + 10.0 + *depth as f32 * INDENT + if *flat { 0.0 } else { 14.0 };
-                        let (icon, color) = kind_icon(file.kind);
+                        let (icon, color) = crate::ui::submodules::row_icon(tab.snap.as_deref(), file)
+                            .unwrap_or_else(|| kind_icon(file.kind));
                         painter.text(pos2(x, y), Align2::LEFT_CENTER, icon, theme::font(14.0), color);
 
                         // The action button appears on hover, so reserve its room then.
@@ -189,6 +191,7 @@ pub fn file_list(
                             }
                             text_right = button.left() - 8.0;
                         }
+                        text_right = crate::ui::lfs_locks::paint_mark(&painter, rect, text_right, locks.as_ref(), &file.path);
 
                         let text_x = x + 22.0;
                         let (dir, name) = match file.path.rfind('/') {
@@ -206,10 +209,18 @@ pub fn file_list(
                                 open = Some(DiffTarget::new(source, file));
                             }
                         }
-                        let hover_text = match &file.old_path {
+                        let mut hover_text = match &file.old_path {
                             Some(old) => format!("{old}  {}  {}", icons::ARROW_RIGHT, file.path),
                             None => format!("{} ({})", file.path, widgets::kind_name(file.kind)),
                         };
+                        let notes = [
+                            crate::ui::submodules::row_note(tab.snap.as_deref(), &file.path),
+                            crate::ui::lfs_locks::row_note(locks.as_ref(), &file.path),
+                        ];
+                        for note in notes.into_iter().flatten() {
+                            hover_text.push('\n');
+                            hover_text.push_str(&note);
+                        }
                         response.on_hover_text(hover_text).context_menu(|ui| {
                             ui.set_min_width(190.0);
                             let one = std::slice::from_ref(&file.path);
@@ -228,7 +239,14 @@ pub fn file_list(
                                     {
                                         run = external::merge(&shared.settings.tools, &file.path);
                                     }
+                                    let submodule = crate::ui::submodules::is_submodule(tab.snap.as_deref(), &file.path);
+                                    if submodule
+                                        && let Some(cmd) = crate::ui::submodules::file_items(ui, tab, shared, &file.path)
+                                    {
+                                        run = Some(cmd);
+                                    }
                                     if file.kind != ChangeKind::Conflicted
+                                        && !submodule
                                         && menu_item(ui, icons::TRASH, "Discard changes")
                                     {
                                         let what = if file.kind == ChangeKind::Untracked {
@@ -318,6 +336,11 @@ pub fn file_list(
                                 if menu_item(ui, icons::FILE_ARCHIVE, &format!("Track {pattern} with LFS")) {
                                     run = Some(crate::git::lfs::track(&pattern));
                                 }
+                            }
+                            if file.kind != ChangeKind::Deleted
+                                && let Some(cmd) = crate::ui::lfs_locks::file_items(ui, tab, shared, file)
+                            {
+                                run = Some(cmd);
                             }
                             if !source.is_committed() && file.kind != ChangeKind::Conflicted {
                                 ui.separator();

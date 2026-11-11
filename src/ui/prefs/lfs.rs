@@ -30,6 +30,8 @@ pub struct State {
     pattern: String,
     /// A command the page started (label, when), to look again once it ends.
     running: Vec<(String, Instant)>,
+    /// The server was asked for the locks since the page opened.
+    locks_asked: bool,
 }
 
 impl State {
@@ -170,6 +172,9 @@ pub fn show(ui: &mut Ui, page: &mut Page<'_>, state: &mut State) {
                 Some(Err(e)) => form::error(ui, e.trim()),
             }
         });
+
+        let first = !std::mem::replace(&mut state.locks_asked, true);
+        crate::ui::lfs_locks::prefs_row(ui, tab, page.shared, first);
 
         form::row(ui, "LFS objects", |ui| {
             ui.horizontal(|ui| {
