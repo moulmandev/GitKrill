@@ -6,10 +6,14 @@
 //! (`Loader::utf16_diff`). Such a diff is of UTF-8 lines, which `git apply`
 //! cannot apply to the file's own bytes. Its hunks and lines are applied
 //! here instead: the selected changes are made to the decoded text of the
-//! side being changed, which is encoded back the way that file was (UTF-16
-//! LE or BE, its byte order mark, its line endings, all kept) and written
-//! to the index (`git hash-object -w`, `git update-index`) or the working
-//! tree. Each refuses when the file is no longer what the diff was made
+//! side being changed, which is encoded back the way that version was
+//! (UTF-16 LE or BE, UTF-8, or the repository's encoding; its byte order
+//! mark and its line endings kept) and written to the index (`git
+//! hash-object -w`, `git update-index`) or the working tree. The two
+//! versions need not be in the same encoding: a file turned from UTF-8 into
+//! UTF-16 and staged in part stays UTF-8 in the index, with the selected
+//! lines changed, until every change is staged and the index has the new
+//! bytes. Each refuses when the file is no longer what the diff was made
 //! from. As for every other file, these have no undo.
 //!
 //! `git blame` reads a UTF-16 file as bytes and cuts it into "lines" at
@@ -68,12 +72,12 @@ pub struct Sides {
 
 impl Sides {
     /// Both versions as read (`old_bytes` / `new_bytes` with their text in
-    /// `old` / `new`). `None` when parts of the diff could not be written
-    /// back faithfully: a side whose text does not encode back to its bytes
-    /// (broken UTF-16), or two non-empty sides read in different encodings.
+    /// `old` / `new`), each in its own encoding. `None` when parts of the
+    /// diff could not be written back faithfully: a side whose text does not
+    /// encode back to its bytes (broken UTF-16, bytes that are not valid in
+    /// the repository's encoding).
     pub fn new(path: &str, old: Side, old_bytes: &[u8], new: Side, new_bytes: &[u8]) -> Option<Self> {
-        let same = old.empty || new.empty || old.encoding == new.encoding;
-        (same && old.round_trips(old_bytes) && new.round_trips(new_bytes)).then(|| Sides { path: path.to_owned(), old, new })
+        (old.round_trips(old_bytes) && new.round_trips(new_bytes)).then(|| Sides { path: path.to_owned(), old, new })
     }
 
     /// The header of the UTF-8 patches built from the diff (`hunk_patch`,
@@ -100,12 +104,23 @@ impl Sides {
         if removes && text.is_empty() {
             return Ok(None);
         }
-        // Everything applied: the file becomes the other side, byte for byte.
+        // Everything applied: the file becomes the other side, byte for byte,
+        // in that side's encoding.
         if text == other.text && other.blob.is_some() {
             return Ok(Some(if other.empty { Vec::new() } else { other.encoding.encode(&other.text) }));
         }
+        // In part: the side being changed keeps its encoding, unless it had
+        // no bytes to tell.
         let encoding = if base.empty { other.encoding } else { base.encoding };
-        Ok(Some(encoding.encode(&text)))
+        let bytes = encoding.encode(&text);
+        if !holds_every_character(encoding, &text, &bytes) {
+            let name = self.path.rsplit('/').next().unwrap_or(&self.path);
+            return Err(format!(
+                "Some characters of the selected lines cannot be written in {}, the encoding of {name}. Stage, unstage or discard the whole file instead.",
+                encoding.encoding.label()
+            ));
+        }
+        Ok(Some(bytes))
     }
 
     /// The command that applies `patch` the way `git apply [--cached]
@@ -142,6 +157,17 @@ impl FileDiff {
 fn changed_since(path: &str) -> String {
     let name = path.rsplit('/').next().unwrap_or(path);
     format!("{name} has changed since the diff was shown. Look at it again and select the lines anew.")
+}
+
+/// Whether `bytes`, `text` written in `encoding`, read back as `text`. UTF-8
+/// and UTF-16 hold every character; the repository's encoding may not (a
+/// line taken from the UTF-16 version of a file into its Windows-1252 one
+/// would have its Chinese turned into question marks).
+fn holds_every_character(encoding: FileEncoding, text: &str, bytes: &[u8]) -> bool {
+    use super::text::Encoding;
+    matches!(encoding.encoding, Encoding::Utf8 | Encoding::Utf8Bom)
+        || encoding.encoding.is_utf16()
+        || super::text::decode_as(bytes, encoding) == text
 }
 
 /// Puts `content` in the index as `path` (or takes `path` out, for `None`),
@@ -489,6 +515,90 @@ mod repo_tests {
     }
 
     #[test]
+    fn a_file_turned_from_utf8_into_utf16_is_staged_unstaged_and_discarded_in_part() {
+        const UTF8: FileEncoding = FileEncoding { encoding: Encoding::Utf8, bom: false };
+        let fx = Fixture::new("utf16-from-utf8");
+        let path = "notes.txt";
+        let index = |fx: &Fixture| blob(fx, &format!(":{path}"));
+        put(&fx, path, UTF8, &numbered(|_| None));
+        fx.commit_all("notes");
+        let change = |two: bool, twelve: bool| {
+            numbered(|n| match n {
+                2 if two => Some("deux 中文".to_owned()),
+                12 if twelve => Some("twelve, changed".to_owned()),
+                _ => None,
+            })
+        };
+        // Saved again as UTF-16 LE with a byte order mark, two lines changed.
+        put(&fx, path, LE_BOM, &change(true, true));
+        let diff = fx.diff(Unstaged, path);
+        assert!(diff.transcoded.is_some() && !diff.file_header.is_empty(), "the parts of the diff can be applied");
+        assert_eq!(diff.hunks.len(), 2, "only the two changed lines differ");
+
+        // One hunk into the index: it stays UTF-8, CRLF and all.
+        fx.run(diff.apply_part("Stage hunk", diff.hunk_patch(0).unwrap(), true, false));
+        assert_eq!(index(&fx), change(true, false).as_bytes());
+        assert_eq!(on_disk(&fx, path), LE_BOM.encode(&change(true, true)), "the working tree is left alone");
+        // The other one too: every change is staged, and the index has the
+        // UTF-16 file byte for byte.
+        let diff = fx.diff(Unstaged, path);
+        assert_eq!(diff.hunks.len(), 1);
+        fx.run(diff.apply_part("Stage hunk", diff.hunk_patch(0).unwrap(), true, false));
+        assert_eq!(index(&fx), LE_BOM.encode(&change(true, true)));
+
+        // Unstaging lines of HEAD's UTF-8 against the index's UTF-16: the
+        // index stays UTF-16.
+        let staged = fx.diff(Staged, path);
+        assert!(staged.transcoded.is_some());
+        let patch = staged.lines_patch(&pick(&staged, &[('-', "café 2"), ('+', "deux 中文")]), Reverse).unwrap();
+        fx.run(staged.apply_part("Unstage lines", patch, true, true));
+        assert_eq!(index(&fx), LE_BOM.encode(&change(false, true)));
+        // All of it: HEAD's UTF-8 again.
+        let staged = fx.diff(Staged, path);
+        fx.run(staged.apply_part("Unstage hunk", staged.hunk_patch(0).unwrap(), true, true));
+        assert_eq!(index(&fx), blob(&fx, &format!("HEAD:{path}")));
+
+        // Discarding lines of the UTF-16 working tree file keeps it UTF-16.
+        let diff = fx.diff(Unstaged, path);
+        let patch = diff.lines_patch(&pick(&diff, &[('-', "café 12"), ('+', "twelve, changed")]), Reverse).unwrap();
+        fx.run(diff.apply_part("Discard lines", patch, false, true));
+        assert_eq!(on_disk(&fx, path), LE_BOM.encode(&change(true, false)));
+        // Discarding the rest puts back the index's UTF-8 file.
+        let diff = fx.diff(Unstaged, path);
+        fx.run(diff.apply_part("Discard hunk", diff.hunk_patch(0).unwrap(), false, true));
+        assert_eq!(on_disk(&fx, path), index(&fx));
+    }
+
+    #[test]
+    fn a_file_turned_from_utf16_into_utf8_is_staged_and_discarded_in_part() {
+        const UTF8_BOM: FileEncoding = FileEncoding { encoding: Encoding::Utf8Bom, bom: true };
+        let fx = Fixture::new("utf16-to-utf8");
+        put(&fx, "list.txt", BE, "alpha\nbeta\ngamma\ndelta\n");
+        fx.commit_all("list");
+        // Saved again as UTF-8 with a byte order mark.
+        put(&fx, "list.txt", UTF8_BOM, "alpha\nBETA ü\ngamma\nDELTA\nepsilon\n");
+
+        let diff = fx.diff(Unstaged, "list.txt");
+        assert!(diff.transcoded.is_some());
+        let patch = diff.lines_patch(&pick(&diff, &[('+', "epsilon")]), Forward).unwrap();
+        fx.run(diff.apply_part("Stage lines", patch, true, false));
+        let staged = "alpha\nbeta\ngamma\ndelta\nepsilon\n";
+        assert_eq!(blob(&fx, ":list.txt"), BE.encode(staged), "still UTF-16 BE, no mark");
+
+        // The working tree file stays UTF-8 with its mark.
+        let diff = fx.diff(Unstaged, "list.txt");
+        let patch = diff.lines_patch(&pick(&diff, &[('-', "beta"), ('+', "BETA ü")]), Reverse).unwrap();
+        fx.run(diff.apply_part("Discard lines", patch, false, true));
+        assert_eq!(on_disk(&fx, "list.txt"), UTF8_BOM.encode("alpha\nbeta\ngamma\nDELTA\nepsilon\n"));
+        // Discarding the last change makes it the index's file again, UTF-16
+        // and all, as discarding every change does.
+        let diff = fx.diff(Unstaged, "list.txt");
+        fx.run(diff.apply_part("Discard hunk", diff.hunk_patch(0).unwrap(), false, true));
+        assert_eq!(on_disk(&fx, "list.txt"), BE.encode(staged));
+        assert_eq!(git(&fx.dir, &["status", "--porcelain", "--", "list.txt"]), "M  list.txt");
+    }
+
+    #[test]
     fn utf16_without_a_byte_order_mark_is_read_and_written_as_it_is() {
         let fx = Fixture::new("utf16-be");
         put(&fx, "list.txt", BE, "alpha\nbeta\ngamma\n");
@@ -508,6 +618,23 @@ mod repo_tests {
         let diff = fx.diff(Commit(head), "list.txt");
         let changed: Vec<_> = diff.hunks.iter().flat_map(|h| &h.lines).filter(|l| l.origin != ' ').map(|l| (l.origin, l.text.as_str())).collect();
         assert_eq!(changed, [('+', "delta")]);
+    }
+
+    #[test]
+    fn utf16_with_no_latin_text_and_no_byte_order_mark_is_found_without_the_setting() {
+        const LE: FileEncoding = FileEncoding { encoding: Encoding::Utf16Le, bom: false };
+        let fx = Fixture::new("utf16-chinese");
+        let lines = |third: &str| format!("第一行文字\r\n第二行文字\r\n{third}\r\n第四行文字\r\n");
+        put(&fx, "说明.txt", LE, &lines("第三行文字"));
+        fx.commit_all("notes");
+        put(&fx, "说明.txt", LE, &lines("第三行，已修改"));
+
+        let diff = fx.diff(Unstaged, "说明.txt");
+        assert!(!diff.binary && diff.transcoded.is_some());
+        let changed: Vec<_> = diff.hunks.iter().flat_map(|h| &h.lines).filter(|l| l.origin != ' ').map(|l| (l.origin, l.text.as_str())).collect();
+        assert_eq!(changed, [('-', "第三行文字"), ('+', "第三行，已修改")]);
+        fx.run(diff.apply_part("Stage hunk", diff.hunk_patch(0).unwrap(), true, false));
+        assert_eq!(blob(&fx, ":说明.txt"), LE.encode(&lines("第三行，已修改")));
     }
 
     #[test]
@@ -619,15 +746,47 @@ mod tests {
         let (old, old_bytes) = side("a\n", le);
         let (new, new_bytes) = side("b\n", le);
         assert!(Sides::new("f", old, &old_bytes, new, &new_bytes).is_some());
-        // Read in two different ways: what would one write?
+        // Read in two different ways: each is written back in its own.
         let (old, old_bytes) = side("a\n", le);
         let (new, new_bytes) = side("b\n", be);
-        assert!(Sides::new("f", old, &old_bytes, new, &new_bytes).is_none());
+        assert!(Sides::new("f", old, &old_bytes, new, &new_bytes).is_some());
         // Half a character at the end does not survive decoding.
         let (old, _) = side("a\n", le);
         let broken = [&le.encode("a\n")[..], b"x"].concat();
         let new = Side::new(Some(&broken), le.encoding.decode(&broken[2..]).into_owned(), le);
         assert!(Sides::new("f", old, &[], new, &broken).is_none());
+        // Nor do bytes that are not valid in the encoding they were read in.
+        let utf8 = FileEncoding { encoding: Encoding::Utf8, bom: false };
+        let latin = b"caf\xE9\n";
+        let old = Side::new(Some(latin), utf8.encoding.decode(latin).into_owned(), utf8);
+        let (new, new_bytes) = side("café\n", le);
+        assert!(Sides::new("f", old, latin, new, &new_bytes).is_none());
+    }
+
+    #[test]
+    fn each_side_is_written_in_its_own_encoding() {
+        let le = FileEncoding { encoding: Encoding::Utf16Le, bom: true };
+        let cp1252 = FileEncoding { encoding: Encoding::Windows1252, bom: false };
+        let (old, old_bytes) = side("a\r\nb\r\n", cp1252);
+        let (new, new_bytes) = side("a\r\nb é\r\nc 中\r\n", le);
+        let sides = Sides::new("dir/f.txt", old, &old_bytes, new, &new_bytes).unwrap();
+        let header = "diff --git a/f b/f\n--- a/f\n+++ b/f\n";
+        let patch = |body: &str| format!("{header}{body}").into_bytes();
+
+        // Staging one line into the Windows-1252 index: still Windows-1252.
+        let changed = patch("@@ -1,2 +1,2 @@\n a\r\n-b\r\n+b é\r\n");
+        assert_eq!(sides.result(&changed, false).unwrap().unwrap(), b"a\r\nb \xE9\r\n");
+        // A character it has no way to write is refused, not turned into "?".
+        let chinese = patch("@@ -2,0 +3 @@\n+c 中\r\n");
+        let refused = sides.result(&chinese, false).unwrap_err();
+        assert!(refused.contains("Windows-1252") && refused.contains("f.txt"), "{refused}");
+        // Discarding a line of the UTF-16 version keeps it UTF-16, mark and all.
+        let back = patch("@@ -2,0 +3 @@\n+c 中\r\n");
+        assert_eq!(sides.result(&back, true).unwrap().unwrap(), le.encode("a\r\nb é\r\n"));
+        // Every change at once: the other version, byte for byte.
+        let all = patch("@@ -1,2 +1,3 @@\n a\r\n-b\r\n+b é\r\n+c 中\r\n");
+        assert_eq!(sides.result(&all, false).unwrap().unwrap(), new_bytes);
+        assert_eq!(sides.result(&all, true).unwrap().unwrap(), old_bytes);
     }
 
     fn pieces(bytes: &[u8]) -> Vec<&[u8]> {

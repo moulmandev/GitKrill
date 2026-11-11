@@ -324,8 +324,10 @@ impl Loader {
     /// UTF-16 is binary to git: it is full of zero bytes. When a version of
     /// the file is UTF-16 (`text::utf16_encoding`: a byte order mark, the
     /// repository set to UTF-16, or text that plainly is), both are turned
-    /// into UTF-8 and diffed as text. Its hunks and lines are applied by
-    /// GitKrill itself, in the file's encoding (`FileDiff::transcoded`).
+    /// into UTF-8 and diffed as text; the other version, if it is not UTF-16,
+    /// is read in the repository's encoding (or as its byte order mark
+    /// says). Its hunks and lines are applied by GitKrill itself, each
+    /// version written in its own encoding (`FileDiff::transcoded`).
     fn utf16_diff(
         &self,
         target: &DiffTarget,

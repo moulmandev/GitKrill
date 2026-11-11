@@ -155,11 +155,11 @@ impl Loader {
         let bytes = blob.content();
         let content: Cow<'_, [u8]> = if blob.is_binary() {
             // UTF-16 is binary to git; it reads as text once decoded.
-            if !text::detect(bytes, format.encoding).encoding.is_utf16() {
+            let Some(found) = text::utf16_encoding(bytes, format.encoding) else {
                 out.binary = true;
                 return Ok(out);
-            }
-            let (decoded, _) = text::decode_file(bytes, format.encoding);
+            };
+            let decoded = text::decode_as(bytes, found);
             if decoded.contains('\0') {
                 out.binary = true;
                 return Ok(out);
@@ -362,6 +362,9 @@ mod tests {
         let mut utf16 = vec![0xFF, 0xFE];
         utf16.extend("hé\r\nho\r\n".encode_utf16().flat_map(u16::to_le_bytes));
         std::fs::write(fx.dir.join("wide.txt"), utf16).unwrap();
+        // UTF-16 BE without a mark, and with no Latin letters.
+        let unmarked: Vec<u8> = "第一行\n第二行\n".encode_utf16().flat_map(u16::to_be_bytes).collect();
+        std::fs::write(fx.dir.join("unmarked.txt"), unmarked).unwrap();
         fx.write("sub/dir.txt", "x\n");
         fx.commit_all("kinds");
         let oid = head(&fx);
@@ -375,6 +378,9 @@ mod tests {
         let wide = at("wide.txt").unwrap();
         let texts: Vec<&str> = wide.hunks[0].lines.iter().map(|l| l.text.as_str()).collect();
         assert_eq!(texts, ["hé", "ho"]);
+        let unmarked = at("unmarked.txt").unwrap();
+        let texts: Vec<&str> = unmarked.hunks[0].lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, ["第一行", "第二行"]);
         assert!(at("gone.txt").unwrap_err().contains("not in commit"));
         assert!(at("sub").unwrap_err().contains("folder"));
     }

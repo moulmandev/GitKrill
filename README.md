@@ -250,10 +250,13 @@ be installed.
   text; a resolved file is written back in its own encoding, with the line
   endings set in Preferences > Editor
 - UTF-16 files, LE or BE, with a byte order mark or without one (when the
-  repository is set to UTF-16, or the file plainly is), are diffed and
-  blamed as text, and their hunks and lines staged, unstaged and discarded
-  like any other file's: GitKrill writes the result in the file's own
-  encoding, byte order mark and line endings kept
+  repository is set to UTF-16, or the file plainly is, in a Latin script or
+  any other), are diffed and blamed as text, and their hunks and lines
+  staged, unstaged and discarded like any other file's: GitKrill writes the
+  result in the file's own encoding, byte order mark and line endings kept.
+  So does a file turned from UTF-8 (or the repository's encoding) into
+  UTF-16, or back: each version keeps its own encoding while changes are
+  staged or discarded in part, and takes the other's once all of them are
 
 **History**
 - Checkout (branch, remote branch, commit, tag), create / rename / delete branch
@@ -660,10 +663,9 @@ build.rs         the Windows executable's icon and version details
   a merge brought in are replayed as they are, not edited one by one, a
   merge cannot be squashed into another commit, and a base on a merged-in
   branch is refused (with the nearest base that works offered instead)
-- Hunks and lines of a file whose two versions are in different encodings
-  (UTF-16 in one, UTF-8 in the other) can only be staged as a whole file;
-  UTF-16 without a byte order mark and with no Latin text in it is only
-  read as such when the repository is set to UTF-16
+- UTF-16 without a byte order mark and with no Latin text in it is only
+  told from other data when its first 4 KiB have a line break or a space
+  (or the repository is set to UTF-16)
 - In files over 1 MB or 20,000 lines, syntax colours start afresh at every
   hunk: a block comment or string that runs across the start of a hunk is
   coloured as if it did not

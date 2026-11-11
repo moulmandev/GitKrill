@@ -309,36 +309,126 @@ pub fn utf16_encoding(bytes: &[u8], default: Encoding) -> Option<FileEncoding> {
 }
 
 /// UTF-16 without a byte order mark, told from other data by its zero
-/// bytes: text in a Latin script has one in every other place (the high
-/// byte of each character), in the same place throughout. In the first
-/// 4 KiB, at least three code units in ten must be such a character, none
-/// may be zero, and the whole must read as text: no stray surrogates, no
-/// control characters but tabs, line ends and form feeds. Binary files fail
-/// that within a few bytes.
+/// bytes, judged on the first 4 KiB:
+///
+/// - Text in a Latin script has one in every other place (the high byte of
+///   each character), in the same place throughout: at least three code
+///   units in ten must be such a character, and one of them something other
+///   than whitespace.
+/// - Text in other scripts (Chinese, Japanese, Russian, Arabic...) has its
+///   zero bytes in its line breaks, spaces and tabs, which are 16-bit code
+///   units like every character: the byte order is the one in which such
+///   units are found, at least one, and more than the other way round. UTF-8
+///   and the legacy encodings (Shift_JIS, GBK, Windows-1251...) never have a
+///   zero byte in text, so they never get this far. At least two characters
+///   must then be letters beyond ASCII, and nine in ten of those beyond ASCII
+///   letters, digits, marks, spaces or common punctuation and symbols, not
+///   private use or something else text seldom has.
+///
+/// Either way the whole must read as text: no stray surrogates, no zero
+/// characters, no control characters but tabs, line ends and form feeds, no
+/// noncharacters. Binary files fail that within a few bytes. A file of line
+/// breaks alone, or of a single letter outside the Latin script, says too
+/// little to be taken for UTF-16.
 pub fn looks_like_utf16(bytes: &[u8]) -> Option<Encoding> {
     if bytes.len() < 2 || !bytes.len().is_multiple_of(2) {
         return None;
     }
     let sample = &bytes[..bytes.len().min(UTF16_SNIFF_BYTES)];
     let pairs = sample.as_chunks::<2>().0;
+    let units_in = |encoding: Encoding| -> Vec<u16> {
+        let unit: fn([u8; 2]) -> u16 = if encoding == Encoding::Utf16Le { u16::from_le_bytes } else { u16::from_be_bytes };
+        let mut units: Vec<u16> = pairs.iter().map(|pair| unit(*pair)).collect();
+        // A sample cut between the two halves of a surrogate pair.
+        if sample.len() < bytes.len() && units.last().is_some_and(|u| (0xD800..0xDC00).contains(u)) {
+            units.pop();
+        }
+        units
+    };
+
+    // Latin script. Its zero bytes may also be no more than a few line
+    // breaks in a short file of something else: a Latin character must show.
     let latin = |high: usize| pairs.iter().filter(|pair| pair[high] == 0 && pair[1 - high] != 0).count();
     let (le, be) = (latin(1), latin(0));
-    let units = sample.len() / 2;
-    if le.max(be) * 10 < units * 3 {
-        return None;
+    if le.max(be) * 10 >= pairs.len() * 3 {
+        let encoding = if le >= be { Encoding::Utf16Le } else { Encoding::Utf16Be };
+        if read_utf16(&units_in(encoding)).is_some_and(|read| read.latin > 0) {
+            return Some(encoding);
+        }
     }
-    let (encoding, unit): (Encoding, fn([u8; 2]) -> u16) =
-        if le >= be { (Encoding::Utf16Le, u16::from_le_bytes) } else { (Encoding::Utf16Be, u16::from_be_bytes) };
-    let mut units: Vec<u16> = pairs.iter().map(|pair| unit(*pair)).collect();
-    // A sample cut between the two halves of a surrogate pair.
-    if sample.len() < bytes.len() && units.last().is_some_and(|u| (0xD800..0xDC00).contains(u)) {
-        units.pop();
+
+    // Other scripts.
+    let (le, be) = (units_in(Encoding::Utf16Le), units_in(Encoding::Utf16Be));
+    let spacing = |units: &[u16]| units.iter().filter(|u| matches!(u, 0x09 | 0x0A | 0x0D | 0x20 | 0x3000)).count();
+    let (encoding, units) = match spacing(&le).cmp(&spacing(&be)) {
+        std::cmp::Ordering::Greater => (Encoding::Utf16Le, le),
+        std::cmp::Ordering::Less => (Encoding::Utf16Be, be),
+        std::cmp::Ordering::Equal => return None,
+    };
+    let read = read_utf16(&units)?;
+    (read.letters >= 2 && read.unusual * 10 <= read.beyond_ascii).then_some(encoding)
+}
+
+/// What [`read_utf16`] found in a sample of UTF-16.
+struct Utf16Sample {
+    /// Characters up to U+00FF other than whitespace: ASCII and Latin-1.
+    latin: usize,
+    /// Characters beyond ASCII.
+    beyond_ascii: usize,
+    /// Of those, letters (of any script).
+    letters: usize,
+    /// Of those, ones that are neither letters, digits, marks, spaces nor
+    /// common punctuation and symbols.
+    unusual: usize,
+}
+
+/// `units` decoded, unless they cannot be text: a stray surrogate, a zero,
+/// a control character other than tab, line end or form feed, or a
+/// noncharacter.
+fn read_utf16(units: &[u16]) -> Option<Utf16Sample> {
+    let mut found = Utf16Sample { latin: 0, beyond_ascii: 0, letters: 0, unusual: 0 };
+    for c in char::decode_utf16(units.iter().copied()) {
+        let c = c.ok()?;
+        let noncharacter = matches!(u32::from(c), 0xFDD0..=0xFDEF) || u32::from(c) & 0xFFFE == 0xFFFE;
+        if c == '\0' || noncharacter || (c.is_control() && !matches!(c, '\t' | '\n' | '\r' | '\x0c')) {
+            return None;
+        }
+        if u32::from(c) <= 0xFF && !c.is_whitespace() {
+            found.latin += 1;
+        }
+        if c.is_ascii() {
+            continue;
+        }
+        found.beyond_ascii += 1;
+        if c.is_alphabetic() {
+            found.letters += 1;
+        } else if !(c.is_numeric() || c.is_whitespace() || common_in_text(c)) {
+            found.unusual += 1;
+        }
     }
-    let text_like = char::decode_utf16(units).all(|c| match c {
-        Ok(c) => c != '\0' && (!c.is_control() || matches!(c, '\t' | '\n' | '\r' | '\x0c')),
-        Err(_) => false,
-    });
-    text_like.then_some(encoding)
+    Some(found)
+}
+
+/// Characters beyond ASCII that are neither letters nor digits but common in
+/// text: the marks of scripts that have many (Indic, Thai, Lao, Tibetan,
+/// Myanmar, combining accents), punctuation and symbols (Latin-1, general
+/// punctuation, arrows, mathematics, box drawing, CJK punctuation, fullwidth
+/// forms), variation selectors and emoji.
+fn common_in_text(c: char) -> bool {
+    matches!(u32::from(c),
+        0x00A0..=0x00BF
+        | 0x0300..=0x036F
+        | 0x0483..=0x0489
+        | 0x0591..=0x05C7
+        | 0x0600..=0x06FF
+        | 0x0900..=0x109F
+        | 0x2000..=0x2BFF
+        | 0x2E80..=0x2FFF
+        | 0x3000..=0x33FF
+        | 0xFE00..=0xFE0F
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFFEF
+        | 0x1F000..=0x1FAFF)
 }
 
 // ---- line endings -------------------------------------------------------------
@@ -856,6 +946,98 @@ mod tests {
         // way through a surrogate pair.
         let long = Encoding::Utf16Le.encode(&format!("{}𝄞 and more", "x".repeat(UTF16_SNIFF_BYTES / 2 - 1))).into_owned();
         assert_eq!(looks_like_utf16(&long), Some(Encoding::Utf16Le));
+    }
+
+    /// Text with no Latin letters in it, in UTF-16 without a byte order mark.
+    const OTHER_SCRIPTS: &[&str] = &[
+        "这是一个测试。\n第二行文字，没有拉丁字母。\n",
+        "這是繁體中文的檔案\r\n第二行\r\n",
+        "これは日本語のテキストです。\r\n二行目もあります。\r\n",
+        "Привет, мир! Это проверка.\nВторая строка\n",
+        "مرحبا بالعالم\nهذا سطر ثان\n",
+        "שלום עולם\nשורה שנייה\n",
+        "안녕하세요 세계\n두 번째 줄\n",
+        "สวัสดีชาวโลก\nบรรทัดที่สอง\n",
+        "नमस्ते दुनिया\nदूसरी पंक्ति\n",
+        "Γειά σου κόσμε\n",
+        "一\t二\n",
+    ];
+
+    #[test]
+    fn utf16_in_other_scripts_is_told_without_a_byte_order_mark() {
+        for text in OTHER_SCRIPTS {
+            for encoding in [Encoding::Utf16Le, Encoding::Utf16Be] {
+                let bytes = encoding.encode(text).into_owned();
+                assert_eq!(looks_like_utf16(&bytes), Some(encoding), "{encoding:?}: {text}");
+                assert_eq!(utf16_encoding(&bytes, Encoding::Utf8), Some(FileEncoding { encoding, bom: false }));
+            }
+        }
+        // Long, and cut by the sample in the middle of a character outside
+        // the first plane.
+        let long = format!("{}\n{}", "中文".repeat(UTF16_SNIFF_BYTES / 4 - 2), "𠀋 end\n");
+        let bytes = Encoding::Utf16Be.encode(&long).into_owned();
+        assert_eq!(looks_like_utf16(&bytes), Some(Encoding::Utf16Be));
+        // Emoji and fullwidth punctuation are fine.
+        let emoji = Encoding::Utf16Le.encode("完成了！🎉\n下一步\n").into_owned();
+        assert_eq!(looks_like_utf16(&emoji), Some(Encoding::Utf16Le));
+    }
+
+    #[test]
+    fn other_data_is_not_taken_for_utf16() {
+        let even = |mut bytes: Vec<u8>| {
+            if !bytes.len().is_multiple_of(2) {
+                bytes.push(b'\n');
+            }
+            bytes
+        };
+        // UTF-8 and legacy encodings: no zero bytes, so no 16-bit spaces or
+        // line breaks.
+        for text in OTHER_SCRIPTS {
+            assert_eq!(looks_like_utf16(&even(text.as_bytes().to_vec())), None, "UTF-8: {text}");
+        }
+        for (encoding, text) in [
+            (Encoding::ShiftJis, "これは日本語のテキストです。\r\n二行目もあります。\r\n"),
+            (Encoding::EucJp, "これは日本語のテキストです。\n"),
+            (Encoding::Gbk, "这是一个测试。\n第二行文字，没有拉丁字母。\n"),
+            (Encoding::Gb18030, "这是一个测试。\n"),
+            (Encoding::Big5, "這是繁體中文的檔案\r\n第二行\r\n"),
+            (Encoding::EucKr, "안녕하세요 세계\n두 번째 줄\n"),
+            (Encoding::Windows1251, "Привет, мир! Это проверка.\nВторая строка\n"),
+            (Encoding::Koi8R, "Привет, мир!\n"),
+            (Encoding::Windows1253, "Γειά σου κόσμε\n"),
+        ] {
+            let bytes = even(encoding.encode(text).into_owned());
+            assert_eq!(looks_like_utf16(&bytes), None, "{encoding:?}: {text}");
+        }
+
+        // Pictures and other binary files.
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x10\0\0\0\x10\x08\x06\0\0\0\x1f\xf3\xffa".to_vec();
+        let jpeg = b"\xff\xd8\xff\xe0\0\x10JFIF\0\x01\x01\x01\0H\0H\0\0\xff\xdb\0C\0\x08\x06\x06\x07\x06".to_vec();
+        let gif = b"GIF89a\x10\0\x10\0\x80\0\0\xff\xff\xff\0\0\0!\xf9\x04\x01\0\0\0\0,\0\0\0\0".to_vec();
+        let bmp = [&b"BM"[..], &[0x46, 0, 0, 0, 0, 0, 0, 0, 0x36, 0, 0, 0, 0x28, 0, 0, 0][..], &[0x20, 0x4e].repeat(16)[..]].concat();
+        let zip = b"PK\x03\x04\x14\0\0\0\x08\0\x21\x4e\x0a\x00readme.txt".to_vec();
+        let exe = b"MZ\x90\0\x03\0\0\0\x04\0\0\0\xff\xff\0\0\xb8\0\0\0\0\0\0\0@\0".to_vec();
+        // Sound: 16-bit samples of a wave.
+        let wave: Vec<u8> =
+            (0..2048).flat_map(|i| (((i as f64 / 40.0).sin() * 20_000.0) as i16).to_le_bytes()).collect();
+        let mut seed = 0x2545_f491_u32;
+        let noise: Vec<u8> = (0..4096)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        for (name, bytes) in [("png", png), ("jpeg", jpeg), ("gif", gif), ("bmp", bmp), ("zip", zip), ("exe", exe), ("wave", wave), ("noise", noise)] {
+            assert_eq!(looks_like_utf16(&even(bytes)), None, "{name}");
+        }
+
+        // Short files say too little: whitespace alone, one letter, a
+        // private-use character, a noncharacter.
+        for short in [&b"\n\0"[..], b"\0 \0\n", b" \0 \0", b"\x2d\x4e\x0a\x00", b"\x00\xe0\x01\xe0\x0a\x00", b"\xfe\xff\x0a\x00\x2d\x4e"] {
+            assert_eq!(looks_like_utf16(short), None, "{short:?}");
+        }
     }
 
     #[test]
