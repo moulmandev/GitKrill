@@ -333,26 +333,33 @@ be installed.
   deleted on the remote unless Auto-Prune is off
 - Optionally keep submodules at the commits HEAD records after checkout,
   pull, merge, rebase, reset, cherry-pick and revert
-- GitHub, GitHub Enterprise and GitLab (gitlab.com or your own server): open
-  pull requests (merge requests on GitLab), issues and CI runs (Actions,
-  pipelines) in the sidebar, each request with the CI status of its head;
-  check out a pull or merge request as a local branch, from a fork too
+- GitHub, GitHub Enterprise, GitLab (gitlab.com or your own server),
+  Bitbucket Cloud, Azure DevOps (dev.azure.com and the older
+  visualstudio.com addresses), Codeberg, and your own Gitea or Forgejo:
+  open pull requests (merge requests on GitLab), issues (work items on
+  Azure DevOps) and CI runs (Actions, pipelines, Azure Pipelines builds) in
+  the sidebar, each request with the CI status of its head; check out a
+  pull or merge request as a local branch, from a fork too (on Bitbucket
+  and Azure DevOps, which keep no ref for it, only from a branch in the
+  repository itself)
 - What the reviewers say, at the right of each pull request: approved,
   changes requested, or review required (GitHub's review decision, and the
   reviews themselves where no rule requires any); on GitLab the approvals,
-  `1/2` while some are missing. The tooltip says how many approved
+  `1/2` while some are missing; on Azure DevOps the reviewers' votes, with
+  required reviewers counted the same way; on Bitbucket who approved or
+  asked for changes. The tooltip says how many approved
 - Pull requests from forks have a fork mark, and their tooltip names the
   fork and its branch (`grace:main`)
-- A remote on a server other than github.com or gitlab.com is offered as
-  "Connect <server>…": say whether it runs GitLab or GitHub Enterprise and
-  its lists appear; right-click the remote to disconnect it again. A GitLab
-  installed under a path (`example.com/gitlab`) is added with that path in
-  Preferences > Integrations > GitLab Self-Managed; its HTTPS and SSH
-  remotes are then recognised
+- A remote on a server other than the public services is offered as
+  "Connect <server>…": say whether it runs GitLab, GitHub Enterprise, Gitea
+  or Forgejo and its lists appear; right-click the remote to disconnect it
+  again. A GitLab installed under a path (`example.com/gitlab`) is added
+  with that path in Preferences > Integrations > GitLab Self-Managed; its
+  HTTPS and SSH remotes are then recognised
 - Open a pull or merge request: drop a branch on the list, right-click it,
   or use the list's + button. Title and description are filled in from
   the commits, the branch is pushed first when the remote lacks it, and
-  "Open on GitHub" (or GitLab) works without signing in
+  "Open on GitHub" (or the service it is on) works without signing in
 - In a fork (the service says so, or a remote is called `upstream`), the
   pull request goes into the parent repository by default (Repository in
   the dialog), from `owner:branch`. A branch on another remote of the same
@@ -423,7 +430,7 @@ in the **Help** menu, the others in the **View** menu.
 | Feature | What is sent | Where |
 | --- | --- | --- |
 | Author pictures | SHA-256 of each author's email address, or the GitHub user id from a `noreply` address | gravatar.com, avatars.githubusercontent.com |
-| Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, and the requests you open, with a token when one is found for that host (below). Then, for the requests that changed since: their review states (one GraphQL request on GitHub, signed in only; each merge request's approvals on GitLab), the projects GitLab merge requests come from, and once whether the repository is a fork. While Preferences > Integrations shows an account: whose token it is, its SSH keys, and the public keys you add there | api.github.com, gitlab.com, and only the servers you connected |
+| Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, and the requests you open, with a token when one is found for that host (below). Then, for the requests that changed since: their review states (one GraphQL request on GitHub, signed in only; each merge request's approvals on GitLab), the projects GitLab merge requests come from, and once whether the repository is a fork. While Preferences > Integrations shows an account: whose token it is, its SSH keys, and the public keys you add there | api.github.com, gitlab.com, api.bitbucket.org, codeberg.org, dev.azure.com (app.vssps.visualstudio.com for your Azure DevOps profile), and only the servers you connected |
 | Automatic fetch | `git fetch --prune --all` (without `--prune` when Auto-Prune is off), as you would run it | your remotes |
 | Updates | A request for the latest release shortly after start and every six hours; the download when there is a newer one | api.github.com, github.com and its download host |
 
@@ -435,7 +442,8 @@ nothing outside the computer can reach it) for the questions of its own git
 commands (a password, a passphrase); only those commands know the random
 token it accepts.
 
-A server other than github.com and gitlab.com is never sent anything until
+A server other than the public services (github.com, gitlab.com,
+bitbucket.org, codeberg.org, Azure DevOps) is never sent anything until
 you have said what it runs; the answer is kept in the settings file
 (`hosting_servers`). Tokens are looked for per host and sent only to that
 host's API over HTTPS. They are never stored, logged or shown.
@@ -446,6 +454,10 @@ host's API over HTTPS. They are never stored, logged or shown.
 | GitHub Enterprise | `GH_ENTERPRISE_TOKEN`, `GITHUB_ENTERPRISE_TOKEN` (unless `GH_HOST` names another server), `gh auth token --hostname <server>`, git's credential helper for the server |
 | gitlab.com | `GITLAB_TOKEN` (unless `GITLAB_HOST` names another server), `glab config get token --host gitlab.com`, git's credential helper for gitlab.com |
 | Your GitLab | `GITLAB_TOKEN` only when `GITLAB_HOST` names the server, `glab config get token --host <server>`, git's credential helper for the server |
+| bitbucket.org | `BITBUCKET_ACCESS_TOKEN` (a repository, project or workspace access token), `BITBUCKET_API_TOKEN` with `BITBUCKET_EMAIL` (an Atlassian API token), `BITBUCKET_APP_PASSWORD` with `BITBUCKET_USERNAME`, git's credential helper for bitbucket.org (its user name and password, or the password as an OAuth token) |
+| Azure DevOps | `AZURE_DEVOPS_EXT_PAT` (a personal access token), `az account get-access-token` (after `az login`), git's credential helper for the repository's address on dev.azure.com |
+| codeberg.org | `CODEBERG_TOKEN`, `FORGEJO_TOKEN` when `FORGEJO_HOST` names codeberg.org, the login `tea` keeps for codeberg.org, git's credential helper for codeberg.org |
+| Your Gitea / Forgejo | `GITEA_TOKEN` when `GITEA_HOST` names the server (`FORGEJO_TOKEN` and `FORGEJO_HOST` for Forgejo), the login `tea` keeps for the server, git's credential helper for the server |
 
 A server installed under a path is asked about by its name alone
 (`example.com` for `example.com/gitlab`, as git's credential helper and
@@ -505,8 +517,10 @@ src/
   update.rs      checking for, downloading and applying updates
   notification.rs  system notifications
   hosting/       pull / merge requests, issues and CI: github.rs (GitHub
-                 and Enterprise), gitlab.rs, shared sign-in and network;
-                 account.rs: the accounts and their SSH keys
+                 and Enterprise), gitlab.rs, bitbucket.rs, gitea.rs (Gitea,
+                 Forgejo, Codeberg), azure.rs (Azure DevOps), shared sign-in
+                 and network (signin.rs for the last three); account.rs:
+                 the accounts and their SSH keys
   git/
     repo.rs      snapshot loading (refs, status, history walk)
     graph.rs     lane layout and line colours
@@ -572,7 +586,10 @@ build.rs         the Windows executable's icon and version details
 
 - Undo does not cover an operation that stopped on conflicts and was then
   continued or finished in a terminal (the reflog still has it)
-- Bitbucket, Gitea, Azure DevOps and other hosts
+- Bitbucket Data Center (Server), SourceHut and other hosts; Azure DevOps SSH
+  keys cannot be listed or added in Preferences > Integrations (it has no
+  API for them), Bitbucket lists no comment counts for its issues, and
+  pull requests on Gitea, Forgejo and Codeberg show no review state
 - In a fork, the sidebar lists the fork's own pull requests, issues and CI,
   not its parent's (pull requests are opened into the parent all the same);
   review states on GitHub need a sign-in

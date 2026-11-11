@@ -378,7 +378,7 @@ impl App {
                     crate::prefs::general::set_auto_fetch(&mut shared.settings, auto_fetch);
                 }
                 ui.checkbox(&mut shared.settings.fetch_avatars, "Author pictures from Gravatar and GitHub");
-                ui.checkbox(&mut shared.settings.hosting_integration, "Pull requests, issues and CI from GitHub and GitLab");
+                ui.checkbox(&mut shared.settings.hosting_integration, "Pull requests, issues and CI from your hosting services");
                 if let Some(tab) = tabs.get_mut(*active) {
                     if ui.add(egui::Button::new("Search Commits").shortcut_text("Ctrl+F")).clicked() {
                         ui::graph::open_search(tab);

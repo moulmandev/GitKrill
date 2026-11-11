@@ -3,8 +3,12 @@
 //! account's SSH keys (listing them, adding one from a file, generating a
 //! new one and adding it).
 //!
-//! Everything here that blocks (the network, `gh` / `glab` / `git
-//! credential`, `ssh-keygen`, reading `~/.ssh`) runs on an
+//! Bitbucket keeps an account's keys under its id (`/users/{uuid}/ssh-keys`),
+//! and Azure DevOps has no API for them at all: there only the profile is
+//! read, outside any organisation ([`azure::PROFILE_API`]).
+//!
+//! Everything here that blocks (the network, `gh` / `glab` / `tea` / `az` /
+//! `git credential`, `ssh-keygen`, reading `~/.ssh`) runs on an
 //! [`AccountSession`]'s own thread. The thread lives while the preferences
 //! page holds the session and ends once it is dropped; the UI thread only
 //! sends it orders and drains its events.
@@ -37,8 +41,8 @@ use serde::Deserialize;
 
 use super::{
     Canned, FixtureSignIn, HttpRequest, HttpResponse, NoSecrets, Offer, Rate, RepoId, Secrets, Service, System,
-    Token, TokenSource, Transport, Wire, api_base, clock, epoch_now, find_token, github, gitlab, limited_until,
-    offer_for, public, timestamp, tidy, unsupported, valid_host,
+    Token, TokenSource, Transport, Wire, api_base, azure, bitbucket, clock, epoch_now, find_token, gitlab, headers,
+    limited_until, offer_for, public, timestamp, tidy, unsupported, valid_host,
 };
 use crate::git::RemoteInfo;
 
@@ -63,19 +67,41 @@ impl AccountId {
         AccountId { service: Service::GitLab, host: "gitlab.com".to_owned() }
     }
 
-    /// On a server the user named, rather than github.com or gitlab.com.
-    pub fn self_hosted(&self) -> bool {
-        self.host != "github.com" && self.host != "gitlab.com"
+    pub fn bitbucket() -> Self {
+        AccountId { service: Service::Bitbucket, host: "bitbucket.org".to_owned() }
     }
 
-    /// "GitHub", "GitLab", or the server's name.
+    pub fn codeberg() -> Self {
+        AccountId { service: Service::Codeberg, host: "codeberg.org".to_owned() }
+    }
+
+    pub fn azure() -> Self {
+        AccountId { service: Service::AzureDevOps, host: azure::HOST.to_owned() }
+    }
+
+    /// On a server the user named, rather than a public service.
+    pub fn self_hosted(&self) -> bool {
+        public(&self.host).is_none()
+    }
+
+    /// "GitHub", "GitLab", "Bitbucket"..., or the server's name.
     pub fn site(&self) -> String {
         if self.self_hosted() { self.host.clone() } else { self.service.name().to_owned() }
     }
 
-    /// Where the REST API lives; a token is only ever sent below it.
+    /// Where the REST API lives; a token is only ever sent below it. Azure
+    /// DevOps keeps the user's profile outside every organisation.
     pub fn api(&self) -> String {
-        api_base(self.service, &self.host)
+        match self.service {
+            Service::AzureDevOps => azure::PROFILE_API.to_owned(),
+            service => api_base(service, &self.host),
+        }
+    }
+
+    /// Whether the service lets its SSH keys be listed and added through its
+    /// API. Azure DevOps does not.
+    pub fn keys_supported(&self) -> bool {
+        self.service != Service::AzureDevOps
     }
 
     /// What [`find_token`] is asked about: the service and the host, nothing
@@ -199,9 +225,10 @@ impl Profile {
     }
 }
 
-/// An answer to `GET /user`: GitHub's (`login`, public `email`) or
-/// GitLab's (`username`, `public_email`, and the account's own `email`,
-/// which only its owner is shown).
+/// An answer to `GET /user`: GitHub's (`login`, public `email`), GitLab's
+/// (`username`, `public_email`, and the account's own `email`, which only
+/// its owner is shown), Gitea's and Forgejo's (`login`, `full_name`,
+/// `email`); Bitbucket's and Azure DevOps' profiles have shapes of their own.
 pub fn parse_user(service: Service, json: &str) -> Result<Profile, String> {
     #[derive(Deserialize)]
     struct Raw {
@@ -212,20 +239,27 @@ pub fn parse_user(service: Service, json: &str) -> Result<Profile, String> {
         #[serde(default)]
         username: String,
         name: Option<String>,
+        full_name: Option<String>,
         email: Option<String>,
         public_email: Option<String>,
     }
+    match service {
+        Service::Bitbucket => return bitbucket::parse_user(json).map(|(profile, _)| profile),
+        Service::AzureDevOps => return azure::parse_profile(json),
+        _ => {}
+    }
     let raw: Raw = serde_json::from_str(json).map_err(|e| e.to_string())?;
     let present = |text: Option<String>| text.map(|text| tidy(&text)).filter(|text| !text.is_empty());
-    let (login, email) = match service {
-        Service::GitHub | Service::GitHubEnterprise => (raw.login, present(raw.email)),
-        Service::GitLab => (raw.username, present(raw.public_email).or_else(|| present(raw.email))),
+    let (login, email, name) = match service {
+        Service::GitLab => (raw.username, present(raw.public_email).or_else(|| present(raw.email)), raw.name),
+        service if service.is_gitea() => (raw.login, present(raw.email), raw.full_name),
+        _ => (raw.login, present(raw.email), raw.name),
     };
     let login = tidy(&login);
     if login.is_empty() {
         return Err("the answer names no account".to_owned());
     }
-    Ok(Profile { id: raw.id, login, name: present(raw.name).unwrap_or_default(), email })
+    Ok(Profile { id: raw.id, login, name: present(name).unwrap_or_default(), email })
 }
 
 /// A public SSH key on the account (`GET /user/keys`).
@@ -425,11 +459,8 @@ pub fn new_key_path(dir: &Path, account: &AccountId) -> PathBuf {
     if free("id_ed25519") {
         return dir.join("id_ed25519");
     }
-    let site: String = if account.self_hosted() {
-        account.host.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect()
-    } else {
-        account.service.name().to_ascii_lowercase()
-    };
+    let site = if account.self_hosted() { account.host.clone() } else { account.service.name().to_ascii_lowercase() };
+    let site: String = site.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
     let base = format!("id_ed25519_{site}");
     let name = std::iter::once(base.clone())
         .chain((2..).map(|n| format!("{base}_{n}")))
@@ -560,6 +591,13 @@ impl Trouble {
                         "Sign in with a personal access token that has it (`glab auth login`), then try again."
                             .to_owned()
                     }
+                    (Service::Bitbucket, _) => "Sign in with an API token that has it (Atlassian account settings > \
+                         Security > API tokens), then try again."
+                        .to_owned(),
+                    (service, _) if service.is_gitea() => format!(
+                        "Sign in with an access token that has it (Settings > Applications on {site}), then try again."
+                    ),
+                    _ => "Sign in with a token that has it, then try again.".to_owned(),
                 };
                 format!("{site} does not let this sign-in {to}: its token needs the {scope} scope. {fix}")
             }
@@ -588,6 +626,9 @@ impl Trouble {
 fn api_message(service: Service, body: &str) -> String {
     if service.is_gitlab() {
         return gitlab::api_message(body);
+    }
+    if service == Service::Bitbucket {
+        return bitbucket::api_message(body);
     }
     #[derive(Deserialize, Default)]
     #[serde(default)]
@@ -628,6 +669,9 @@ struct Worker {
     ssh_dir: Option<PathBuf>,
     /// The account's login once known: a generated key's comment.
     login: Option<String>,
+    /// Bitbucket lists an account's keys under its id, which the profile
+    /// gives.
+    key_owner: Option<String>,
 }
 
 impl Worker {
@@ -642,6 +686,7 @@ impl Worker {
             looked: false,
             ssh_dir,
             login: None,
+            key_owner: None,
         }
     }
 
@@ -657,10 +702,7 @@ impl Worker {
                 Worker::new(account, Box::new(transport), secrets, Some(ssh))
             }
             None => {
-                let headers = match account.service {
-                    Service::GitHub | Service::GitHubEnterprise => github::HEADERS,
-                    Service::GitLab => gitlab::HEADERS,
-                };
+                let headers = headers(account.service);
                 let home = dirs::home_dir();
                 // `git credential fill` reads the global configuration from
                 // anywhere; the home folder is a place sure to exist.
@@ -754,19 +796,48 @@ impl Worker {
         if !about_scope {
             return Trouble::Refused(message);
         }
-        let scope = match (self.account.service.is_gitlab(), write) {
-            (false, false) => "read:public_key",
-            (false, true) => "write:public_key",
-            (true, false) => "read_user",
-            (true, true) => "api",
+        let scope = match (self.account.service, write) {
+            (Service::GitLab, false) => "read_user",
+            (Service::GitLab, true) => "api",
+            (Service::Bitbucket, false) => "read:ssh-key:bitbucket",
+            (Service::Bitbucket, true) => "write:ssh-key:bitbucket",
+            (service, false) if service.is_gitea() => "read:user",
+            (service, true) if service.is_gitea() => "write:user",
+            (_, false) => "read:public_key",
+            (_, true) => "write:public_key",
         };
         Trouble::Scope { scope, fine_grained }
     }
 
-    /// `GET /user`: whose sign-in this is.
+    /// Where the account's keys are listed and added. Bitbucket's are under
+    /// the account's id, known once the profile was read.
+    fn keys_url(&self) -> Result<String, Trouble> {
+        match self.account.service {
+            Service::Bitbucket => match &self.key_owner {
+                Some(owner) => Ok(bitbucket::keys_url(owner)),
+                None => Err(Trouble::Failed("The account has not been read yet".to_owned())),
+            },
+            Service::AzureDevOps => Err(Trouble::Failed(
+                "Azure DevOps has no API for SSH keys: add them in User settings > SSH public keys".to_owned(),
+            )),
+            _ => Ok(format!("{}/user/keys", self.api)),
+        }
+    }
+
+    /// `GET /user` (Azure DevOps: the profile): whose sign-in this is.
     fn profile(&mut self, now: u64) -> Result<Profile, Trouble> {
-        let response = self.send(&format!("{}/user", self.api), None, now)?;
+        let url = match self.account.service {
+            Service::AzureDevOps => azure::profile_url(),
+            _ => format!("{}/user", self.api),
+        };
+        let response = self.send(&url, None, now)?;
         match response.status {
+            200 if self.account.service == Service::Bitbucket => {
+                let (profile, owner) = bitbucket::parse_user(&response.body).map_err(|e| self.unreadable(e))?;
+                self.login = Some(profile.login.clone());
+                self.key_owner = Some(owner);
+                Ok(profile)
+            }
             200 => {
                 let profile = parse_user(self.account.service, &response.body).map_err(|e| self.unreadable(e))?;
                 self.login = Some(profile.login.clone());
@@ -779,29 +850,43 @@ impl Worker {
         }
     }
 
-    /// `GET /user/keys`.
+    /// `GET /user/keys` (Bitbucket: `/users/{id}/ssh-keys`).
     fn keys(&mut self, now: u64) -> Result<Vec<SshKey>, Trouble> {
-        let response = self.send(&format!("{}/user/keys?per_page=100", self.api), None, now)?;
+        let page = match self.account.service {
+            Service::Bitbucket => "pagelen=100",
+            // Gitea and Forgejo cap their pages at 50.
+            service if service.is_gitea() => "limit=50",
+            _ => "per_page=100",
+        };
+        let url = format!("{}?{page}", self.keys_url()?);
+        let response = self.send(&url, None, now)?;
         match response.status {
+            200 if self.account.service == Service::Bitbucket => {
+                bitbucket::parse_keys(&response.body).map_err(|e| self.unreadable(e))
+            }
             200 => parse_keys(&response.body).map_err(|e| self.unreadable(e)),
             403 | 404 => Err(self.refusal(&response, false)),
             status => Err(self.unexpected(status)),
         }
     }
 
-    /// `POST /user/keys`. Never repeated after a request that may have
-    /// reached the service, except after a 401, which means nothing was done.
+    /// `POST /user/keys` (Bitbucket: `/users/{id}/ssh-keys`). Never repeated
+    /// after a request that may have reached the service, except after a
+    /// 401, which means nothing was done.
     fn upload(&mut self, title: &str, key: &PublicKey, now: u64) -> Result<SshKey, Trouble> {
-        let body = new_key_json(title, key);
-        let response = self.send(&format!("{}/user/keys", self.api), Some(&body), now)?;
+        let bitbucket = self.account.service == Service::Bitbucket;
+        let body = if bitbucket { bitbucket::new_key_json(title, key) } else { new_key_json(title, key) };
+        let url = self.keys_url()?;
+        let response = self.send(&url, Some(&body), now)?;
         let site = self.account.site();
         match response.status {
+            200 | 201 if bitbucket => bitbucket::parse_key(&response.body).map_err(|e| self.unreadable(e)),
             200 | 201 => parse_key(&response.body).map_err(|e| self.unreadable(e)),
             403 | 404 => Err(self.refusal(&response, true)),
             400 | 409 | 422 => {
                 let message = api_message(self.account.service, &response.body);
                 let lower = message.to_ascii_lowercase();
-                Err(Trouble::Refused(if lower.contains("already") {
+                Err(Trouble::Refused(if lower.contains("already") || lower.contains("been used") {
                     format!("this key is already on a {site} account, this one or another")
                 } else if message.is_empty() {
                     "the key was not accepted".to_owned()
@@ -881,18 +966,19 @@ struct CannedAccount {
 impl Transport for CannedAccount {
     fn get(&mut self, request: &HttpRequest<'_>) -> Result<HttpResponse, String> {
         let path = request.url.split('?').next().unwrap_or_default();
+        // Bitbucket's keys are `.../ssh-keys`, Azure DevOps' profile `.../me`.
         match path.rsplit('/').next() {
-            Some("user") => Ok(self.canned.answer("user", 200)),
-            Some("keys") if self.added && self.canned.dir.join("keys.after.json").exists() => {
+            Some("user" | "me") => Ok(self.canned.answer("user", 200)),
+            Some("keys" | "ssh-keys") if self.added && self.canned.dir.join("keys.after.json").exists() => {
                 Ok(self.canned.answer("keys.after", 200))
             }
-            Some("keys") => Ok(self.canned.answer("keys", 200)),
+            Some("keys" | "ssh-keys") => Ok(self.canned.answer("keys", 200)),
             _ => Err("no fixture for this address".to_owned()),
         }
     }
 
     fn post(&mut self, request: &HttpRequest<'_>, body: &str) -> Result<HttpResponse, String> {
-        if !request.url.ends_with("/user/keys") {
+        if !request.url.ends_with("/user/keys") && !request.url.ends_with("/ssh-keys") {
             return Err("no fixture for this address".to_owned());
         }
         let _ = std::fs::write(self.canned.dir.join("keys.sent.json"), body);
@@ -1335,6 +1421,69 @@ mod tests {
         );
         assert_eq!(worker.profile(NOW).unwrap().login, "john");
         assert_eq!(sent.lock().unwrap()[0].url, "https://git.example.com/api/v4/user");
+    }
+
+    #[test]
+    fn bitbucket_gitea_and_azure_accounts_are_asked_where_each_keeps_them() {
+        // Bitbucket: the profile names the account's id, its keys are below it.
+        let user = r#"{"username": "ada", "display_name": "Ada", "uuid": "{0f1e2d3c-aaaa-bbbb-cccc-111122223333}"}"#;
+        let keys = format!(r#"{{"values": [{{"label": "Laptop", "key": "{PUBLIC}"}}]}}"#);
+        let added = format!(r#"{{"uuid": "{{k2}}", "label": "New", "key": "{PUBLIC}"}}"#);
+        let bitbucket = Fake { env: vec![("BITBUCKET_EMAIL", "ada@example.com"), ("BITBUCKET_API_TOKEN", SECRET)], ..Default::default() };
+        let (mut worker, sent) = scripted(
+            AccountId::bitbucket(),
+            vec![reply(200, &[], user), reply(200, &[], &keys), reply(201, &[], &added)],
+            bitbucket.clone(),
+        );
+        // Before the profile, the keys' address is not known: nothing is sent.
+        assert!(matches!(worker.keys(NOW), Err(Trouble::Failed(_))));
+        assert_eq!(worker.profile(NOW).unwrap().display_name(), "Ada");
+        assert_eq!(worker.keys(NOW).unwrap()[0].title, "Laptop");
+        let key = parse_public_key(PUBLIC).unwrap();
+        assert_eq!(worker.upload("New", &key, NOW).unwrap().title, "New");
+        {
+            let sent = sent.lock().unwrap();
+            let owner = "%7B0f1e2d3c-aaaa-bbbb-cccc-111122223333%7D";
+            assert_eq!(sent[0].url, "https://api.bitbucket.org/2.0/user");
+            assert_eq!(sent[1].url, format!("https://api.bitbucket.org/2.0/users/{owner}/ssh-keys?pagelen=100"));
+            assert_eq!(sent[2].url, format!("https://api.bitbucket.org/2.0/users/{owner}/ssh-keys"));
+            let body: serde_json::Value = serde_json::from_str(sent[2].body.as_deref().unwrap()).unwrap();
+            assert_eq!(body, serde_json::json!({"key": key.line(), "label": "New"}));
+        }
+        // A missing scope is named in Bitbucket's terms.
+        let scope = r#"{"type": "error", "error": {"message": "Your credentials lack one or more required privilege scopes."}}"#;
+        let (mut worker, _) = scripted(AccountId::bitbucket(), vec![reply(200, &[], user), reply(403, &[], scope)], bitbucket);
+        worker.profile(NOW).unwrap();
+        let trouble = worker.keys(NOW).unwrap_err();
+        assert_eq!(trouble, Trouble::Scope { scope: "read:ssh-key:bitbucket", fine_grained: false });
+        assert!(trouble.explain(&AccountId::bitbucket(), None, "read your SSH keys").contains("API token"));
+
+        // Codeberg: Gitea's `/user`, with `full_name`; pages of at most 50.
+        let (mut worker, sent) = scripted(
+            AccountId::codeberg(),
+            vec![reply(200, &[], r#"{"id": 7, "login": "ada", "full_name": "Ada Lovelace", "email": "ada@noreply.codeberg.org"}"#), reply(200, &[], "[]")],
+            Fake { env: vec![("CODEBERG_TOKEN", SECRET)], ..Default::default() },
+        );
+        let profile = worker.profile(NOW).unwrap();
+        assert_eq!((profile.login.as_str(), profile.display_name()), ("ada", "Ada Lovelace"));
+        assert_eq!(worker.keys(NOW).unwrap(), Vec::new());
+        let urls: Vec<String> = sent.lock().unwrap().iter().map(|request| request.url.clone()).collect();
+        assert_eq!(urls, ["https://codeberg.org/api/v1/user", "https://codeberg.org/api/v1/user/keys?limit=50"]);
+
+        // Azure DevOps: the profile service, and no keys API to ask.
+        let (mut worker, sent) = scripted(
+            AccountId::azure(),
+            vec![reply(200, &[], r#"{"displayName": "Ada Lovelace", "emailAddress": "ada@acme.example"}"#)],
+            Fake { env: vec![("AZURE_DEVOPS_EXT_PAT", SECRET)], ..Default::default() },
+        );
+        assert_eq!(worker.profile(NOW).unwrap().login, "ada@acme.example");
+        assert!(matches!(worker.keys(NOW), Err(Trouble::Failed(text)) if text.contains("no API for SSH keys")));
+        assert!(!AccountId::azure().keys_supported() && AccountId::bitbucket().keys_supported());
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].url.starts_with("https://app.vssps.visualstudio.com/_apis/profile/profiles/me?"));
+        assert_eq!(AccountId::azure().api(), "https://app.vssps.visualstudio.com");
+        assert!(!AccountId::azure().self_hosted() && AccountId::azure().site() == "Azure DevOps");
     }
 
     #[test]

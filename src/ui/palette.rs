@@ -700,7 +700,7 @@ fn app_actions(list: &mut Vec<Entry>, has_tab: bool, settings: &Settings) {
         icons::GIT_PULL_REQUEST,
         settings.hosting_integration,
         ("Hide pull requests, issues and CI", "Show pull requests, issues and CI"),
-        "github gitlab hosting actions pipelines merge requests",
+        "github gitlab bitbucket gitea forgejo codeberg azure devops hosting actions pipelines merge requests",
         |s| s.hosting_integration = !s.hosting_integration,
     ));
 

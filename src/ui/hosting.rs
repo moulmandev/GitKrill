@@ -1,6 +1,6 @@
-//! Sidebar sections for pull requests (merge requests on GitLab), issues and
-//! CI runs, the offer to connect a self-hosted server, and the dialog that
-//! asks what runs on it.
+//! Sidebar sections for pull requests (merge requests on GitLab), issues
+//! (work items on Azure DevOps) and CI runs, the offer to connect a
+//! self-hosted server, and the dialog that asks what runs on it.
 
 use eframe::egui::{Align2, Button, Color32, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
 
@@ -108,7 +108,7 @@ fn lists(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, shown: &Shown, act
         .collect();
     let count = (issues.len(), view.issues.items.len());
     let url = repo.issues_url();
-    if header(ui, tab, shown, ("ISSUES", icons::RADIO_BUTTON, &url), count, false, act) {
+    if header(ui, tab, shown, (service.issues_title(), icons::RADIO_BUTTON, &url), count, false, act) {
         notice(ui, shown, &view.issues, act);
         for issue in issues {
             issue_row(ui, shown, issue, act);
@@ -416,12 +416,12 @@ fn local_branch<'a>(snap: &'a RepoSnapshot, shown: &Shown, pr: &PullRequest) -> 
 }
 
 fn checks_mark(service: Service, checks: Checks) -> (&'static str, Color32, &'static str) {
-    let gitlab = service.is_gitlab();
+    let pipelines = service.has_pipelines();
     match checks {
-        Checks::Passing => (icons::CHECK, theme::green(), if gitlab { "Pipeline passed" } else { "Checks passed" }),
-        Checks::Failing => (icons::X, theme::red(), if gitlab { "Pipeline failed" } else { "Checks failed" }),
+        Checks::Passing => (icons::CHECK, theme::green(), if pipelines { "Pipeline passed" } else { "Checks passed" }),
+        Checks::Failing => (icons::X, theme::red(), if pipelines { "Pipeline failed" } else { "Checks failed" }),
         Checks::Pending => {
-            (icons::CIRCLE_NOTCH, theme::yellow(), if gitlab { "Pipeline running" } else { "Checks running" })
+            (icons::CIRCLE_NOTCH, theme::yellow(), if pipelines { "Pipeline running" } else { "Checks running" })
         }
     }
 }
@@ -527,8 +527,12 @@ fn pull_row(ui: &mut Ui, snap: &RepoSnapshot, shown: &Shown, pr: &PullRequest, a
         } else {
             format!("Check out as {branch}")
         };
-        if menu_item(ui, icons::CHECK, &label) {
-            *act = Some(Act::Run(hosting::checkout_pull(&shown.remote, service, pr.number, on_branch)));
+        // Bitbucket and Azure DevOps keep no ref for a pull request: one
+        // from a fork cannot be fetched from this remote.
+        if let Some(cmd) = hosting::checkout_pull_request(&shown.remote, service, &shown.repo, pr, on_branch)
+            && menu_item(ui, icons::CHECK, &label)
+        {
+            *act = Some(Act::Run(cmd));
         }
         if let Some(oid) = target
             && menu_item(ui, icons::GIT_COMMIT, "Show in graph")
@@ -699,8 +703,8 @@ fn offer_section(ui: &mut Ui, tab: &mut RepoTab, offers: &[Offer], act: &mut Opt
         response.on_hover_ui(|ui| {
             ui.set_max_width(320.0);
             ui.label(format!(
-                "{} is on {}. Say whether it runs GitLab or GitHub Enterprise to see its \
-                 requests, issues and CI here. Nothing is sent to {} until then.",
+                "{} is on {}. Say what it runs (GitLab, GitHub Enterprise, Gitea or Forgejo) \
+                 to see its requests, issues and CI here. Nothing is sent to {} until then.",
                 offer.path, offer.host, offer.host
             ));
         });
@@ -765,7 +769,9 @@ pub fn connect_body(ui: &mut Ui, shared: &mut Shared, host: &str, path: &str, ch
     let options = [
         (ServerKind::GitLab, icons::GITLAB_LOGO, "GitLab"),
         (ServerKind::GitHubEnterprise, icons::GITHUB_LOGO, "GitHub Enterprise"),
-        (ServerKind::Ignored, icons::PROHIBIT, "Neither: don't offer again"),
+        (ServerKind::Gitea, icons::COFFEE, "Gitea"),
+        (ServerKind::Forgejo, icons::HAMMER, "Forgejo"),
+        (ServerKind::Ignored, icons::PROHIBIT, "None of these: don't offer again"),
     ];
     for (kind, icon, label) in options {
         // GitHub Enterprise is never installed under a path.
@@ -805,6 +811,16 @@ pub fn connect_body(ui: &mut Ui, shared: &mut Shared, host: &str, path: &str, ch
              GH_ENTERPRISE_TOKEN, gh's sign-in, or Git's credential manager. github.com \
              tokens are never sent to it.",
             hosting::api_base(Service::GitHubEnterprise, host)
+        ),
+        Some(ServerKind::Gitea) => format!(
+            "Requests go to {} only. A token is used if one is found for this server: \
+             GITEA_TOKEN when GITEA_HOST names it, tea's sign-in, or Git's credential manager.",
+            hosting::api_base(Service::Gitea, host)
+        ),
+        Some(ServerKind::Forgejo) => format!(
+            "Requests go to {} only. A token is used if one is found for this server: \
+             FORGEJO_TOKEN when FORGEJO_HOST names it, tea's sign-in, or Git's credential manager.",
+            hosting::api_base(Service::Forgejo, host)
         ),
         Some(ServerKind::Ignored) => format!(
             "{host} is not contacted, and not offered again. Right-click the remote to \
