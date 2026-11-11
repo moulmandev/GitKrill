@@ -49,6 +49,44 @@ pub struct Editor {
     pub syntax_highlighting: bool,
     pub line_numbers: bool,
     pub word_wrap: bool,
+    /// Diffs: one column of changes, or the two versions side by side.
+    pub diff_layout: DiffLayout,
+    /// Diffs: the hunks, or the whole file with the changes in place.
+    pub diff_context: DiffContext,
+    /// Diffs leave out changes of whitespace alone (`git diff -w`).
+    pub ignore_whitespace: bool,
+}
+
+/// How a diff is laid out.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DiffLayout {
+    /// Removed and added lines one under the other.
+    #[default]
+    Inline,
+    /// The old version on the left, the new one on the right.
+    Split,
+}
+
+/// How much of the file a diff shows.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DiffContext {
+    /// The changes with three lines around each.
+    #[default]
+    Hunks,
+    /// Every line of the file.
+    File,
+}
+
+impl Editor {
+    /// How diffs are worked out on the reader threads.
+    pub fn diff_mode(&self) -> crate::git::diff::Mode {
+        crate::git::diff::Mode {
+            whole_file: self.diff_context == DiffContext::File,
+            ignore_whitespace: self.ignore_whitespace,
+        }
+    }
 }
 
 impl Default for Editor {
@@ -64,6 +102,9 @@ impl Default for Editor {
             syntax_highlighting: true,
             line_numbers: true,
             word_wrap: false,
+            diff_layout: DiffLayout::Inline,
+            diff_context: DiffContext::Hunks,
+            ignore_whitespace: false,
         }
     }
 }
@@ -86,11 +127,13 @@ pub struct Look {
     pub highlight: bool,
     pub numbers: bool,
     pub wrap: bool,
+    /// Diffs side by side (`DiffLayout::Split`).
+    pub split: bool,
 }
 
 impl Default for Look {
     fn default() -> Self {
-        Look { size: DEFAULT_FONT_SIZE, highlight: true, numbers: true, wrap: false }
+        Look { size: DEFAULT_FONT_SIZE, highlight: true, numbers: true, wrap: false, split: false }
     }
 }
 
@@ -101,6 +144,7 @@ impl Look {
             highlight: editor.syntax_highlighting,
             numbers: editor.line_numbers,
             wrap: editor.word_wrap,
+            split: editor.diff_layout == DiffLayout::Split,
         }
     }
 
@@ -124,6 +168,7 @@ impl Look {
             | u64::from(self.highlight) << 32
             | u64::from(self.numbers) << 33
             | u64::from(self.wrap) << 34
+            | u64::from(self.split) << 35
     }
 
     fn unpack(bits: u64) -> Self {
@@ -132,6 +177,7 @@ impl Look {
             highlight: bits & 1 << 32 != 0,
             numbers: bits & 1 << 33 != 0,
             wrap: bits & 1 << 34 != 0,
+            split: bits & 1 << 35 != 0,
         }
     }
 }
@@ -171,6 +217,7 @@ pub fn font_error() -> Option<String> {
 pub fn apply(ctx: &egui::Context, settings: &Settings) {
     let editor = &settings.editor;
     LOOK.store(Look::of(editor).pack(), Ordering::Relaxed);
+    crate::git::diff::set_mode(editor.diff_mode());
 
     let encodings: Vec<(PathBuf, Encoding)> =
         settings.repos.iter().map(|(dir, prefs)| (dir.clone(), prefs.encoding.encoding)).collect();
@@ -219,8 +266,8 @@ mod tests {
     fn the_look_survives_its_trip_through_an_atomic() {
         for look in [
             Look::default(),
-            Look { size: 9.5, highlight: false, numbers: true, wrap: true },
-            Look { size: 32.0, highlight: true, numbers: false, wrap: false },
+            Look { size: 9.5, highlight: false, numbers: true, wrap: true, split: false },
+            Look { size: 32.0, highlight: true, numbers: false, wrap: false, split: true },
         ] {
             assert_eq!(Look::unpack(look.pack()), look);
             assert_ne!(look.pack(), 0);
@@ -236,6 +283,12 @@ mod tests {
         assert_eq!(editor, Editor::default());
         assert!(editor.monospace_only && editor.syntax_highlighting && editor.line_numbers && !editor.word_wrap);
         assert_eq!((editor.tab_size, editor.eol), (4, Eol::Keep));
+        assert_eq!((editor.diff_layout, editor.diff_context, editor.ignore_whitespace), (DiffLayout::Inline, DiffContext::Hunks, false));
+        assert_eq!(editor.diff_mode(), crate::git::diff::Mode::default());
+        let diffs: Editor =
+            serde_json::from_str(r#"{"diff_layout": "split", "diff_context": "file", "ignore_whitespace": true}"#).unwrap();
+        assert_eq!(diffs.diff_mode(), crate::git::diff::Mode { whole_file: true, ignore_whitespace: true });
+        assert!(Look::of(&diffs).split);
         let encoding: RepoEncoding = serde_json::from_str(r#"{"encoding": "windows-1252"}"#).unwrap();
         assert_eq!(encoding.encoding, Encoding::Windows1252);
     }

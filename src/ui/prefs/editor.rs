@@ -6,7 +6,7 @@ use eframe::egui::{self, ComboBox, DragValue, Id, RichText, ScrollArea, Ui, vec2
 
 use super::{Page, form};
 use crate::git::text::Eol;
-use crate::prefs::editor::{self, MAX_FONT_SIZE, MIN_FONT_SIZE, fonts::FontEntry};
+use crate::prefs::editor::{self, DiffContext, DiffLayout, MAX_FONT_SIZE, MIN_FONT_SIZE, fonts::FontEntry};
 use crate::theme;
 
 /// What this section remembers while preferences are open.
@@ -100,6 +100,34 @@ pub fn show(ui: &mut Ui, page: &mut Page<'_>, state: &mut State) {
         form::checkbox(ui, &mut prefs.word_wrap, "");
         form::help(ui, "Long lines continue on the next row instead of scrolling sideways, in diffs and blame.");
     });
+
+    form::heading(ui, "Diffs");
+    form::row(ui, "Layout", |ui| {
+        form::choice(
+            ui,
+            "prefs-editor-diff-layout",
+            &mut prefs.diff_layout,
+            &[(DiffLayout::Inline, "Inline"), (DiffLayout::Split, "Side by side")],
+        );
+        form::help(ui, "Side by side puts the old version on the left and the new one on the right.");
+    });
+    form::row(ui, "Show", |ui| {
+        form::choice(
+            ui,
+            "prefs-editor-diff-context",
+            &mut prefs.diff_context,
+            &[(DiffContext::Hunks, "The changed hunks"), (DiffContext::File, "The whole file")],
+        );
+        form::help(ui, "The whole file has every line, with the changes in place; each hunk can still be staged on its own.");
+    });
+    form::row(ui, "Ignore Whitespace", |ui| {
+        form::checkbox(ui, &mut prefs.ignore_whitespace, "Hide changes to whitespace alone (git diff -w)");
+        form::help(
+            ui,
+            "While it is on, hunks and lines cannot be staged or discarded one by one; whole files still can.",
+        );
+    });
+    form::help(ui, "The diff's title bar switches these too, and so does the command palette.");
 }
 
 /// The font drop-down: the default font, then the installed ones (only the
