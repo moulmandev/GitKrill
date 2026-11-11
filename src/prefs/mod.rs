@@ -44,6 +44,10 @@ pub struct RepoPrefs {
     pub encoding: editor::RepoEncoding,
     /// Preferences > Commit.
     pub commit: commit::RepoCommit,
+    /// In a fork, the hosting sidebar shows its parent's pull requests,
+    /// issues and CI rather than the fork's own (the switch above them,
+    /// `crate::ui::hosting`).
+    pub hosting_parent: bool,
 }
 
 /// The preferences of the repository at `workdir`, or the defaults.

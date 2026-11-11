@@ -65,9 +65,10 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Give every git command an environment variable | `git::cli::set_session_env` (the SSH key and author of the profile in use). It replaces the whole set and `prefs::identity::apply` owns it: add what you need to `identity::session_env` rather than calling it from elsewhere. |
 | Change what the commit button does | `src/ui/commit_button.rs`: the split button (`show`), what runs once a commit succeeded (`follow_up`), the commit template in the message fields (`prefill`). `commit_blocker` and `commit_staged` commit from a button elsewhere (a squash merge's Continue) the way the panel does. |
 | Add trailers or flags to the panel's commits | `git::trailers::CommitOptions`: `message` adds `Co-authored-by:` trailers the message does not have yet (before a trailing sign-off), `apply` adds `--signoff` (left out when `ident` already signed the message) and `--no-verify` to the `git commit` steps. `ui::commit_options::options(ctx, tab, prefs)` is what the next commit gets, `sign_off_ident` who git signs off as, `committed` resets them. |
-| Know how a pull request stands with its reviewers, or where it comes from | `PullRequest::review` (`hosting::Review`, `Unknown` until the service has said) and `approvals`; `head_repo` and `is_from(repo)` for forks. A backend learns them in `Backend::details`, called after the three lists each round: return what changed (`Details`), and apply what is already known to a fresh list in `pulls()` so it does not flicker. `View::parent` is the repository's parent when it is a fork. |
-| Open a pull request between forks | `HostingState::create_pull_across(new, Across { from, into })` (`Backend::create_pull_across`); `hosting::related(remotes, servers, repo)` lists the remotes on the same server that point at other repositories. `ui::new_pull::{targets, route}` decide where a pull request goes and which remote its branch is pushed to. |
-| Add a hosting service | A backend file in `src/hosting/` behind the `Backend` trait, built on `signin::Api` (sign-in found, refused and replaced, rate limit, redirects inside the API, `classify` for the usual statuses); a `Service` variant with its words (`pull_word`, `ci_title`, `issues_title`, `pull_number`, `has_pull_refs`), its remote URLs in `parse_remote`/`public`, its token sources in `find_token`, and its arms in `connect`, `headers`, `api_base`, the `RepoId` links and `account.rs`. A token that is not a bearer token is `Token::basic(user, secret)`. `checkout_pull_request` checks a pull request out on any service. |
+| Know how a pull request stands with its reviewers, or where it comes from | `PullRequest::review` (`hosting::Review`, `Unknown` until the service has said) and `approvals`; `head_repo` and `is_from(repo)` for forks. A backend learns them in `Backend::details`, called after the three lists each round: return what changed (`Details`), and apply what is already known to a fresh list in `pulls()` so it does not flicker. `hosting::Reviews` does that bookkeeping for review states asked one round after another: `listed` (a fresh list, filled in), `stale(limit)` (what changed since asked), `learnt` (what to put in `Details`), `ask_again` (a refresh by hand). Spend a small request budget with `Limiter::left(now)` (what the service said is left of its window). `View::parent` is the repository's parent when it is a fork. |
+| Show a fork's parent | `hosting::parent_of(repo, view.parent, remotes, servers)` (the service's word, else a remote called `upstream`). `Shown::family` (`hosting::Family`: the fork and its remote, the parent and the remote pointing at it, which is shown) is set whenever there is one; `HostingState::sync(.., show_parent)` then runs a second session for the parent and shows it, `RepoPrefs::hosting_parent` remembering the choice (`ui::hosting::show_parent`). `HostingState::connected` is always the fork's session (pull requests are opened from it); `parent_shown()` is the parent's while shown; `refresh()` refreshes what is shown, `refresh_connected()` the fork. |
+| Open a pull request between forks | `HostingState::create_pull_across(new, Across { from, into })` (`Backend::create_pull_across`, on GitHub, GitLab, Gitea / Forgejo and Bitbucket); one opened in the parent is added to the parent's session at once. `hosting::related(remotes, servers, repo)` lists the remotes on the same server that point at other repositories. `ui::new_pull::{targets, route}` decide where a pull request goes and which remote its branch is pushed to. |
+| Add a hosting service | A backend file in `src/hosting/` behind the `Backend` trait, built on `signin::Api` (sign-in found, refused and replaced, rate limit, redirects inside the API, `classify` for the usual statuses); a `Service` variant with its words (`pull_word`, `ci_title`, `issues_title`, `pull_number`, `has_pull_refs`, `has_issues`), its remote URLs in `parse_remote`/`public`, its token sources in `find_token`, and its arms in `connect`, `headers`, `api_base`, the `RepoId` links and `account.rs`. A token that is not a bearer token is `Token::basic(user, secret)`. `checkout_pull_request` checks a pull request out on any service. |
 | Ask a hosting account something (who is signed in, its SSH keys) | `hosting::account::AccountSession::start(account, ctx)`, polled from the UI; `account::local_keys`, `parse_public_key` and `fingerprint` read `.pub` files. A host in `settings.hosting_disconnected` is never signed in to. |
 | Know who commits | `prefs::identity`: `settings.identity.current()` is the profile in use; `identity::generation()` changes whenever the identity git commands get may have changed (ask git again then, as `ui::prefs::profiles::commit_author` does). |
 | Show the text of a file (not git's own data) | Decode it in the background with `git::text::format_for(workdir)` (the repository's encoding and the tab width: `display_text_in`, `decode_file`), keep the `Format` with the result, and load again when `text::generation()` has moved on (`ui/diff.rs` does). |
@@ -273,7 +274,7 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   `<dir>/<endpoint>.json` instead of the network: `pulls`, `issues` and
   `runs` for GitHub, Gitea and Forgejo (`tasks` for servers older than the
   runs endpoint), `merge_requests`, `issues` and `pipelines` for GitLab,
-  `pullrequests`, `issues` and `pipelines` for Bitbucket, `pullrequests`,
+  `pullrequests` and `pipelines` for Bitbucket (no issues), `pullrequests`,
   `wiql`, `workitems`, `builds` and `repositories` for Azure DevOps,
   in each API's own JSON. `<endpoint>.head` stages a status and headers
   (a rate limit, an outage). To show a GitLab or self-hosted remote, point
@@ -287,10 +288,18 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   and `pulls.after.json` replaces `pulls.json` once one was opened
   (`pullrequests.after.json` on Bitbucket and Azure DevOps).
 - Review states and forks: GitHub's GraphQL answer (review decisions) comes
-  from `graphql.json` and the repository itself (a fork's `parent`) from
-  `repo.json`; on GitLab each merge request's approvals from
+  from `graphql.json`, and the repository itself (a fork's `parent`) from
+  `repo.json` on GitHub, Gitea, Forgejo and Bitbucket; one pull request's
+  reviews (GitHub without a sign-in, Gitea, Forgejo) from
+  `reviews-<number>.json`; on GitLab each merge request's approvals from
   `approvals-<iid>.json`, the project (`forked_from_project`) from
-  `project.json`, and a fork's project by id from `project-<id>.json`.
+  `project.json`, and a fork's project by id from `project-<id>.json`. A
+  repository with a folder of its own, `<dir>/<owner>/<name>/`, is answered
+  from there: put a fork's parent's files in one (`<dir>/octo/app/pulls.json`
+  beside the fork's `repo.json` naming `octo/app`) and click Parent above
+  the lists. Checking out one of the parent's pull requests fetches from
+  the parent's real address when no remote points at it, so do not click
+  that in a run.
 - A server installed under a path is the key `example.com/gitlab` in
   `hosting_servers`; point the demo's origin at
   `https://example.com/gitlab/group/app.git` to show one. An empty

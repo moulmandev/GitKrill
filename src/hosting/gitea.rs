@@ -7,6 +7,12 @@
 //! older `/actions/tasks`, tried in that order. A server without Actions has
 //! neither, and its CI section stays empty.
 //!
+//! After the lists ([`Backend::details`]): the repository itself once (a
+//! fork's `parent`), and the reviews of each open pull request that changed
+//! since they were last asked (`/pulls/{index}/reviews`), which the list
+//! does not carry. A pull request into a fork's parent names its branch
+//! `owner:branch`, as the API's `head` takes it.
+//!
 //! Sign-ins: `CODEBERG_TOKEN` for codeberg.org, `GITEA_TOKEN` for the Gitea
 //! server `GITEA_HOST` names, `FORGEJO_TOKEN` for the Forgejo server (or
 //! codeberg.org) `FORGEJO_HOST` names, then the login `tea` keeps for the
@@ -361,6 +367,53 @@ pub fn parse_runs(text: &str, tasks: bool) -> Result<(Vec<Run>, bool), String> {
     Ok((runs, total > count))
 }
 
+/// What a pull request's reviews (`GET /repos/{owner}/{repo}/pulls/{index}/
+/// reviews`) come to: each reviewer's latest approval or request for
+/// changes, unless it was dismissed since. Only official reviews count
+/// (those of reviewers the branch's rules, or write access, let count);
+/// servers too old to say are taken at their word. Comments, pending
+/// reviews and requests for a review leave a reviewer's word as it was.
+/// The rules' required number of approvals is not in the answer, so a pull
+/// request is never "review required" here.
+pub fn parse_reviews(text: &str) -> Result<(Review, Approvals), String> {
+    #[derive(Deserialize)]
+    struct RawReview {
+        #[serde(default)]
+        id: u64,
+        user: Option<RawUser>,
+        #[serde(default)]
+        state: String,
+        #[serde(default)]
+        dismissed: bool,
+        official: Option<bool>,
+    }
+    let mut raw: Vec<RawReview> = json(text)?;
+    // Oldest first, whatever order the server lists them in.
+    raw.sort_by_key(|review| review.id);
+    // Each reviewer's last word, and whether it was dismissed.
+    let mut words: Vec<(String, &'static str, bool)> = Vec::new();
+    for review in &raw {
+        let Some(login) = review.user.as_ref().map(|user| user.login.clone()).filter(|login| !login.is_empty()) else {
+            continue;
+        };
+        let word = match review.state.as_str() {
+            "APPROVED" => "APPROVED",
+            "REQUEST_CHANGES" => "CHANGES_REQUESTED",
+            _ => continue,
+        };
+        if !review.official.unwrap_or(true) {
+            continue;
+        }
+        match words.iter_mut().find(|(who, ..)| *who == login) {
+            Some(last) => *last = (login, word, review.dismissed),
+            None => words.push((login, word, review.dismissed)),
+        }
+    }
+    let states: Vec<String> =
+        words.into_iter().filter(|(_, _, dismissed)| !dismissed).map(|(_, word, _)| word.to_owned()).collect();
+    Ok(github::review_of(None, &states))
+}
+
 /// The body of a new pull request. Gitea and Forgejo take no draft flag:
 /// a "WIP:" title is what makes one.
 pub fn new_pull_json(new: &NewPull) -> String {
@@ -388,18 +441,36 @@ enum RunsAt {
     Nowhere,
 }
 
+/// Review requests at most per round, one per pull request: the whole list
+/// signed in, fewer without a sign-in, whose allowance is smaller.
+const REVIEWS_AT_ONCE: usize = 30;
+const PUBLIC_REVIEWS_AT_ONCE: usize = 10;
+
 pub struct Client {
     api: Api,
     runs_at: RunsAt,
+    /// Review states of the listed pull requests, as last asked.
+    reviews: Reviews,
+    /// The repository's parent once asked; `Some(None)` when it has none.
+    parent: Option<Option<Parent>>,
 }
 
 impl Client {
     pub fn new(repo: RepoId, transport: Box<dyn Transport>, secrets: Box<dyn Secrets>) -> Self {
-        Client { api: Api::new(repo, transport, secrets, 3, &[401], plain_message), runs_at: RunsAt::Unknown }
+        Client {
+            api: Api::new(repo, transport, secrets, 3, &[401], plain_message),
+            runs_at: RunsAt::Unknown,
+            reviews: Reviews::default(),
+            parent: None,
+        }
     }
 
     fn repo_url(&self, path: &str) -> String {
-        format!("{}/repos/{}/{}/{path}", self.api.base, self.api.repo.owner, self.api.repo.name)
+        Self::url_of(&self.api.base, &self.api.repo, path)
+    }
+
+    fn url_of(base: &str, repo: &RepoId, path: &str) -> String {
+        format!("{base}/repos/{}/{}/{path}", repo.owner, repo.name)
     }
 
     /// `rel="next"` in the `Link` header.
@@ -407,10 +478,12 @@ impl Client {
         response.header("link").is_some_and(|link| link.contains("rel=\"next\""))
     }
 
-    fn create(&mut self, new: &NewPull, now: u64) -> Result<PullRequest, Problem> {
+    /// POST /repos/{owner}/{repo}/pulls of `into`: this repository, or
+    /// another of the server (a fork's parent).
+    fn create(&mut self, into: &RepoId, new: &NewPull, now: u64) -> Result<PullRequest, Problem> {
         // Not signed in so far: the user may have signed in since.
         self.api.look_again();
-        let url = self.repo_url("pulls");
+        let url = Self::url_of(&self.api.base, into, "pulls");
         let response = self.api.post(&url, &new_pull_json(new), true, now)?;
         let message = self.api.message(&response.body);
         let site = self.api.repo.site();
@@ -421,8 +494,8 @@ impl Client {
             // The repository was listed a moment ago: what is missing is a branch.
             404 => Err(Problem::Refused(format!("{site} does not have the branch {head} or {base}: push it first"))),
             403 => Err(Problem::Refused(match message.is_empty() {
-                true => format!("No permission to open pull requests in {}", self.api.repo.slug()),
-                false => format!("No permission to open pull requests in {} ({message})", self.api.repo.slug()),
+                true => format!("No permission to open pull requests in {}", into.slug()),
+                false => format!("No permission to open pull requests in {} ({message})", into.slug()),
             })),
             400 | 422 if message.to_lowercase().contains("no changes") => {
                 Err(Problem::Refused(format!("No commits between {base} and {head}: there is nothing to merge")))
@@ -454,15 +527,61 @@ impl Client {
         );
         (!missing).then_some(outcome)
     }
+
+    /// GET /repos/{owner}/{repo}, for the parent of a fork. `None` when
+    /// there was no answer worth keeping (no connection, a rate limit, the
+    /// server failing): asked again next round.
+    fn ask_parent(&mut self, now: u64) -> Option<Option<Parent>> {
+        let url = self.repo_url("").trim_end_matches('/').to_owned();
+        let response = self.api.get(url, None, now).ok()?;
+        match response.status {
+            200..=299 => Some(github::parse_parent(&response.body, &self.api.repo).unwrap_or(None)),
+            500..=599 => None,
+            // Moved, hidden or refused: no parent to offer.
+            _ => Some(None),
+        }
+    }
+
+    /// The reviews of the listed pull requests that changed since they were
+    /// last asked, one request each and at most a list's worth per round
+    /// (fewer without a sign-in). Stops at the first request that gets no
+    /// answer worth keeping; the rest wait for the next round. Returns those
+    /// whose state is not what it was.
+    fn ask_reviews(&mut self, now: u64) -> Vec<PullRequest> {
+        let limit = if self.api.signed_in() { REVIEWS_AT_ONCE } else { PUBLIC_REVIEWS_AT_ONCE };
+        let mut changed = Vec::new();
+        for (number, updated) in self.reviews.stale(limit) {
+            let url = self.repo_url(&format!("pulls/{number}/reviews?limit=50"));
+            let Ok(response) = self.api.get(url, None, now) else { break };
+            let (review, approvals) = match response.status {
+                200..=299 => match parse_reviews(&response.body) {
+                    Ok((review, approvals)) => (review, Some(approvals)),
+                    Err(_) => (Review::Unknown, None),
+                },
+                500..=599 => break,
+                // Hidden or gone: unknown until the pull request changes.
+                _ => (Review::Unknown, None),
+            };
+            changed.extend(self.reviews.learnt(number, updated, review, approvals));
+        }
+        changed
+    }
 }
 
 impl Backend for Client {
     fn pulls(&mut self, now: u64) -> Outcome<PullRequest> {
         self.api.start_round();
         let url = self.repo_url("pulls?state=open&sort=recentupdate&limit=30");
-        self.api.fetch(url, List::Pulls as usize, now, |_, _| None, |response| {
+        let outcome = self.api.fetch(url, List::Pulls as usize, now, |_, _| None, |response| {
             Ok((parse_pulls(&response.body)?, Self::linked(response)))
-        })
+        });
+        match outcome {
+            Outcome::Fresh { mut items, more } => {
+                self.reviews.listed(&mut items);
+                Outcome::Fresh { items, more }
+            }
+            other => other,
+        }
     }
 
     fn issues(&mut self, now: u64) -> Outcome<Issue> {
@@ -502,6 +621,8 @@ impl Backend for Client {
         if self.runs_at == RunsAt::Nowhere {
             self.runs_at = RunsAt::Unknown;
         }
+        // Reviews are asked about again, and shown as they were meanwhile.
+        self.reviews.ask_again();
     }
 
     fn blocked_until(&self, now: u64) -> Option<u64> {
@@ -509,8 +630,36 @@ impl Backend for Client {
     }
 
     fn create_pull(&mut self, new: &NewPull, now: u64) -> Result<PullRequest, Problem> {
-        let created = self.create(new, now);
+        let into = self.api.repo.clone();
+        let created = self.create(&into, new, now);
         created.map_err(|problem| self.api.scrub(problem))
+    }
+
+    /// Opened in `across.into`; a branch of another repository (a fork) is
+    /// `owner:branch` there.
+    fn create_pull_across(&mut self, new: &NewPull, across: &Across, now: u64) -> Result<PullRequest, Problem> {
+        let here = |repo: &RepoId| repo.service == self.api.repo.service && repo.host == self.api.repo.host;
+        if !here(&across.from) || !here(&across.into) {
+            return Err(Problem::Failed(format!("Both repositories must be on {}", self.api.repo.site())));
+        }
+        let head = match across.from.same(&across.into) {
+            true => new.head.clone(),
+            false => format!("{}:{}", across.from.owner, new.head),
+        };
+        let created = self.create(&across.into, &NewPull { head, ..new.clone() }, now);
+        created.map_err(|problem| self.api.scrub(problem))
+    }
+
+    fn details(&mut self, now: u64) -> Option<Details> {
+        let mut details = Details::default();
+        if self.parent.is_none()
+            && let Some(parent) = self.ask_parent(now)
+        {
+            details.parent = parent.clone();
+            self.parent = Some(parent);
+        }
+        details.pulls = self.ask_reviews(now);
+        (details != Details::default()).then_some(details)
     }
 }
 
@@ -916,6 +1065,165 @@ preferences:
         assert!(!format!("{:?}", client.create_pull(&new_pull(false), NOW)).contains(SECRET));
         let (mut client, _) = scripted(codeberg(), vec![reply(500, &[], "")], with_token());
         assert_eq!(client.create_pull(&new_pull(false), NOW), Err(Problem::Failed("Codeberg answered 500".to_owned())));
+    }
+
+    // ---- review states, the parent, pull requests across forks ----
+
+    /// `GET /repos/{owner}/{repo}/pulls/{index}/reviews`, after the API's
+    /// PullReview: a request for a review, a dismissed approval, a stale but
+    /// standing one, and changes asked for then approved.
+    const REVIEWS: &str = r#"[
+      {"id": 31, "user": {"id": 2, "login": "grace"}, "team": null, "state": "REQUEST_REVIEW", "body": "",
+       "commit_id": "", "stale": false, "official": false, "dismissed": false, "comments_count": 0,
+       "submitted_at": "1970-01-02T00:00:00Z", "updated_at": "1970-01-02T00:00:00Z"},
+      {"id": 34, "user": {"id": 3, "login": "linus"}, "state": "APPROVED", "body": "lgtm",
+       "commit_id": "0000000000000000000000000000000000000000", "stale": true, "official": true, "dismissed": true,
+       "submitted_at": "1970-01-02T01:00:00Z"},
+      {"id": 33, "user": {"id": 4, "login": "ada"}, "state": "APPROVED", "commit_id": "0000000000000000000000000000000000000000",
+       "stale": true, "official": true, "dismissed": false, "submitted_at": "1970-01-02T00:30:00Z"},
+      {"id": 32, "user": {"id": 2, "login": "grace"}, "state": "REQUEST_CHANGES", "official": true, "dismissed": false},
+      {"id": 35, "user": {"id": 2, "login": "grace"}, "state": "APPROVED", "official": true, "dismissed": false},
+      {"id": 36, "user": {"id": 2, "login": "grace"}, "state": "COMMENT", "official": true, "dismissed": false}
+    ]"#;
+
+    /// `GET /repos/{owner}/{repo}` of a fork, trimmed: `parent` is a whole
+    /// repository.
+    const FORK: &str = r#"{"id": 70, "full_name": "ada/app", "name": "app", "fork": true, "default_branch": "main",
+      "owner": {"login": "ada"},
+      "parent": {"id": 7, "full_name": "team/app", "name": "app", "fork": false, "default_branch": "trunk",
+                 "owner": {"login": "team"}, "parent": null}}"#;
+
+    #[test]
+    fn reviews_come_to_each_official_reviewers_last_word() {
+        let given = |n| Approvals { given: n, left: 0 };
+        // grace approved after asking for changes; ada's stale approval
+        // stands; linus's was dismissed; the review request is no word.
+        assert_eq!(parse_reviews(REVIEWS).unwrap(), (Review::Approved, given(2)));
+        let changes = r#"[{"id": 1, "user": {"login": "grace"}, "state": "APPROVED", "official": true},
+            {"id": 2, "user": {"login": "grace"}, "state": "REQUEST_CHANGES", "official": true},
+            {"id": 3, "user": {"login": "ada"}, "state": "APPROVED", "official": true}]"#;
+        assert_eq!(parse_reviews(changes).unwrap(), (Review::ChangesRequested, given(1)));
+        // Someone the rules do not count; a pending review; a deleted account.
+        let none = r#"[{"id": 1, "user": {"login": "eve"}, "state": "APPROVED", "official": false},
+            {"id": 2, "user": {"login": "ada"}, "state": "PENDING", "official": true},
+            {"id": 3, "user": null, "state": "REQUEST_CHANGES", "official": true}]"#;
+        assert_eq!(parse_reviews(none).unwrap(), (Review::Unreviewed, given(0)));
+        // A server too old to say which reviews are official.
+        let older = r#"[{"id": 1, "user": {"login": "ada"}, "state": "APPROVED"}]"#;
+        assert_eq!(parse_reviews(older).unwrap(), (Review::Approved, given(1)));
+        assert_eq!(parse_reviews("[]").unwrap(), (Review::Unreviewed, given(0)));
+        assert!(parse_reviews(r#"{"message": "not found"}"#).is_err());
+    }
+
+    #[test]
+    fn reviews_are_asked_for_the_pull_requests_that_changed_and_kept_between_rounds() {
+        let second = PULLS.replace("\"updated_at\": \"1970-01-02T00:00:00Z\"", "\"updated_at\": \"1970-01-04T00:00:00Z\"");
+        let (mut client, sent) = scripted(
+            codeberg(),
+            vec![
+                reply(200, &[], PULLS),
+                reply(200, &[], FORK),
+                reply(200, &[], REVIEWS),
+                reply(404, &[], r#"{"message": "not found"}"#),
+                reply(200, &[], "[]"),
+                reply(200, &[], &second),
+                reply(200, &[], r#"[{"id": 9, "user": {"login": "grace"}, "state": "REQUEST_CHANGES", "official": true}]"#),
+            ],
+            with_token(),
+        );
+        assert!(matches!(client.pulls(NOW), Outcome::Fresh { .. }));
+        let details = client.details(NOW).unwrap();
+        let parent = details.parent.unwrap();
+        assert_eq!((parent.repo.slug().as_str(), parent.default_branch.as_str()), ("team/app", "trunk"));
+        // #12 approved, #9 not found (unknown: nothing to say), #8 unreviewed.
+        let states: Vec<(u64, Review)> = details.pulls.iter().map(|pull| (pull.number, pull.review)).collect();
+        assert_eq!(states, [(12, Review::Approved), (8, Review::Unreviewed)]);
+        assert_eq!(details.pulls[0].approvals, Some(Approvals { given: 2, left: 0 }));
+        // Nothing changed: nothing asked.
+        assert_eq!(client.details(NOW), None);
+        // #12 was updated: the list keeps what is known, #12 alone is asked.
+        let Outcome::Fresh { items, .. } = client.pulls(NOW) else { panic!("expected a list") };
+        assert_eq!(items.iter().map(|pull| pull.review).collect::<Vec<_>>(), [Review::Approved, Review::Unknown, Review::Unreviewed]);
+        let details = client.details(NOW).unwrap();
+        assert_eq!(details.pulls.iter().map(|pull| (pull.number, pull.review)).collect::<Vec<_>>(), [(12, Review::ChangesRequested)]);
+
+        let asked = urls(&sent);
+        assert_eq!(
+            asked[1..5],
+            [
+                "https://codeberg.org/api/v1/repos/team/app",
+                "https://codeberg.org/api/v1/repos/team/app/pulls/12/reviews?limit=50",
+                "https://codeberg.org/api/v1/repos/team/app/pulls/9/reviews?limit=50",
+                "https://codeberg.org/api/v1/repos/team/app/pulls/8/reviews?limit=50",
+            ]
+        );
+        assert_eq!(asked.len(), 7);
+        assert!(sent.lock().unwrap().iter().all(|request| request.token.as_deref() == Some(SECRET)));
+    }
+
+    #[test]
+    fn a_failing_server_or_a_rate_limit_stops_the_reviews_for_the_round() {
+        let (mut client, sent) = scripted(
+            codeberg(),
+            vec![
+                reply(200, &[], PULLS),
+                reply(200, &[], r#"{"full_name": "team/app", "fork": false, "parent": null}"#),
+                reply(502, &[], "<html>"),
+                reply(429, &[("retry-after", "600")], ""),
+            ],
+            Fake::default(),
+        );
+        assert!(matches!(client.pulls(NOW), Outcome::Fresh { .. }));
+        // Not a fork; the first review request failed: nothing learnt, and
+        // the others wait for the next round.
+        assert_eq!(client.details(NOW), None);
+        assert_eq!(urls(&sent).len(), 3);
+        // Next round: refused for asking too often, and then nothing at all
+        // until the limit lifts, lists included.
+        assert_eq!(client.details(NOW), None);
+        assert_eq!(client.details(NOW + 60), None);
+        assert_eq!(urls(&sent).len(), 4);
+        assert_eq!(client.blocked_until(NOW + 60), Some(NOW + 600));
+        assert!(sent.lock().unwrap().iter().all(|request| request.token.is_none()));
+    }
+
+    #[test]
+    fn a_pull_request_into_the_parent_names_the_forks_branch_owner_colon_branch() {
+        let fork = RepoId { owner: "ada".to_owned(), ..codeberg() };
+        let (mut client, sent) = scripted(fork.clone(), vec![reply(201, &[], CREATED)], with_token());
+        let across = Across { from: fork.clone(), into: codeberg() };
+        assert_eq!(client.create_pull_across(&new_pull(false), &across, NOW).unwrap().number, 13);
+        let sent_now = sent.lock().unwrap();
+        assert_eq!(sent_now[0].url, "https://codeberg.org/api/v1/repos/team/app/pulls");
+        let body: serde_json::Value = serde_json::from_str(sent_now[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!((body["head"].as_str(), body["base"].as_str()), (Some("ada:feature/fast"), Some("main")));
+        drop(sent_now);
+
+        // Refusals name the repository it went into.
+        let (mut client, _) = scripted(fork.clone(), vec![reply(403, &[], "{}")], with_token());
+        let refused = client.create_pull_across(&new_pull(false), &across, NOW).unwrap_err();
+        assert_eq!(refused, Problem::Refused("No permission to open pull requests in team/app".to_owned()));
+        // Never to another server, and nothing is sent then.
+        let elsewhere = RepoId { service: Service::Forgejo, host: "forge.acme.com".to_owned(), ..codeberg() };
+        let (mut client, sent) = scripted(fork.clone(), vec![reply(201, &[], CREATED)], with_token());
+        assert!(client.create_pull_across(&new_pull(false), &Across { from: fork, into: elsewhere }, NOW).is_err());
+        assert!(sent.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_offline_fixture_answers_reviews_and_the_repository() {
+        let dir = std::env::temp_dir().join("gitkrill-tests").join(format!("hosting-canned-gitea-reviews-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pulls.json"), PULLS).unwrap();
+        std::fs::write(dir.join("repo.json"), FORK).unwrap();
+        std::fs::write(dir.join("reviews-12.json"), REVIEWS).unwrap();
+        let mut client = Client::new(codeberg(), Box::new(Canned { dir: dir.clone(), created: false }), Box::new(NoSecrets));
+        assert!(matches!(client.pulls(NOW), Outcome::Fresh { .. }));
+        let details = client.details(NOW).unwrap();
+        assert_eq!(details.parent.unwrap().repo.slug(), "team/app");
+        assert_eq!(details.pulls.iter().map(|pull| (pull.number, pull.review)).collect::<Vec<_>>(), [(12, Review::Approved)]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

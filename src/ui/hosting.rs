@@ -1,18 +1,25 @@
 //! Sidebar sections for pull requests (merge requests on GitLab), issues
 //! (work items on Azure DevOps) and CI runs, the offer to connect a
 //! self-hosted server, and the dialog that asks what runs on it.
+//!
+//! In a fork whose parent is known (`hosting::Family`), a Fork / Parent
+//! switch above the sections picks whose lists they show, remembered per
+//! repository (`RepoPrefs::hosting_parent`). The parent's list puts the
+//! pull requests from the fork first.
 
 use eframe::egui::{Align2, Button, Color32, Rect, Response, RichText, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
 
 use crate::git::{BranchInfo, Oid, RemoteInfo, RepoSnapshot};
 use crate::git::ops::GitCmd;
-use crate::hosting::{self, Checks, Feed, Issue, Offer, PullRequest, Review, Run, RunState, ServerKind, Service, Shown};
+use crate::hosting::{
+    self, Checks, Family, Feed, Issue, Offer, PullRequest, Review, Run, RunState, ServerKind, Service, Shown,
+};
 use crate::state::{Dialog, RepoTab, Shared};
 use crate::theme::{self, icons};
 use crate::ui::dialogs;
 use crate::ui::graph::drag::{self, Branch};
 use crate::ui::sidebar::{leaf, row, section, section_header};
-use crate::ui::widgets::{elided, elided_pair, menu_item, spinner};
+use crate::ui::widgets::{elided, elided_pair, menu_item, segmented_wide, spinner};
 
 /// What a click or a menu entry asked for; applied once the lists are drawn.
 enum Act {
@@ -27,6 +34,8 @@ enum Act {
     Disconnect(String),
     /// Open the "Create pull request" dialog, from this branch if given.
     NewPull(Option<Branch>),
+    /// Show the parent's lists (true) or the fork's own.
+    ShowParent(bool),
 }
 
 /// Called at the end of the sidebar, inside its scroll area.
@@ -36,10 +45,14 @@ pub fn sections(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Repo
     let servers = &shared.settings.hosting_servers;
     let offers = if enabled { hosting::offers(&snap.remotes, servers) } else { Vec::new() };
     let disconnected = &shared.settings.hosting_disconnected;
-    let shown = tab.hosting.sync(&ctx, &snap.workdir, &snap.remotes, servers, disconnected, enabled);
+    let parent_wanted = crate::prefs::repo(&shared.settings, &tab.path).hosting_parent;
+    let shown = tab.hosting.sync(&ctx, &snap.workdir, &snap.remotes, servers, disconnected, enabled, parent_wanted);
 
     let mut act = None;
     if let Some(shown) = &shown {
+        if let Some(family) = &shown.family {
+            family_switch(ui, family, &mut act);
+        }
         lists(ui, tab, snap, shown, &mut act);
     }
     if !offers.is_empty() {
@@ -58,7 +71,54 @@ pub fn sections(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Repo
             shared.settings.hosting_servers.remove(&host);
         }
         Some(Act::NewPull(branch)) => crate::ui::new_pull::open(tab, shared, branch),
+        Some(Act::ShowParent(parent)) => show_parent(tab, shared, parent),
         None => {}
+    }
+}
+
+/// In a fork, makes the sidebar show its parent's lists (`parent`) or the
+/// fork's own, and remembers that for the repository.
+pub fn show_parent(tab: &RepoTab, shared: &mut Shared, parent: bool) {
+    crate::prefs::repo_mut(&mut shared.settings, &tab.path).hosting_parent = parent;
+    crate::prefs::tidy(&mut shared.settings);
+}
+
+/// Fork / Parent: whose pull requests, issues and CI the sections below
+/// show, for a fork whose parent is known.
+fn family_switch(ui: &mut Ui, family: &Family, act: &mut Option<Act>) {
+    let (fork, parent) = (family.fork.slug(), family.parent.slug());
+    let tips = [
+        format!("Pull requests, issues and CI of {fork} ({})", family.fork_remote),
+        format!(
+            "Pull requests, issues and CI of {parent}, the repository {fork} is a fork of. Pull \
+             requests from {fork} come first."
+        ),
+    ];
+    // The repositories' names too when both halves have room for them.
+    let (icon_fork, icon_parent) = (icons::GIT_FORK, icons::ARROW_BEND_LEFT_UP);
+    let named = (format!("Fork  {fork}"), format!("Parent  {parent}"));
+    let half = (ui.available_width() - 16.0) / 2.0;
+    let fits = |icon: &str, label: &str| {
+        let width = ui.painter().layout_no_wrap(format!("{icon} {label}"), theme::font(12.0), theme::text()).size().x;
+        width + 16.0 <= half
+    };
+    let (first, second) = match fits(icon_fork, &named.0) && fits(icon_parent, &named.1) {
+        true => (named.0.as_str(), named.1.as_str()),
+        false => ("Fork", "Parent"),
+    };
+    let mut parent_shown = family.parent_shown;
+    ui.add_space(6.0);
+    let changed = ui
+        .horizontal(|ui| {
+            ui.add_space(8.0);
+            ui.set_max_width(ui.available_width() - 8.0);
+            let tips = [tips[0].as_str(), tips[1].as_str()];
+            segmented_wide(ui, &mut parent_shown, (icon_fork, first), (icon_parent, second), tips)
+        })
+        .inner;
+    ui.add_space(6.0);
+    if changed {
+        *act = Some(Act::ShowParent(parent_shown));
     }
 }
 
@@ -77,12 +137,16 @@ fn lists(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, shown: &Shown, act
     let now = hosting::epoch_now() as i64;
 
     // ---- pull / merge requests ----
-    let pulls: Vec<&PullRequest> = view
+    let mut pulls: Vec<&PullRequest> = view
         .pulls
         .items
         .iter()
         .filter(|pr| matches(Some(pr.number), &[&pr.title, &pr.author, &pr.head_ref]))
         .collect();
+    // In the parent's list, those from the fork come first.
+    if let Some(family) = shown.family.as_ref().filter(|family| family.parent_shown) {
+        pulls.sort_by_key(|pr| !family.is_from_fork(pr));
+    }
     let count = (pulls.len(), view.pulls.items.len());
     let url = repo.pulls_url();
     let top = ui.cursor().top();
@@ -108,7 +172,7 @@ fn lists(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, shown: &Shown, act
         .collect();
     let count = (issues.len(), view.issues.items.len());
     let url = repo.issues_url();
-    if header(ui, tab, shown, (service.issues_title(), icons::RADIO_BUTTON, &url), count, false, act) {
+    if service.has_issues() && header(ui, tab, shown, (service.issues_title(), icons::RADIO_BUTTON, &url), count, false, act) {
         notice(ui, shown, &view.issues, act);
         for issue in issues {
             issue_row(ui, shown, issue, act);
@@ -143,7 +207,9 @@ fn pull_icon(service: Service) -> &'static str {
 /// pointer is on it, and the branch is returned on the frame it is dropped.
 fn drop_target(ui: &Ui, snap: &RepoSnapshot, shown: &Shown, rect: Rect) -> Option<Branch> {
     let session = drag::session(ui.ctx())?;
-    if !crate::ui::new_pull::accepts(snap, &shown.remote, session.branch()) {
+    // Pull requests are opened from the fork, whichever list is shown.
+    let remote = shown.family.as_ref().map_or(&shown.remote, |family| &family.fork_remote);
+    if !crate::ui::new_pull::accepts(snap, remote, session.branch()) {
         return None;
     }
     let clipped = rect.intersect(ui.clip_rect());
@@ -406,11 +472,12 @@ fn item_row(
 }
 
 /// The local branch a pull request is available as: the one "Check out"
-/// creates, or its own head branch when it comes from this repository.
+/// creates, or its own head branch when it comes from this repository (or,
+/// in a fork's parent, from the fork).
 fn local_branch<'a>(snap: &'a RepoSnapshot, shown: &Shown, pr: &PullRequest) -> Option<&'a BranchInfo> {
     let checked_out = hosting::pull_branch(shown.repo.service, pr.number);
     snap.branches.iter().find(|branch| branch.name == checked_out).or_else(|| {
-        let own = pr.is_from(&shown.repo);
+        let own = pr.is_from(&shown.repo) || shown.family.as_ref().is_some_and(|family| family.is_from_fork(pr));
         snap.branches.iter().find(|branch| own && branch.name == pr.head_ref)
     })
 }
@@ -462,8 +529,13 @@ fn fork_line(service: Service, shown: &Shown, pr: &PullRequest) -> Option<String
     if pr.is_from(&shown.repo) {
         return None;
     }
+    // The fork this clone's remote points at, in its parent's list.
+    let ours = shown.family.as_ref().filter(|family| family.is_from_fork(pr));
     Some(match (&pr.head_repo, service.is_gitlab()) {
-        (Some(fork), _) => format!("From the fork {fork}"),
+        (Some(fork), _) => match ours {
+            Some(family) => format!("From the fork {fork} ({})", family.fork_remote),
+            None => format!("From the fork {fork}"),
+        },
         // GitHub names every fork it still has.
         (None, false) => "From a fork that was deleted".to_owned(),
         (None, true) => "From a fork".to_owned(),
@@ -495,7 +567,9 @@ fn pull_row(ui: &mut Ui, snap: &RepoSnapshot, shown: &Shown, pr: &PullRequest, a
         marks.push(("Draft", 11.0, theme::text_dim()));
     }
     if fork.is_some() {
-        marks.push((icons::GIT_FORK, 12.5, theme::text_dim()));
+        // The fork's own stand out in its parent's list.
+        let ours = shown.family.as_ref().is_some_and(|family| family.is_from_fork(pr));
+        marks.push((icons::GIT_FORK, 12.5, if ours { theme::accent() } else { theme::text_dim() }));
     }
     let number = service.pull_number(pr.number);
     let response = item_row(

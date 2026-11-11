@@ -304,8 +304,18 @@ pub fn route(
     }
 }
 
+/// The open lists the dialog knows, each with its repository: the one a
+/// remote points at, and its parent's while the sidebar shows that.
+type Lists = Vec<(RepoId, Vec<PullRequest>)>;
+
+/// [`existing`] in whichever of `lists` the pull request would go into,
+/// with that repository.
+fn existing_in<'a>(lists: &'a Lists, route: &Route, head: &str, base: &str) -> Option<(&'a RepoId, &'a PullRequest)> {
+    lists.iter().find_map(|(repo, open)| Some((repo, existing(open, repo, route, head, base)?)))
+}
+
 /// The open pull request that already does what `head` into `base` along
-/// `route` would, among `open` (the list of the repository shown, so only
+/// `route` would, among `open` (the list of the repository `shown`, so only
 /// when that is where it goes).
 pub fn existing<'a>(open: &'a [PullRequest], shown: &RepoId, route: &Route, head: &str, base: &str) -> Option<&'a PullRequest> {
     if !route.into.same(shown) {
@@ -605,7 +615,7 @@ impl NewPullForm {
 
     /// Why there is no pull request to open for this pair, if there is not:
     /// neither Create nor the service's own form can help.
-    fn blocker(&self, snap: &RepoSnapshot, open: &[PullRequest]) -> Option<String> {
+    fn blocker(&self, snap: &RepoSnapshot, lists: &Lists) -> Option<String> {
         let route = self.route(snap);
         let plan = push_plan(&snap.branches, &snap.remote_branches, &route.push, &self.head);
         if self.base.is_empty() {
@@ -614,7 +624,7 @@ impl NewPullForm {
         if plan.head == self.base && route.from.same(&route.into) {
             return Some(format!("{} cannot be merged into itself: pick another branch.", self.base));
         }
-        if let Some(existing) = existing(open, &self.repo, &route, &plan.head, &self.base) {
+        if let Some((_, existing)) = existing_in(lists, &route, &plan.head, &self.base) {
             return Some(format!(
                 "{} {} already merges {} into {}.",
                 self.repo.service.pull_word_title(),
@@ -779,7 +789,9 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
     }
     let shown = tab.hosting.connected();
-    let open_pulls: Vec<PullRequest> = shown.as_ref().map(|shown| shown.view.pulls.items.clone()).unwrap_or_default();
+    let mut lists: Lists = Vec::new();
+    lists.extend(shown.as_ref().map(|shown| (shown.repo.clone(), shown.view.pulls.items.clone())));
+    lists.extend(tab.hosting.parent_shown().map(|parent| (parent.repo, parent.view.pulls.items.clone())));
     let auth = shown.as_ref().map(|shown| shown.view.auth).unwrap_or_default();
     if !form.busy() {
         let parent = shown.as_ref().and_then(|shown| shown.view.parent.clone());
@@ -865,11 +877,11 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
     });
 
     // Whatever stands in the way, or went wrong, or is happening now.
-    let blocker = form.blocker(&snap, &open_pulls);
+    let blocker = form.blocker(&snap, &lists);
     let untitled = form.title.trim().is_empty();
     // Known to have no usable sign-in: Create would only be refused.
     let signed_out = matches!(auth, hosting::Auth::Anonymous | hosting::Auth::Rejected);
-    let existing = existing(&open_pulls, &form.repo, &route, &plan.head, &form.base);
+    let existing = existing_in(&lists, &route, &plan.head, &form.base);
     let site = form.target().repo.site();
     ui.add_space(2.0);
     let mut check_again = false;
@@ -902,8 +914,9 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
         }
     }
     if check_again {
-        // A manual refresh looks for a sign-in again.
-        tab.hosting.refresh();
+        // A manual refresh looks for a sign-in again (of the repository the
+        // pull request is opened through, whichever the sidebar shows).
+        tab.hosting.refresh_connected();
     }
 
     // Buttons: the browser on the left, Cancel and Create on the right.
@@ -912,8 +925,8 @@ pub fn show(ui: &mut Ui, form: &mut NewPullForm, shared: &mut Shared, tab: Optio
     let ready = blocker.is_none() && !untitled && !signed_out && !form.busy();
     ui.horizontal(|ui| {
         match existing {
-            Some(pull) => {
-                let url = form.repo.pull_url(pull.number);
+            Some((into, pull)) => {
+                let url = into.pull_url(pull.number);
                 let label = format!("{}  Open {}", icons::ARROW_SQUARE_OUT, form.repo.service.pull_number(pull.number));
                 let button = Button::new(label).min_size(vec2(0.0, 28.0));
                 if ui.add(button).on_hover_text(&url).clicked() {

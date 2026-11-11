@@ -39,9 +39,15 @@
 //!
 //! After the three lists, each round asks the backend for [`Details`]:
 //! review states, the forks pull requests come from and the repository's
-//! parent, only for what changed since it last asked. A self-managed
-//! server may be installed under a path (`example.com/gitlab`); that is
-//! then its name in [`Servers`] and [`RepoId::host`].
+//! parent, only for what changed since it last asked ([`Reviews`] keeps
+//! what was learnt). A self-managed server may be installed under a path
+//! (`example.com/gitlab`); that is then its name in [`Servers`] and
+//! [`RepoId::host`].
+//!
+//! When the repository is a fork whose parent is known ([`parent_of`]),
+//! the sidebar can show the parent's lists instead ([`Family`]): a second
+//! session follows the parent, and only the session shown refreshes by
+//! itself.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -133,6 +139,13 @@ impl Service {
     /// branch ([`checkout_pull_request`]).
     pub fn has_pull_refs(self) -> bool {
         !matches!(self, Service::Bitbucket | Service::AzureDevOps)
+    }
+
+    /// Whether the service has an issue tracker to list. Bitbucket Cloud
+    /// removed its own on 20 August 2026 (its endpoints answer 410 Gone),
+    /// so nothing is asked and the sidebar has no section for it.
+    pub fn has_issues(self) -> bool {
+        self != Service::Bitbucket
     }
 
     /// Sidebar title of the issue section: Azure DevOps has work items.
@@ -461,6 +474,14 @@ impl RepoId {
     pub fn same(&self, other: &RepoId) -> bool {
         self.service == other.service && self.host == other.host && self.slug().eq_ignore_ascii_case(&other.slug())
     }
+
+    /// The repository's address for git over HTTPS, built from its
+    /// validated parts: what a fork's parent is fetched from when no remote
+    /// points at it. `None` on Azure DevOps, whose names may need escapes
+    /// (and which never names a parent, see [`RepoId::sibling`]).
+    pub fn clone_url(&self) -> Option<String> {
+        (self.service != Service::AzureDevOps).then(|| format!("https://{}/{}.git", self.host, self.slug()))
+    }
 }
 
 /// One part of a repository path: letters, digits, `-`, `_` and `.`, and
@@ -735,6 +756,24 @@ pub fn related(remotes: &[RemoteInfo], servers: &Servers, repo: &RepoId) -> Vec<
     found
 }
 
+/// The repository `repo` is a fork of, with the remote that points at it
+/// when one does: the parent the service named, else the repository a
+/// remote called `upstream` points at (on the same server, see
+/// [`related`]). `None` when neither says.
+pub fn parent_of(
+    repo: &RepoId,
+    named: Option<&Parent>,
+    remotes: &[RemoteInfo],
+    servers: &Servers,
+) -> Option<(RepoId, Option<String>)> {
+    let related = related(remotes, servers, repo);
+    let remote_for = |target: &RepoId| related.iter().find(|(_, other)| other.same(target)).map(|(name, _)| name.clone());
+    match named {
+        Some(parent) => Some((parent.repo.clone(), remote_for(&parent.repo))),
+        None => related.iter().find(|(name, _)| name == "upstream").map(|(name, upstream)| (upstream.clone(), Some(name.clone()))),
+    }
+}
+
 /// A remote on a server that may run GitHub Enterprise, GitLab, Gitea or
 /// Forgejo.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -831,8 +870,9 @@ impl PullRequest {
 /// decision, or what a GitLab merge request's approvals come to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Review {
-    /// Not known: not asked (GitHub without a sign-in), not answered yet,
-    /// or a service that does not say. Nothing is shown for it.
+    /// Not known: not asked yet (a few pull requests a round, on GitHub
+    /// without a sign-in), not answered, or a service that does not say.
+    /// Nothing is shown for it.
     #[default]
     Unknown,
     /// Nobody has approved it or asked for changes, and no rule requires it.
@@ -882,6 +922,65 @@ pub struct Parent {
     /// Its default branch: where a pull request into it merges unless told
     /// otherwise. Empty when the service did not say.
     pub default_branch: String,
+}
+
+/// What a backend that asks about review states one round after another
+/// keeps of them (GitHub, Gitea and Forgejo): the open pull requests of the
+/// last list, and what was learnt of each, as of the `updated_at` it was
+/// asked at. A pull request is asked about again once it has changed (a
+/// review, a push or a comment moves its `updated_at`), or after a refresh
+/// by hand; meanwhile what is known stays on show.
+#[derive(Debug, Default)]
+pub struct Reviews {
+    /// Number and `updated_at` of each pull request of the last list.
+    listed: Vec<(u64, i64)>,
+    /// By number: the `updated_at` asked at, and what came of it.
+    known: BTreeMap<u64, (i64, Review, Option<Approvals>)>,
+}
+
+impl Reviews {
+    /// Takes note of a fresh list, and fills in what is known of its pull
+    /// requests so the list does not lose it. Pull requests no longer
+    /// listed (merged, closed) are forgotten.
+    pub fn listed(&mut self, items: &mut [PullRequest]) {
+        self.listed = items.iter().map(|pull| (pull.number, pull.updated)).collect();
+        self.known.retain(|number, _| items.iter().any(|pull| pull.number == *number));
+        for pull in items {
+            if let Some((_, review, approvals)) = self.known.get(&pull.number) {
+                pull.review = *review;
+                pull.approvals = *approvals;
+            }
+        }
+    }
+
+    /// Up to `limit` pull requests of the last list whose reviews are not
+    /// known as of their last change, in list order (the most recently
+    /// updated first): number and `updated_at`.
+    pub fn stale(&self, limit: usize) -> Vec<(u64, i64)> {
+        self.listed
+            .iter()
+            .filter(|(number, updated)| self.known.get(number).is_none_or(|(asked, ..)| asked != updated))
+            .take(limit)
+            .copied()
+            .collect()
+    }
+
+    /// Keeps what was learnt of `number` as of `updated`. Returns the pull
+    /// request for [`Details::pulls`] when that is not what was shown so
+    /// far ([`Review::Unknown`] before it was ever asked).
+    pub fn learnt(&mut self, number: u64, updated: i64, review: Review, approvals: Option<Approvals>) -> Option<PullRequest> {
+        let before = self.known.insert(number, (updated, review, approvals));
+        let shown = before.map_or((Review::Unknown, None), |(_, was, had)| (was, had));
+        (shown != (review, approvals)).then(|| PullRequest { number, review, approvals, ..Default::default() })
+    }
+
+    /// Every pull request is asked about again (the user refreshed),
+    /// showing what is known until the answer comes.
+    pub fn ask_again(&mut self) {
+        for (asked, ..) in self.known.values_mut() {
+            *asked = i64::MIN;
+        }
+    }
 }
 
 /// A pull request between two repositories of the same service: from a
@@ -1777,8 +1876,8 @@ fn explain(error: ureq::Error) -> String {
 /// A request is answered with `<endpoint>.json`, after the last part of its
 /// path: `pulls`, `issues` and `runs` on GitHub, Gitea and Forgejo (`tasks`
 /// for runs on servers older than the runs endpoint), `merge_requests`,
-/// `issues` and `pipelines` on GitLab, `pullrequests`, `issues` and
-/// `pipelines` on Bitbucket, and `pullrequests`, `wiql` (the work item
+/// `issues` and `pipelines` on GitLab, `pullrequests` and `pipelines` on
+/// Bitbucket (which has no issues any more), and `pullrequests`, `wiql` (the work item
 /// query), `workitems`, `builds` and `repositories` on Azure DevOps. An
 /// optional `<endpoint>.head` gives a status
 /// code on its first line and `name: value` headers after it, which is how
@@ -1792,10 +1891,16 @@ fn explain(error: ureq::Error) -> String {
 /// the list can be seen to pick it up.
 ///
 /// What [`Backend::details`] asks comes from more files: GitHub's GraphQL
-/// (review decisions) from `graphql.json`, its repository (a fork's parent)
-/// from `repo.json`; on GitLab a merge request's approvals from
+/// (review decisions) from `graphql.json`, the repository (a fork's parent)
+/// from `repo.json` on GitHub, Gitea, Forgejo and Bitbucket, and one pull
+/// request's reviews (GitHub without a sign-in, Gitea and Forgejo) from
+/// `reviews-<number>.json`; on GitLab a merge request's approvals from
 /// `approvals-<iid>.json`, the project (its parent) from `project.json` and
 /// another project by id (a fork) from `project-<id>.json`.
+///
+/// A repository with a folder of its own, `<dir>/<owner>/<name>` (a fork's
+/// parent, say), is answered from there instead; `signed-in` is read from
+/// `<dir>` whichever it is.
 struct Canned {
     dir: PathBuf,
     created: bool,
@@ -1865,13 +1970,25 @@ impl Transport for Canned {
 /// [`Backend::details`], if `path` is one: see [`Canned`].
 fn detail_fixture(path: &str) -> Option<String> {
     let parts: Vec<&str> = path.split('/').collect();
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
     match parts.as_slice() {
         [.., "merge_requests", iid, "approvals"] => Some(format!("approvals-{iid}")),
-        [.., "projects", id] if id.bytes().all(|b| b.is_ascii_digit()) => Some(format!("project-{id}")),
+        [.., "pulls", number, "reviews"] if digits(number) => Some(format!("reviews-{number}")),
+        [.., "projects", id] if digits(id) => Some(format!("project-{id}")),
         [.., "projects", _] => Some("project".to_owned()),
         [.., "repos", _, _] => Some("repo".to_owned()),
+        // Bitbucket's repository; Azure DevOps has `repositories/<id>/...`
+        // below its own `_apis/git`, never below `2.0`.
+        [.., "2.0", "repositories", _, _] => Some("repo".to_owned()),
         _ => None,
     }
+}
+
+/// The fixture folder answering for `repo`: its own `<dir>/<owner>/<name>`
+/// when there is one (see [`Canned`]), else `dir`.
+fn fixture_dir(dir: &Path, repo: &RepoId) -> PathBuf {
+    let own = repo.owner.split('/').fold(dir.to_path_buf(), |path, part| path.join(part)).join(&repo.name);
+    if own.is_dir() { own } else { dir.to_path_buf() }
 }
 
 // ---- rate limits and backoff ----------------------------------------------
@@ -1938,6 +2055,9 @@ pub struct Limiter {
     until: Option<u64>,
     /// Consecutive rate-limit refusals.
     strikes: u32,
+    /// Requests left in the window and when the window resets, as the last
+    /// answer that said both told.
+    left: Option<(u64, u64)>,
 }
 
 impl Limiter {
@@ -1946,9 +2066,18 @@ impl Limiter {
         self.until.filter(|until| *until > now)
     }
 
+    /// How many requests are left in the current window, as the service
+    /// last said, while that window lasts; `None` when it did not say.
+    pub fn left(&self, now: u64) -> Option<u64> {
+        self.left.filter(|(_, reset)| *reset > now).map(|(left, _)| left)
+    }
+
     /// Takes note of a response. Returns the time to stay away until when
     /// the response was a rate-limit refusal.
     pub fn record(&mut self, status: u16, rate: &Rate, message: &str, now: u64) -> Option<u64> {
+        if let (Some(remaining), Some(reset)) = (rate.remaining, rate.reset) {
+            self.left = Some((remaining, reset));
+        }
         if let Some(until) = limited_until(status, rate, message, self.strikes, now) {
             self.strikes += 1;
             self.until = Some(until);
@@ -2041,7 +2170,7 @@ fn connect(repo: &RepoId, workdir: &Path, signed_out: bool) -> Box<dyn Backend> 
                 let dir = PathBuf::from(dir);
                 let secrets: Box<dyn Secrets> =
                     if dir.join("signed-in").exists() { Box::new(FixtureSignIn) } else { Box::new(NoSecrets) };
-                (Box::new(Canned { dir, created: false }), secrets)
+                (Box::new(Canned { dir: fixture_dir(&dir, repo), created: false }), secrets)
             }
             None => (Box::new(Wire::new(repo.api_base(), headers(repo.service))), Box::new(System::new(workdir))),
         };
@@ -2215,14 +2344,44 @@ fn worker(
 // ---- per-tab state --------------------------------------------------------
 
 /// What the sidebar needs for one frame.
+#[derive(Clone)]
 pub struct Shown {
-    /// Name of the remote the repository was found through.
+    /// Where the repository's pull requests are fetched from: the remote it
+    /// was found through, or for a fork's parent ([`Family`]) the remote that
+    /// points at the parent, else the parent's address
+    /// ([`RepoId::clone_url`]).
     pub remote: String,
     pub repo: RepoId,
     pub view: Arc<View>,
     /// The account on the repository's host is disconnected ([`Disconnected`]):
     /// no sign-in is used, whatever is found.
     pub disconnected: bool,
+    /// The repository a remote points at is a fork whose parent is known:
+    /// the sidebar can show the lists of either, and this says which these
+    /// are.
+    pub family: Option<Family>,
+}
+
+/// A fork and its parent ([`parent_of`]), between which the sidebar
+/// switches.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Family {
+    /// The repository the remote points at, and that remote: what pull
+    /// requests are opened from ([`HostingState::connected`]).
+    pub fork: RepoId,
+    pub fork_remote: String,
+    pub parent: RepoId,
+    /// The remote that points at the parent, if one does.
+    pub parent_remote: Option<String>,
+    /// The lists shown are the parent's.
+    pub parent_shown: bool,
+}
+
+impl Family {
+    /// Whether `pr`, of the parent's list, comes from a branch of the fork.
+    pub fn is_from_fork(&self, pr: &PullRequest) -> bool {
+        pr.is_from(&self.fork)
+    }
 }
 
 /// A running integration: one repository, one background thread.
@@ -2240,8 +2399,11 @@ struct Session {
     /// Answers to those, until collected with [`HostingState::take_created`].
     created: Vec<(u64, Result<PullRequest, Problem>)>,
     /// Those of `creating` opened in another repository (a fork's parent),
-    /// which this list does not show.
-    elsewhere: Vec<u64>,
+    /// which this list does not show, with that repository.
+    elsewhere: Vec<(u64, RepoId)>,
+    /// Pull requests opened in another repository and the repository, for
+    /// [`HostingState`] to hand to the session showing it.
+    opened_elsewhere: Vec<(RepoId, PullRequest)>,
     last_id: u64,
     /// A pull request was opened during a refresh round: refresh once more
     /// when it ends, so the list has it for certain.
@@ -2282,6 +2444,7 @@ impl Session {
             creating: Vec::new(),
             created: Vec::new(),
             elsewhere: Vec::new(),
+            opened_elsewhere: Vec::new(),
             last_id: 0,
             refresh_after: false,
             signed_out: false,
@@ -2290,19 +2453,40 @@ impl Session {
         session
     }
 
+    fn shown(&self, family: Option<Family>) -> Shown {
+        Shown {
+            remote: self.remote.clone(),
+            repo: self.repo.clone(),
+            view: self.view.clone(),
+            disconnected: self.signed_out,
+            family,
+        }
+    }
+
     fn create(&mut self, new: NewPull, across: Option<Across>) -> u64 {
         self.last_id += 1;
         let id = self.last_id;
-        let elsewhere = across.as_ref().is_some_and(|across| !across.into.same(&self.repo));
+        let elsewhere = across.as_ref().map(|across| across.into.clone()).filter(|into| !into.same(&self.repo));
         if self.orders.send(Order::CreatePull { id, new, across: across.map(Box::new) }).is_ok() {
             self.creating.push(id);
-            if elsewhere {
-                self.elsewhere.push(id);
+            if let Some(into) = elsewhere {
+                self.elsewhere.push((id, into));
             }
         } else {
             self.created.push((id, Err(stopped_problem())));
         }
         id
+    }
+
+    /// A pull request opened in this repository from another session (a
+    /// fork's, into this parent): listed at once, and confirmed by a
+    /// refresh once the current round, if any, is over.
+    fn take_in(&mut self, pull: PullRequest) {
+        let view = Arc::make_mut(&mut self.view);
+        if !view.pulls.items.iter().any(|known| known.number == pull.number) {
+            view.pulls.items.insert(0, pull);
+        }
+        self.refresh_after = true;
     }
 
     fn request(&mut self, manual: bool) {
@@ -2345,14 +2529,18 @@ impl Session {
                         }
                         Event::Created { id, result } => {
                             self.creating.retain(|pending| *pending != id);
-                            let listed = !self.elsewhere.contains(&id);
-                            self.elsewhere.retain(|other| *other != id);
-                            if let (Ok(pull), true) = (&result, listed) {
-                                // Listed at once; the refresh below confirms it.
-                                if !view.pulls.items.iter().any(|known| known.number == pull.number) {
-                                    view.pulls.items.insert(0, pull.clone());
+                            let elsewhere = self.elsewhere.iter().position(|(other, _)| *other == id);
+                            let elsewhere = elsewhere.map(|index| self.elsewhere.remove(index).1);
+                            match (&result, elsewhere) {
+                                (Ok(pull), None) => {
+                                    // Listed at once; the refresh below confirms it.
+                                    if !view.pulls.items.iter().any(|known| known.number == pull.number) {
+                                        view.pulls.items.insert(0, pull.clone());
+                                    }
+                                    self.refresh_after = true;
                                 }
-                                self.refresh_after = true;
+                                (Ok(pull), Some(into)) => self.opened_elsewhere.push((into, pull.clone())),
+                                (Err(_), _) => {}
                             }
                             self.created.push((id, result));
                         }
@@ -2391,6 +2579,15 @@ impl Session {
             self.request(false);
         }
     }
+
+    /// Takes in what the thread produced and, when `attended` and due,
+    /// starts the next automatic refresh.
+    fn tick(&mut self, attended: bool) {
+        self.poll();
+        if attended && self.next_auto.is_some_and(|due| Instant::now() >= due) {
+            self.request(false);
+        }
+    }
 }
 
 fn stopped_problem() -> Problem {
@@ -2398,22 +2595,35 @@ fn stopped_problem() -> Problem {
 }
 
 /// Per-repository hosting state, owned by the tab.
+///
+/// One session follows the repository a remote points at ([`detect`]).
+/// When that is a fork and the user switched the sidebar to its parent
+/// ([`Family`]), a second session follows the parent; only the session
+/// shown refreshes by itself, and the other waits, its lists kept, until it
+/// is shown again. Pull requests are always opened through the first one.
 #[derive(Default)]
 pub struct HostingState {
     session: Option<Session>,
+    /// The parent of the repository `session` follows, once the sidebar has
+    /// been switched to it.
+    parent: Option<Session>,
+    /// The fork and its parent as of the last [`HostingState::sync`].
+    family: Option<Family>,
 }
 
 impl HostingState {
     /// Called every frame the sidebar is drawn, which is only for the active
     /// tab. Starts the integration the first time a hosted remote is seen,
-    /// takes in whatever the background thread has produced, and asks for a
-    /// refresh when one is due.
+    /// takes in whatever the background threads have produced, and asks for
+    /// a refresh when one is due.
     ///
     /// Returns `None`, having made no request, when the integration is
     /// switched off or no remote points at a known service: github.com,
     /// gitlab.com, or a server in `servers` the user said runs GitHub
     /// Enterprise or GitLab. A repository on a host in `disconnected` is
-    /// shown without a sign-in.
+    /// shown without a sign-in. With `show_parent`, a fork whose parent is
+    /// known is shown as its parent ([`Family`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn sync(
         &mut self,
         ctx: &egui::Context,
@@ -2422,6 +2632,7 @@ impl HostingState {
         servers: &Servers,
         disconnected: &Disconnected,
         enabled: bool,
+        show_parent: bool,
     ) -> Option<Shown> {
         let wake = {
             let ctx = ctx.clone();
@@ -2430,13 +2641,92 @@ impl HostingState {
         // Only poll while someone is looking at the window.
         let attended = ctx.input(|input| input.focused);
         let connect = |repo: &RepoId, signed_out: bool| connect(repo, workdir, signed_out);
-        let shown = self.sync_accounts(remotes, servers, disconnected, enabled, attended, connect, wake);
-        if let Some(due) = self.session.as_ref().and_then(|session| session.next_auto)
+        let shown =
+            self.sync_family(remotes, servers, disconnected, (enabled, attended, show_parent), connect, wake);
+        if let Some(due) = self.shown_session().and_then(|session| session.next_auto)
             && attended
         {
             ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
         }
         shown
+    }
+
+    /// The session whose lists the sidebar shows.
+    fn shown_session(&self) -> Option<&Session> {
+        match (&self.family, &self.parent) {
+            (Some(family), Some(parent)) if family.parent_shown => Some(parent),
+            _ => self.session.as_ref(),
+        }
+    }
+
+    /// [`HostingState::sync_accounts`] for the repository a remote points
+    /// at, then, when it is a fork with a known parent, the [`Family`]; with
+    /// `show_parent` the parent's session (started the first time) is the
+    /// one shown and refreshed, the fork's only taken in. `connect` is told
+    /// which repository and whether to sign in.
+    fn sync_family(
+        &mut self,
+        remotes: &[RemoteInfo],
+        servers: &Servers,
+        disconnected: &Disconnected,
+        (enabled, attended, show_parent): (bool, bool, bool),
+        mut connect: impl FnMut(&RepoId, bool) -> Box<dyn Backend>,
+        wake: impl Fn() + Clone + Send + 'static,
+    ) -> Option<Shown> {
+        // The fork waits while its parent is shown.
+        let fork_waits = show_parent && self.family.is_some();
+        let own = self.sync_accounts(
+            remotes,
+            servers,
+            disconnected,
+            enabled,
+            attended && !fork_waits,
+            &mut connect,
+            wake.clone(),
+        );
+        let found = own.as_ref().and_then(|own| parent_of(&own.repo, own.view.parent.as_ref(), remotes, servers));
+        let (Some(own), Some((parent, parent_remote))) = (own.clone(), found) else {
+            // Not hosted, or no fork (any more): dropping the session stops
+            // its thread.
+            self.parent = None;
+            self.family = None;
+            return own;
+        };
+        let family = Family {
+            fork: own.repo.clone(),
+            fork_remote: own.remote.clone(),
+            parent,
+            parent_remote,
+            parent_shown: show_parent,
+        };
+        self.family = Some(family.clone());
+
+        let signed_out = disconnected.contains(&family.parent.host);
+        let stale = |session: &Session| !session.repo.same(&family.parent) || session.signed_out != signed_out;
+        if self.parent.as_ref().is_some_and(stale) {
+            self.parent = None;
+        }
+        if show_parent && self.parent.is_none() {
+            let backend = connect(&family.parent, signed_out);
+            let mut session = Session::start(String::new(), family.parent.clone(), backend, wake);
+            session.signed_out = signed_out;
+            self.parent = Some(session);
+        }
+        // Pull requests opened from the fork into the parent: on its list
+        // at once.
+        let opened = self.session.as_mut().map(|session| std::mem::take(&mut session.opened_elsewhere));
+        let Some(session) = self.parent.as_mut() else { return Some(own.shown_with(family)) };
+        for (into, pull) in opened.unwrap_or_default() {
+            if into.same(&session.repo) {
+                session.take_in(pull);
+            }
+        }
+        session.remote = family.parent_remote.clone().or_else(|| family.parent.clone_url()).unwrap_or_default();
+        session.tick(attended && show_parent);
+        Some(match show_parent {
+            true => session.shown(Some(family)),
+            false => own.shown_with(family),
+        })
     }
 
     /// [`HostingState::sync_with`], in step with the accounts disconnected
@@ -2504,43 +2794,52 @@ impl HostingState {
         }
         let session = self.session.as_mut()?;
         session.remote = remote;
-        session.poll();
-        if attended && session.next_auto.is_some_and(|due| Instant::now() >= due) {
-            session.request(false);
-        }
-        Some(Shown {
-            remote: session.remote.clone(),
-            repo: session.repo.clone(),
-            view: session.view.clone(),
-            disconnected: session.signed_out,
-        })
+        session.tick(attended);
+        Some(session.shown(None))
     }
 
-    /// Refreshes now, at the user's request.
+    /// Refreshes the lists shown now, at the user's request.
     pub fn refresh(&mut self) {
+        let parent_shown = self.family.as_ref().is_some_and(|family| family.parent_shown);
+        match (&mut self.parent, &mut self.session) {
+            (Some(parent), _) if parent_shown => parent.request(true),
+            (_, Some(session)) => session.request(true),
+            _ => {}
+        }
+    }
+
+    /// Refreshes the repository [`HostingState::connected`] is about (where
+    /// pull requests are opened from), whichever the sidebar shows: a
+    /// refresh by hand looks for a sign-in again.
+    pub fn refresh_connected(&mut self) {
         if let Some(session) = &mut self.session {
             session.request(true);
         }
     }
 
     /// The remote and hosted repository the integration is running for, if
-    /// it is: what "Create pull request" works with.
+    /// it is: what "Create pull request" works with. For a fork, the fork,
+    /// whichever the sidebar shows ([`Shown::family`] says).
     pub fn connected(&self) -> Option<Shown> {
-        let session = self.session.as_ref()?;
-        Some(Shown {
-            remote: session.remote.clone(),
-            repo: session.repo.clone(),
-            view: session.view.clone(),
-            disconnected: session.signed_out,
-        })
+        Some(self.session.as_ref()?.shown(self.family.clone()))
     }
 
-    /// Takes in what the background thread has produced, without the rest
-    /// of [`HostingState::sync`]: for views that wait on an answer while the
-    /// sidebar may be hidden.
+    /// The parent's session as last shown, when the sidebar shows the
+    /// parent of a fork: its open pull requests, say.
+    pub fn parent_shown(&self) -> Option<Shown> {
+        let family = self.family.clone().filter(|family| family.parent_shown)?;
+        Some(self.parent.as_ref()?.shown(Some(family)))
+    }
+
+    /// Takes in what the background threads have produced, without the
+    /// rest of [`HostingState::sync`]: for views that wait on an answer
+    /// while the sidebar may be hidden.
     pub fn poll(&mut self) {
         if let Some(session) = &mut self.session {
             session.poll();
+        }
+        if let Some(parent) = &mut self.parent {
+            parent.poll();
         }
     }
 
@@ -2553,7 +2852,8 @@ impl HostingState {
 
     /// [`HostingState::create_pull`] between two repositories: from a fork
     /// into its parent. Answered the same way; a pull request opened in a
-    /// repository other than the one shown is not added to its list.
+    /// repository other than the one shown is not added to its list, but to
+    /// the parent's when that has a session.
     pub fn create_pull_across(&mut self, new: NewPull, across: Across) -> Option<u64> {
         Some(self.session.as_mut()?.create(new, Some(across)))
     }
@@ -2562,7 +2862,16 @@ impl HostingState {
     pub fn take_created(&mut self, id: u64) -> Option<Result<PullRequest, Problem>> {
         let session = self.session.as_mut()?;
         let index = session.created.iter().position(|(done, _)| *done == id)?;
-        Some(session.created.remove(index).1)
+        let answer = session.created.remove(index).1;
+        // Opened into the parent: its list has it at once, sidebar or not.
+        if let Some(parent) = &mut self.parent {
+            for (into, pull) in std::mem::take(&mut session.opened_elsewhere) {
+                if into.same(&parent.repo) {
+                    parent.take_in(pull);
+                }
+            }
+        }
+        Some(answer)
     }
 
     /// Whether the answer to [`HostingState::create_pull`] is still on its
@@ -2570,6 +2879,13 @@ impl HostingState {
     /// answer will never come.
     pub fn is_creating(&self, id: u64) -> bool {
         self.session.as_ref().is_some_and(|session| session.creating.contains(&id))
+    }
+}
+
+impl Shown {
+    /// This repository's lists, as one of a [`Family`].
+    fn shown_with(self, family: Family) -> Shown {
+        Shown { family: Some(family), ..self }
     }
 }
 

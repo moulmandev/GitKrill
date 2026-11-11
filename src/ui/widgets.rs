@@ -250,10 +250,40 @@ pub fn segmented(ui: &mut Ui, value: &mut bool, first: (&str, &str), second: (&s
     let (w1, w2) = (measure(ui, first), measure(ui, second));
     let (rect, _) = ui.allocate_exact_size(vec2(w1 + w2, 24.0), Sense::hover());
     let halves = [
-        (Rect::from_min_size(rect.min, vec2(w1, rect.height())), first, false),
-        (Rect::from_min_size(rect.min + vec2(w1, 0.0), vec2(w2, rect.height())), second, true),
+        (Rect::from_min_size(rect.min, vec2(w1, rect.height())), first),
+        (Rect::from_min_size(rect.min + vec2(w1, 0.0), vec2(w2, rect.height())), second),
     ];
-    for (half, (icon, label), is_second) in halves {
+    segments(ui, value, halves);
+}
+
+/// [`segmented`] across the whole width in two equal halves, labels cut
+/// short when they do not fit, for a narrow panel. `tips` say what each half
+/// stands for. Returns whether a click changed `value`.
+pub fn segmented_wide(
+    ui: &mut Ui,
+    value: &mut bool,
+    first: (&str, &str),
+    second: (&str, &str),
+    tips: [&str; 2],
+) -> bool {
+    let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 24.0), Sense::hover());
+    let half = vec2(rect.width() / 2.0, rect.height());
+    let halves = [(Rect::from_min_size(rect.min, half), first), (Rect::from_min_size(rect.min + vec2(half.x, 0.0), half), second)];
+    let (changed, responses) = segments(ui, value, halves);
+    for (response, tip) in responses.into_iter().zip(tips) {
+        response.on_hover_text(tip);
+    }
+    changed
+}
+
+/// Paints the two halves of a segmented toggle and takes their clicks:
+/// whether `value` changed, and each half's response.
+fn segments(ui: &mut Ui, value: &mut bool, halves: [(Rect, (&str, &str)); 2]) -> (bool, Vec<Response>) {
+    let font = theme::font(12.0);
+    let mut changed = false;
+    let mut responses = Vec::new();
+    for (index, (half, (icon, label))) in halves.into_iter().enumerate() {
+        let is_second = index == 1;
         let response = ui.interact(half, ui.id().with((label, "segment")), Sense::click());
         let active = *value == is_second;
         let fill = if active {
@@ -268,18 +298,19 @@ pub fn segmented(ui: &mut Ui, value: &mut bool, first: (&str, &str), second: (&s
         } else {
             egui::CornerRadius { nw: 3, sw: 3, ne: 0, se: 0 }
         };
-        ui.painter().rect_filled(half, radius, fill);
-        ui.painter().text(
-            half.center(),
-            Align2::CENTER_CENTER,
-            format!("{icon} {label}"),
-            font.clone(),
-            if active { theme::text_bright() } else { theme::text_dim() },
-        );
-        if response.clicked() {
+        let color = if active { theme::text_bright() } else { theme::text_dim() };
+        let painter = ui.painter();
+        painter.rect_filled(half, radius, fill);
+        let galley = elided(painter, &format!("{icon} {label}"), font.clone(), color, half.width() - 12.0);
+        let at = half.center() - galley.size() / 2.0;
+        painter.galley(pos2(at.x.round(), at.y.round()), galley, color);
+        if response.clicked() && !active {
             *value = is_second;
+            changed = true;
         }
+        responses.push(response);
     }
+    (changed, responses)
 }
 
 /// The title bar shared by full-size overlays: an icon, a title, a dimmer

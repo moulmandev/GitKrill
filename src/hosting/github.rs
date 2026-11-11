@@ -226,6 +226,13 @@ pub fn graphql_url(api: &str) -> String {
 /// Review states asked at most per request; as many as a list holds.
 const REVIEWS_AT_ONCE: usize = 30;
 
+/// Without a sign-in, the pull requests whose reviews are asked at most per
+/// round (one request each, see `Client::ask_public_reviews`)...
+const PUBLIC_REVIEWS_AT_ONCE: usize = 5;
+/// ...and the requests that must be left in the hour to ask any: the lists
+/// take three a round, six rounds an hour.
+const PUBLIC_RESERVE: u64 = 20;
+
 /// The GraphQL request for how the pull requests `numbers` of `repo` stand
 /// with their reviewers: GitHub's review decision (set when the branch's
 /// rules require reviews) and the latest approval or request for changes of
@@ -303,6 +310,40 @@ pub fn parse_reviews(json: &str) -> Result<Vec<(u64, Review, Approvals)>, String
             (pull.number, review, approvals)
         })
         .collect())
+}
+
+/// What one pull request's reviews (`GET /repos/{owner}/{repo}/pulls/
+/// {number}/reviews`, oldest first) come to without the review decision,
+/// which only GraphQL gives: the latest approval or request for changes of
+/// each reviewer with write access (owner, member or collaborator, as
+/// `writersOnly` counts them in GraphQL), unless it was dismissed since;
+/// comments leave a reviewer's word as it was. Reviews by deleted accounts
+/// are left out.
+pub fn parse_public_reviews(json: &str) -> Result<(Review, Approvals), String> {
+    #[derive(Deserialize)]
+    struct RawReview {
+        user: Option<RawUser>,
+        #[serde(default)]
+        state: String,
+        #[serde(default)]
+        author_association: String,
+    }
+    let raw: Vec<RawReview> = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    // Each reviewer's last word, in the order they first spoke.
+    let mut words: Vec<(String, String)> = Vec::new();
+    for review in raw {
+        let Some(login) = review.user.map(|user| user.login).filter(|login| !login.is_empty()) else { continue };
+        let writer = matches!(review.author_association.as_str(), "OWNER" | "MEMBER" | "COLLABORATOR");
+        if !writer || !matches!(review.state.as_str(), "APPROVED" | "CHANGES_REQUESTED" | "DISMISSED") {
+            continue;
+        }
+        match words.iter_mut().find(|(who, _)| *who == login) {
+            Some((_, word)) => *word = review.state,
+            None => words.push((login, review.state)),
+        }
+    }
+    let states: Vec<String> = words.into_iter().map(|(_, word)| word).filter(|word| word != "DISMISSED").collect();
+    Ok(review_of(None, &states))
 }
 
 /// The parent of `repo` in the answer to `GET /repos/{owner}/{repo}`:
@@ -432,11 +473,8 @@ pub struct Client {
     limiter: Limiter,
     /// Last `ETag` per list, for conditional requests.
     etags: [Option<String>; 3],
-    /// Number and `updated_at` of each pull request of the last list.
-    listed: Vec<(u64, i64)>,
-    /// Review states by number, with the `updated_at` they were asked at:
-    /// a pull request is asked about again once it has changed.
-    reviews: BTreeMap<u64, (i64, Review, Option<Approvals>)>,
+    /// Review states of the listed pull requests, as last asked.
+    reviews: Reviews,
     /// The repository's parent once asked; `Some(None)` when it has none.
     parent: Option<Option<Parent>>,
     /// GraphQL has a budget of its own.
@@ -455,8 +493,7 @@ impl Client {
             looked: false,
             limiter: Limiter::default(),
             etags: [None, None, None],
-            listed: Vec::new(),
-            reviews: BTreeMap::new(),
+            reviews: Reviews::default(),
             parent: None,
             graphql: Limiter::default(),
         }
@@ -665,23 +702,18 @@ impl Client {
         }
     }
 
-    /// Asks GraphQL how the listed pull requests that changed since they
-    /// were last asked about stand with their reviewers: one request for
-    /// all of them, and none at all while nothing changed. GraphQL needs a
-    /// sign-in, so without one review states stay unknown. Returns those
-    /// whose state is not what it was.
+    /// Asks how the listed pull requests that changed since they were last
+    /// asked about stand with their reviewers. Signed in: GraphQL, one
+    /// request for all of them, and none at all while nothing changed.
+    /// Without a sign-in, GraphQL is closed: each pull request's reviews
+    /// instead ([`Client::ask_public_reviews`]). Returns those whose state is
+    /// not what it was.
     fn ask_reviews(&mut self, now: u64) -> Vec<PullRequest> {
-        let Some((token, _)) = &self.token else { return Vec::new() };
+        let Some((token, _)) = &self.token else { return self.ask_public_reviews(now) };
         if self.graphql.blocked(now).is_some() || self.limiter.blocked(now).is_some() {
             return Vec::new();
         }
-        let stale: Vec<(u64, i64)> = self
-            .listed
-            .iter()
-            .filter(|(number, updated)| self.reviews.get(number).is_none_or(|(asked, ..)| asked != updated))
-            .take(REVIEWS_AT_ONCE)
-            .copied()
-            .collect();
+        let stale = self.reviews.stale(REVIEWS_AT_ONCE);
         if stale.is_empty() {
             return Vec::new();
         }
@@ -707,23 +739,47 @@ impl Client {
                 Some((_, review, approvals)) => (*review, Some(*approvals)),
                 None => (Review::Unknown, None),
             };
-            let before = self.reviews.insert(number, (updated, review, approvals));
-            // Unknown before is what the list shows without asking.
-            if before.map_or((Review::Unknown, None), |(_, was, had)| (was, had)) != (review, approvals) {
-                changed.push(PullRequest { number, review, approvals, ..Default::default() });
-            }
+            changed.extend(self.reviews.learnt(number, updated, review, approvals));
         }
         changed
     }
 
-    /// Fills in what is known of the reviews of a fresh list's pull requests.
-    fn known_reviews(&self, items: &mut [PullRequest]) {
-        for pull in items {
-            if let Some((_, review, approvals)) = self.reviews.get(&pull.number) {
-                pull.review = *review;
-                pull.approvals = *approvals;
+    /// Review states without a sign-in: `GET .../pulls/{number}/reviews`
+    /// of each pull request that changed, which public repositories answer
+    /// to anyone. Each is one of the 60 requests an hour GitHub allows
+    /// without a sign-in, shared with the lists, so at most
+    /// [`PUBLIC_REVIEWS_AT_ONCE`] are asked per round and none while fewer
+    /// than [`PUBLIC_RESERVE`] are left in the hour. What is learnt is kept
+    /// until the pull request changes, like GraphQL's answers. The review
+    /// decision (what the branch's rules require) is not in this answer.
+    fn ask_public_reviews(&mut self, now: u64) -> Vec<PullRequest> {
+        let mut changed = Vec::new();
+        for (number, updated) in self.reviews.stale(PUBLIC_REVIEWS_AT_ONCE) {
+            let spent = self.limiter.left(now).is_some_and(|left| left < PUBLIC_RESERVE);
+            if spent || self.limiter.blocked(now).is_some() {
+                break;
             }
+            let (owner, name) = (&self.repo.owner, &self.repo.name);
+            let url = format!("{}/repos/{owner}/{name}/pulls/{number}/reviews?per_page=100", self.api);
+            let request = HttpRequest { url: &url, etag: None, token: None };
+            let Ok(response) = self.transport.get(&request) else { break };
+            let message = api_message(&response.body);
+            if self.limiter.record(response.status, &Rate::of(&response), &message, now).is_some() {
+                break;
+            }
+            let (review, approvals) = match response.status {
+                200 => match parse_public_reviews(&response.body) {
+                    Ok((review, approvals)) => (review, Some(approvals)),
+                    Err(_) => (Review::Unknown, None),
+                },
+                // Asked again next round.
+                500..=599 => break,
+                // Hidden or gone: unknown until the pull request changes.
+                _ => (Review::Unknown, None),
+            };
+            changed.extend(self.reviews.learnt(number, updated, review, approvals));
         }
+        changed
     }
 
     /// `problem` with every token this client has held blanked out.
@@ -738,8 +794,7 @@ impl Backend for Client {
     fn pulls(&mut self, now: u64) -> Outcome<PullRequest> {
         match self.fetch(List::Pulls, now, |json| Ok((parse_pulls(json)?, false))) {
             Outcome::Fresh { mut items, more } => {
-                self.listed = items.iter().map(|pull| (pull.number, pull.updated)).collect();
-                self.known_reviews(&mut items);
+                self.reviews.listed(&mut items);
                 Outcome::Fresh { items, more }
             }
             other => other,
@@ -774,9 +829,7 @@ impl Backend for Client {
             self.looked = false;
         }
         // Reviews are asked about again, and shown as they were meanwhile.
-        for (asked, ..) in self.reviews.values_mut() {
-            *asked = i64::MIN;
-        }
+        self.reviews.ask_again();
     }
 
     fn blocked_until(&self, now: u64) -> Option<u64> {
@@ -968,18 +1021,102 @@ mod tests {
     }
 
     #[test]
-    fn without_a_sign_in_reviews_stay_unknown_and_the_parent_is_asked_once() {
+    fn without_a_sign_in_reviews_come_from_each_pull_request_a_few_per_round() {
+        let reset = (NOW + 3600).to_string();
+        let window = [("x-ratelimit-remaining", "50"), ("x-ratelimit-reset", reset.as_str())];
+        let day = "1970-01-02T00:00:00Z";
+        let first = list(&[7, 6, 5, 4, 3, 2, 1].map(|number| pull(number, day)));
+        let second = list(&[pull(7, "1970-01-03T00:00:00Z"), pull(6, day), pull(5, day), pull(4, day), pull(3, day), pull(2, day), pull(1, day)]);
+        let approved = r#"[{"id": 80, "user": {"login": "grace"}, "state": "APPROVED", "author_association": "MEMBER",
+            "submitted_at": "1970-01-02T00:00:00Z", "commit_id": "1111111111111111111111111111111111111111"}]"#;
+        let mut replies = vec![reply(200, &window, &first), reply(200, &window, r#"{"fork": false}"#)];
+        replies.extend((0..6).map(|_| reply(200, &window, approved)));
+        replies.extend([
+            reply(404, &window, r#"{"message": "Not Found"}"#),
+            reply(200, &window, &second),
+            reply(200, &window, "[]"),
+        ]);
+        let (mut client, sent) = scripted(replies, Fake::default());
+
+        fresh(client.pulls(NOW));
+        // The parent once, then five pull requests' reviews, newest first.
+        let details = client.details(NOW).unwrap();
+        assert_eq!(details.parent, None);
+        assert_eq!(details.pulls.iter().map(|pull| (pull.number, pull.review)).collect::<Vec<_>>(), [7, 6, 5, 4, 3].map(|n| (n, Review::Approved)));
+        assert_eq!(details.pulls[0].approvals, Some(Approvals { given: 1, left: 0 }));
+        // The other two next round; one is not found, which is no change
+        // from unknown. Then nothing is left to ask.
+        let details = client.details(NOW).unwrap();
+        assert_eq!(details.pulls.iter().map(|pull| pull.number).collect::<Vec<_>>(), [2]);
+        assert_eq!(client.details(NOW), None);
+        // #7 changed: a fresh list keeps what is known, and #7 alone is asked.
+        let pulls = fresh(client.pulls(NOW));
+        assert_eq!(pulls.iter().filter(|pull| pull.review == Review::Approved).count(), 6);
+        let details = client.details(NOW).unwrap();
+        assert_eq!(details.pulls.iter().map(|pull| (pull.number, pull.review)).collect::<Vec<_>>(), [(7, Review::Unreviewed)]);
+
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent.len(), 11);
+        assert_eq!(sent[1].url, "https://api.github.com/repos/ada/app");
+        assert_eq!(sent[2].url, "https://api.github.com/repos/ada/app/pulls/7/reviews?per_page=100");
+        assert_eq!(sent[8].url, "https://api.github.com/repos/ada/app/pulls/1/reviews?per_page=100");
+        assert_eq!(sent[10].url, "https://api.github.com/repos/ada/app/pulls/7/reviews?per_page=100");
+        assert!(sent.iter().all(|request| request.token.is_none() && request.body.is_none()));
+    }
+
+    #[test]
+    fn without_a_sign_in_reviews_leave_the_hours_last_requests_to_the_lists() {
+        let reset = (NOW + 3600).to_string();
+        let left = |n: &'static str| [("x-ratelimit-remaining", n), ("x-ratelimit-reset", reset.as_str())];
+        let three = list(&[pull(3, "1970-01-02T00:00:00Z"), pull(2, "1970-01-02T00:00:00Z"), pull(1, "1970-01-02T00:00:00Z")]);
         let (mut client, sent) = scripted(
-            vec![reply(200, &[], &list(&[pull(12, "1970-01-02T00:00:00Z")])), reply(200, &[], r#"{"fork": false}"#)],
+            vec![
+                reply(200, &left("22"), &three),
+                reply(200, &left("20"), r#"{"fork": false}"#),
+                reply(200, &left("19"), "[]"),
+            ],
             Fake::default(),
         );
         fresh(client.pulls(NOW));
+        // Twenty left: one more review, which leaves nineteen, and no more.
+        assert_eq!(client.details(NOW), Some(Details { pulls: vec![PullRequest { number: 3, review: Review::Unreviewed, approvals: Some(Approvals::default()), ..Default::default() }], parent: None }));
         assert_eq!(client.details(NOW), None);
-        assert_eq!(client.details(NOW), None);
-        let sent = sent.lock().unwrap();
-        assert_eq!(sent.len(), 2);
-        assert_eq!(sent[1].url, "https://api.github.com/repos/ada/app");
-        assert_eq!(sent[1].token, None);
+        assert_eq!(sent.lock().unwrap().len(), 3);
+        // A new hour: asked again.
+        let (mut client, sent) = scripted(vec![reply(200, &left("5"), &three), reply(200, &[], "{}")], Fake::default());
+        fresh(client.pulls(NOW));
+        client.details(NOW);
+        client.details(NOW + 3601);
+        assert_eq!(sent.lock().unwrap().len(), 3);
+        assert!(sent.lock().unwrap()[2].url.ends_with("/pulls/3/reviews?per_page=100"));
+    }
+
+    #[test]
+    fn public_reviews_count_each_writers_last_word() {
+        let review = |id: u32, login: &str, state: &str, association: &str| {
+            format!(r#"{{"id": {id}, "user": {{"login": "{login}"}}, "state": "{state}", "author_association": "{association}"}}"#)
+        };
+        let of = |reviews: &[String]| parse_public_reviews(&format!("[{}]", reviews.join(","))).unwrap();
+        let given = |n| Approvals { given: n, left: 0 };
+        assert_eq!(of(&[]), (Review::Unreviewed, given(0)));
+        assert_eq!(
+            of(&[review(1, "grace", "APPROVED", "MEMBER"), review(2, "linus", "APPROVED", "COLLABORATOR")]),
+            (Review::Approved, given(2))
+        );
+        // Changes asked for, then a comment: the request stands.
+        let asked = [review(1, "grace", "CHANGES_REQUESTED", "OWNER"), review(2, "grace", "COMMENTED", "OWNER")];
+        assert_eq!(of(&asked), (Review::ChangesRequested, given(0)));
+        // Changes asked for, then approved: approved.
+        let turned = [review(1, "grace", "CHANGES_REQUESTED", "OWNER"), review(2, "grace", "APPROVED", "OWNER")];
+        assert_eq!(of(&turned), (Review::Approved, given(1)));
+        // A dismissed approval counts for nothing; one from someone without
+        // write access is left out, as GraphQL's `writersOnly` does.
+        let dismissed = [review(1, "grace", "DISMISSED", "MEMBER"), review(2, "ada", "APPROVED", "CONTRIBUTOR")];
+        assert_eq!(of(&dismissed), (Review::Unreviewed, given(0)));
+        assert_eq!(of(&[review(1, "grace", "PENDING", "MEMBER")]), (Review::Unreviewed, given(0)));
+        let ghost = r#"[{"id": 1, "user": null, "state": "CHANGES_REQUESTED", "author_association": "MEMBER"}]"#;
+        assert_eq!(parse_public_reviews(ghost).unwrap(), (Review::Unreviewed, given(0)));
+        assert!(parse_public_reviews(r#"{"message": "Not Found"}"#).is_err());
     }
 
     #[test]
@@ -1116,6 +1253,24 @@ mod tests {
         let across = Across { from: repo(), into: RepoId { owner: "octo".to_owned(), ..repo() } };
         let problem = client.create_pull_across(&new_pull(), &across, NOW).unwrap_err();
         assert_eq!(problem, Problem::Refused("GitHub does not have the branch ada:feature: push it first".to_owned()));
+    }
+
+    #[test]
+    fn the_offline_fixture_answers_each_pull_requests_reviews_without_a_sign_in() {
+        let dir = std::env::temp_dir().join("gitkrill-tests").join(format!("hosting-canned-public-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pulls.json"), list(&[pull(12, "1970-01-02T00:00:00Z"), pull(9, "1970-01-02T00:00:00Z")])).unwrap();
+        let approved = r#"[{"id": 1, "user": {"login": "grace"}, "state": "APPROVED", "author_association": "OWNER"}]"#;
+        std::fs::write(dir.join("reviews-12.json"), approved).unwrap();
+        let canned = Canned { dir: dir.clone(), created: false };
+        let mut client = Client::new(repo(), Box::new(canned), Box::new(NoSecrets));
+        fresh(client.pulls(NOW));
+        // No repo.json: not a fork. No reviews-9.json: unknown.
+        let details = client.details(NOW).unwrap();
+        assert_eq!(details.parent, None);
+        assert_eq!(details.pulls.iter().map(|pull| (pull.number, pull.review)).collect::<Vec<_>>(), [(12, Review::Approved)]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -7,6 +7,12 @@
 //! request's head on the remote: one from this repository is checked out
 //! from its branch ([`checkout_pull_request`]).
 //!
+//! There are no issues to list: Bitbucket Cloud removed its issue tracker,
+//! API included, on 20 August 2026 (its endpoints answer 410 Gone), so
+//! nothing is asked for them ([`Service::has_issues`]). After the lists the
+//! repository itself is asked once, for a fork's `parent`; a pull request
+//! into the parent names the fork as its source's `repository`.
+//!
 //! Sign-ins use HTTP Basic: an Atlassian API token with the account's
 //! e-mail address (`BITBUCKET_EMAIL` and `BITBUCKET_API_TOKEN`), or an app
 //! password with the user name (`BITBUCKET_USERNAME` and
@@ -184,42 +190,6 @@ pub fn parse_pull(text: &str) -> Result<PullRequest, String> {
     json::<RawPull>(text).map(pull_request)
 }
 
-#[derive(Deserialize)]
-struct RawIssue {
-    id: u64,
-    #[serde(default)]
-    title: String,
-    reporter: Option<RawAccount>,
-    kind: Option<String>,
-    priority: Option<String>,
-    component: Option<RawName>,
-    updated_on: Option<String>,
-}
-
-/// The issues, and whether there are more. Bitbucket has no labels: the
-/// kind (bug, enhancement...), a priority other than the usual "major",
-/// and the component stand in for them. Comment counts are not listed.
-pub fn parse_issues(text: &str) -> Result<(Vec<Issue>, bool), String> {
-    let page: Page<RawIssue> = json(text)?;
-    let issues = page
-        .values
-        .into_iter()
-        .map(|issue| {
-            let priority = issue.priority.filter(|priority| priority != "major");
-            let labels = [issue.kind, priority, issue.component.map(|component| component.name)];
-            Issue {
-                number: issue.id,
-                title: issue.title,
-                author: account_name(issue.reporter),
-                labels: labels.into_iter().flatten().filter(|label| !label.is_empty()).collect(),
-                comments: 0,
-                updated: timestamp(issue.updated_on.as_deref()),
-            }
-        })
-        .collect();
-    Ok((issues, page.next.is_some()))
-}
-
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct RawState {
@@ -369,14 +339,44 @@ pub fn api_message(body: &str) -> String {
 
 /// The body of a new pull request.
 pub fn new_pull_json(new: &NewPull) -> String {
-    serde_json::json!({
+    pull_json(new, None)
+}
+
+/// [`new_pull_json`], from a branch of `from` (a fork) when given: the
+/// source's `repository`, by its `workspace/slug`.
+fn pull_json(new: &NewPull, from: Option<&RepoId>) -> String {
+    let mut json = serde_json::json!({
         "title": new.title.trim(),
         "description": new.body,
         "source": {"branch": {"name": new.head}},
         "destination": {"branch": {"name": new.base}},
         "draft": new.draft,
-    })
-    .to_string()
+    });
+    if let Some(from) = from {
+        json["source"]["repository"] = serde_json::json!({ "full_name": from.slug() });
+    }
+    json.to_string()
+}
+
+/// The parent of `repo` in the answer to `GET /repositories/{workspace}/
+/// {repo_slug}`: `None` when it is not a fork, or its parent's name is not
+/// one a remote could have. Its main branch, when the answer has it.
+pub fn parse_parent(text: &str, repo: &RepoId) -> Result<Option<Parent>, String> {
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct RawParent {
+        full_name: String,
+        mainbranch: Option<RawName>,
+    }
+    #[derive(Deserialize)]
+    struct RawRepo {
+        parent: Option<RawParent>,
+    }
+    let raw: RawRepo = json(text)?;
+    Ok(raw.parent.and_then(|parent| {
+        let default_branch = branch_name(&parent.mainbranch.map(|branch| branch.name).unwrap_or_default());
+        Some(Parent { repo: repo.sibling(&parent.full_name)?, default_branch })
+    }))
 }
 
 // ---- the account (Preferences > Integrations) ----
@@ -447,29 +447,37 @@ pub fn new_key_json(title: &str, key: &PublicKey) -> String {
 // ---- the client ----
 
 #[derive(Clone, Copy)]
+/// The lists asked for, each with its own validator.
 enum List {
     Pulls,
-    Issues,
     Pipelines,
 }
 
 pub struct Client {
     api: Api,
+    /// The repository's parent once asked; `Some(None)` when it has none.
+    parent: Option<Option<Parent>>,
 }
 
 impl Client {
     pub fn new(repo: RepoId, transport: Box<dyn Transport>, secrets: Box<dyn Secrets>) -> Self {
-        Client { api: Api::new(repo, transport, secrets, 3, &[401], api_message) }
+        Client { api: Api::new(repo, transport, secrets, 2, &[401], api_message), parent: None }
     }
 
     fn repo_url(&self, path: &str) -> String {
-        format!("{}/repositories/{}/{}/{path}", self.api.base, self.api.repo.owner, self.api.repo.name)
+        Self::url_of(&self.api.base, &self.api.repo, path)
     }
 
-    fn create(&mut self, new: &NewPull, now: u64) -> Result<PullRequest, Problem> {
+    fn url_of(base: &str, repo: &RepoId, path: &str) -> String {
+        format!("{base}/repositories/{}/{}/{path}", repo.owner, repo.name)
+    }
+
+    /// POST the new pull request `body` to the pull requests of `into`:
+    /// this repository, or a fork's parent.
+    fn create(&mut self, into: &RepoId, new: &NewPull, body: &str, now: u64) -> Result<PullRequest, Problem> {
         self.api.look_again();
-        let url = self.repo_url("pullrequests");
-        let response = self.api.post(&url, &new_pull_json(new), true, now)?;
+        let url = Self::url_of(&self.api.base, into, "pullrequests");
+        let response = self.api.post(&url, body, true, now)?;
         let message = self.api.message(&response.body);
         let lower = message.to_lowercase();
         let (head, base) = (&new.head, &new.base);
@@ -484,10 +492,24 @@ impl Client {
             }
             400 | 409 | 422 if !message.is_empty() => Err(Problem::Refused(message)),
             403 => Err(Problem::Refused(match message.is_empty() {
-                true => format!("No permission to open pull requests in {}", self.api.repo.slug()),
-                false => format!("No permission to open pull requests in {} ({message})", self.api.repo.slug()),
+                true => format!("No permission to open pull requests in {}", into.slug()),
+                false => format!("No permission to open pull requests in {} ({message})", into.slug()),
             })),
             status => Err(Problem::Failed(format!("Bitbucket answered {status}"))),
+        }
+    }
+
+    /// GET the repository itself, for the parent of a fork. `None` when
+    /// there was no answer worth keeping (no connection, a rate limit, the
+    /// server failing): asked again next round.
+    fn ask_parent(&mut self, now: u64) -> Option<Option<Parent>> {
+        let url = self.repo_url("").trim_end_matches('/').to_owned();
+        let response = self.api.get(url, None, now).ok()?;
+        match response.status {
+            200..=299 => Some(parse_parent(&response.body, &self.api.repo).unwrap_or(None)),
+            500..=599 => None,
+            // Moved, hidden or refused: no parent to offer.
+            _ => Some(None),
         }
     }
 }
@@ -504,15 +526,9 @@ impl Backend for Client {
         self.api.fetch(url, List::Pulls as usize, now, |_, _| None, |response| parse_pulls(&response.body))
     }
 
-    fn issues(&mut self, now: u64) -> Outcome<Issue> {
-        let query = url_escape("state=\"new\" OR state=\"open\" OR state=\"on hold\"");
-        let url = self.repo_url(&format!("issues?q={query}&sort=-updated_on&pagelen=30"));
-        // Most repositories have no issue tracker, and say so.
-        let special = |response: &HttpResponse, _: bool| {
-            let none = response.status == 404 && api_message(&response.body).to_lowercase().contains("issue tracker");
-            none.then_some(Ok(Got::Nothing))
-        };
-        self.api.fetch(url, List::Issues as usize, now, special, |response| parse_issues(&response.body))
+    /// Bitbucket Cloud has no issue tracker any more: nothing to ask.
+    fn issues(&mut self, _now: u64) -> Outcome<Issue> {
+        Outcome::Fresh { items: Vec::new(), more: false }
     }
 
     fn runs(&mut self, now: u64) -> Outcome<Run> {
@@ -536,8 +552,30 @@ impl Backend for Client {
     }
 
     fn create_pull(&mut self, new: &NewPull, now: u64) -> Result<PullRequest, Problem> {
-        let created = self.create(new, now);
+        let into = self.api.repo.clone();
+        let created = self.create(&into, new, &new_pull_json(new), now);
         created.map_err(|problem| self.api.scrub(problem))
+    }
+
+    /// Opened in `across.into`, from a branch of `across.from` (named as the
+    /// source's repository when it is another one).
+    fn create_pull_across(&mut self, new: &NewPull, across: &Across, now: u64) -> Result<PullRequest, Problem> {
+        let here = |repo: &RepoId| repo.service == self.api.repo.service && repo.host == self.api.repo.host;
+        if !here(&across.from) || !here(&across.into) {
+            return Err(Problem::Failed(format!("Both repositories must be on {}", self.api.repo.site())));
+        }
+        let from = (!across.from.same(&across.into)).then_some(&across.from);
+        let created = self.create(&across.into, new, &pull_json(new, from), now);
+        created.map_err(|problem| self.api.scrub(problem))
+    }
+
+    fn details(&mut self, now: u64) -> Option<Details> {
+        if self.parent.is_some() {
+            return None;
+        }
+        let parent = self.ask_parent(now)?;
+        self.parent = Some(parent.clone());
+        parent.map(|parent| Details { pulls: Vec::new(), parent: Some(parent) })
     }
 }
 
@@ -590,12 +628,11 @@ mod tests {
        "destination": {"branch": {"name": "main"}}}
     ]}"#;
 
-    const ISSUES: &str = r#"{"pagelen": 30, "size": 2, "values": [
-      {"type": "issue", "id": 31, "title": "Crash on empty repo", "state": "new", "kind": "bug", "priority": "critical",
-       "reporter": {"display_name": "Grace", "nickname": "grace"}, "component": {"name": "graph"},
-       "updated_on": "1970-01-01T00:01:00+00:00", "votes": 3},
-      {"type": "issue", "id": 30, "title": "Docs typo", "state": "open", "kind": "task", "priority": "major", "reporter": null}
-    ]}"#;
+    /// `GET /repositories/{workspace}/{repo_slug}` of a fork, trimmed.
+    const FORK: &str = r#"{"type": "repository", "full_name": "ada/app", "name": "app", "is_private": false,
+      "mainbranch": {"type": "branch", "name": "main"}, "fork_policy": "allow_forks",
+      "parent": {"type": "repository", "full_name": "team/app", "name": "app", "uuid": "{7e1c}",
+                 "links": {"html": {"href": "https://bitbucket.org/team/app"}}}}"#;
 
     const PIPELINES: &str = r#"{"page": 1, "pagelen": 20, "size": 3, "values": [
       {"type": "pipeline", "uuid": "{a1}", "build_number": 140,
@@ -694,13 +731,7 @@ mod tests {
     }
 
     #[test]
-    fn issues_and_pipelines_map_to_the_model() {
-        let (issues, more) = parse_issues(ISSUES).unwrap();
-        assert!(!more);
-        assert_eq!((issues[0].number, issues[0].author.as_str(), issues[0].updated), (31, "grace", 60));
-        assert_eq!(issues[0].labels, ["bug", "critical", "graph"]);
-        assert_eq!((issues[1].labels.clone(), issues[1].author.as_str()), (vec!["task".to_owned()], "Former user"));
-
+    fn pipelines_map_to_the_model() {
         let (runs, more) = parse_pipelines(PIPELINES).unwrap();
         assert!(!more);
         let first = &runs[0];
@@ -805,12 +836,13 @@ mod tests {
     }
 
     #[test]
-    fn lists_are_asked_for_below_the_api_and_a_missing_tracker_is_no_error() {
-        let no_tracker = r#"{"type": "error", "error": {"message": "Repository has no issue tracker."}}"#;
-        let (mut client, sent) =
-            scripted(vec![reply(200, &[], PULLS), reply(404, &[], no_tracker), reply(200, &[], PIPELINES)], api_token());
+    fn lists_are_asked_for_below_the_api_and_issues_not_at_all() {
+        let (mut client, sent) = scripted(vec![reply(200, &[], PULLS), reply(200, &[], PIPELINES)], api_token());
         assert!(matches!(client.pulls(NOW), Outcome::Fresh { ref items, more: true } if items.len() == 2));
+        // The issue tracker is gone from Bitbucket Cloud: an empty list,
+        // and no request for it.
         assert_eq!(client.issues(NOW), Outcome::Fresh { items: Vec::new(), more: false });
+        assert!(!Service::Bitbucket.has_issues() && Service::GitHub.has_issues() && Service::Codeberg.has_issues());
         assert!(matches!(client.runs(NOW), Outcome::Fresh { ref items, .. } if items.len() == 3));
         assert_eq!(client.auth(), Auth::SignedIn(TokenSource::Env("BITBUCKET_API_TOKEN")));
         let sent = sent.lock().unwrap();
@@ -819,11 +851,55 @@ mod tests {
             urls,
             [
                 "https://api.bitbucket.org/2.0/repositories/team/app/pullrequests?q=state%3D%22OPEN%22%20AND%20%28draft%3Dtrue%20OR%20draft%3Dfalse%29&sort=-updated_on&pagelen=30&fields=%2Bvalues.participants",
-                "https://api.bitbucket.org/2.0/repositories/team/app/issues?q=state%3D%22new%22%20OR%20state%3D%22open%22%20OR%20state%3D%22on%20hold%22&sort=-updated_on&pagelen=30",
                 "https://api.bitbucket.org/2.0/repositories/team/app/pipelines?sort=-created_on&pagelen=20",
             ]
         );
         assert!(sent.iter().all(|request| within(API, &request.url) && request.token.as_deref() == Some(SECRET)));
+    }
+
+    #[test]
+    fn a_forks_parent_is_asked_once_and_taken_only_with_a_name_a_remote_could_have() {
+        let fork = RepoId { owner: "ada".to_owned(), ..repo() };
+        let sent = Log::default();
+        let transport = Script { replies: vec![reply(500, &[], ""), reply(200, &[], FORK)].into(), sent: sent.clone() };
+        let mut client = Client::new(fork.clone(), Box::new(transport), Box::new(Fake::default()));
+        // The server failed: nothing learnt, asked again next round.
+        assert_eq!(client.details(NOW), None);
+        let parent = client.details(NOW).unwrap().parent.unwrap();
+        assert_eq!((parent.repo, parent.default_branch.as_str()), (repo(), ""));
+        assert_eq!(client.details(NOW), None);
+        let urls: Vec<String> = sent.lock().unwrap().iter().map(|request| request.url.clone()).collect();
+        assert_eq!(urls, ["https://api.bitbucket.org/2.0/repositories/ada/app", "https://api.bitbucket.org/2.0/repositories/ada/app"]);
+
+        let named = r#"{"parent": {"full_name": "team/app", "mainbranch": {"name": "trunk"}}}"#;
+        assert_eq!(parse_parent(named, &fork).unwrap().unwrap().default_branch, "trunk");
+        assert_eq!(parse_parent(r#"{"full_name": "team/app", "parent": null}"#, &fork).unwrap(), None);
+        assert_eq!(parse_parent(r#"{"parent": {"full_name": "../x"}}"#, &fork).unwrap(), None);
+        assert!(parse_parent("[]", &fork).is_err());
+    }
+
+    #[test]
+    fn a_pull_request_from_a_fork_names_it_as_its_sources_repository() {
+        let fork = RepoId { owner: "ada".to_owned(), ..repo() };
+        let (mut client, sent) = scripted(vec![reply(201, &[], CREATED)], api_token());
+        let across = Across { from: fork.clone(), into: repo() };
+        assert_eq!(client.create_pull_across(&new_pull(false), &across, NOW).unwrap().number, 13);
+        let sent = sent.lock().unwrap();
+        assert_eq!(sent[0].url, "https://api.bitbucket.org/2.0/repositories/team/app/pullrequests");
+        let body: serde_json::Value = serde_json::from_str(sent[0].body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["source"], serde_json::json!({"branch": {"name": "feature/fast"}, "repository": {"full_name": "ada/app"}}));
+        assert_eq!(body["destination"], serde_json::json!({"branch": {"name": "main"}}));
+        drop(sent);
+
+        // Within one repository: no repository named. Never elsewhere.
+        let (mut client, sent) = scripted(vec![reply(201, &[], CREATED)], api_token());
+        client.create_pull_across(&new_pull(false), &Across { from: repo(), into: repo() }, NOW).unwrap();
+        let body: serde_json::Value = serde_json::from_str(sent.lock().unwrap()[0].body.as_deref().unwrap()).unwrap();
+        assert!(body["source"].get("repository").is_none());
+        let github = RepoId { service: Service::GitHub, host: "github.com".to_owned(), ..repo() };
+        let (mut client, sent) = scripted(vec![reply(201, &[], CREATED)], api_token());
+        assert!(client.create_pull_across(&new_pull(false), &Across { from: fork, into: github }, NOW).is_err());
+        assert!(sent.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -852,7 +928,7 @@ mod tests {
         // Bitbucket sends no hint with a 429: back off.
         let (mut client, sent) = scripted(vec![reply(429, &[], "Rate limit for this resource has been exceeded")], api_token());
         assert_eq!(failure(client.pulls(NOW)), Problem::RateLimited { until: NOW + 60 });
-        assert_eq!(failure(client.issues(NOW + 30)), Problem::RateLimited { until: NOW + 60 });
+        assert_eq!(failure(client.runs(NOW + 30)), Problem::RateLimited { until: NOW + 60 });
         assert_eq!(sent.lock().unwrap().len(), 1);
     }
 

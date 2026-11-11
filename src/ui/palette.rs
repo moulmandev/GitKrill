@@ -427,6 +427,21 @@ pub fn entries(tabs: &[RepoTab], active: usize, settings: &Settings) -> Vec<Entr
             .detail(format!("on {}", shown.repo.site()))
             .keywords("pull request merge request mr pr open propose"),
         );
+        // A fork: the sidebar's Fork / Parent switch.
+        if let Some(family) = &shown.family {
+            let parent = !family.parent_shown;
+            let (label, repo) = match parent {
+                true => ("Show the parent's pull requests, issues and CI", family.parent.slug()),
+                false => ("Show the fork's own pull requests, issues and CI", family.fork.slug()),
+            };
+            list.push(
+                Entry::on_tab("hosting-family", icons::GIT_FORK, label, move |tab, shared| {
+                    crate::ui::hosting::show_parent(tab, shared, parent)
+                })
+                .detail(repo)
+                .keywords("fork parent upstream sidebar pull requests issues ci switch"),
+            );
+        }
     }
 
     if let (Some(tab), Some(snap)) = (tab, snap) {
