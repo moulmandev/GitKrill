@@ -454,9 +454,10 @@ be installed.
   "Open on GitHub" (or the service it is on) works without signing in
 - In a fork, the pull request goes into the parent repository by default
   (Repository in the dialog), from `owner:branch`, on GitHub, GitLab,
-  Gitea, Forgejo, Codeberg, Bitbucket and Bitbucket Data Center; it shows
-  in the parent's list at once. A branch on another remote of the same
-  server, such as your fork of the repository shown, can be proposed too
+  Gitea, Forgejo, Codeberg, Bitbucket, Bitbucket Data Center and Azure
+  DevOps; it shows in the parent's list at once. A branch on another
+  remote of the same server, such as your fork of the repository shown,
+  can be proposed too
 
 **Profiles, SSH and signing** (File > Preferences)
 - Profiles: an author name and email, an SSH key and signing settings each;
@@ -706,8 +707,6 @@ build.rs         the Windows executable's icon and version details
   not shown on Gitea, Forgejo and Codeberg, whose rules only repository
   admins may read, nor on GitHub without a sign-in, where only GraphQL
   says it
-- On Azure DevOps a fork's parent is known only from a remote called
-  `upstream`, and pull requests are not opened across forks there
 - The interactive rebase moves a commit only within its own line of
   history (the branch's own, or that of one merged branch), and autosquash
   leaves a fixup of the repository's first commit when merges follow it (its

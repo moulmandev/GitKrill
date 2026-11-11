@@ -186,6 +186,8 @@ fn fixture_files_are_named_after_the_detail_asked_for() {
         ("https://api.bitbucket.org/2.0/repositories/team/app/pullrequests", None),
         // Azure DevOps lists below `repositories/<id>/`: still its lists.
         ("https://dev.azure.com/org/proj/_apis/git/repositories/app/pullrequests", None),
+        ("https://dev.azure.com/org/proj/_apis/git/repositories/app", Some("repo")),
+        ("https://dev.azure.com/org/proj/_apis/git/repositories", None),
         ("https://gitlab.com/api/v4/projects/group%2Fapp/merge_requests", None),
         ("https://gitlab.com/api/v4/projects/7/pipelines", None),
         // Bitbucket Data Center: the repository, a commit's builds, and its
@@ -509,7 +511,8 @@ fn the_parent_is_the_one_the_service_names_else_the_upstream_remote() {
     assert_eq!(named.repo.clone_url().as_deref(), Some("https://github.com/octo/app.git"));
     let lab = at(Service::GitLab, "example.com/gitlab", "group/sub", "app");
     assert_eq!(lab.clone_url().as_deref(), Some("https://example.com/gitlab/group/sub/app.git"));
-    assert_eq!(at(Service::AzureDevOps, "dev.azure.com", "org/proj", "app").clone_url(), None);
+    let azure = at(Service::AzureDevOps, "dev.azure.com", "org/My%20Project", "app");
+    assert_eq!(azure.clone_url().as_deref(), Some("https://dev.azure.com/org/My%20Project/_git/app"));
 }
 
 /// One repository of a fork and its parent: fixed lists, its parent told

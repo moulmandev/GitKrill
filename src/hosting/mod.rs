@@ -561,7 +561,8 @@ impl RepoId {
             // A project key or `~user`, then the repository.
             Service::BitbucketDataCenter => parts.len() == 2,
             // An organisation and project whose names may need escapes:
-            // never taken from an answer. SourceHut has no forks.
+            // never taken from an answer as a path (`azure` builds a
+            // fork's parent from its parts). SourceHut has no forks.
             Service::AzureDevOps | Service::SourceHut => false,
         };
         let owner_part = |part: &&str| match self.service {
@@ -583,11 +584,11 @@ impl RepoId {
 
     /// The repository's address for git over HTTPS, built from its
     /// validated parts: what a fork's parent is fetched from when no remote
-    /// points at it. `None` on Azure DevOps, whose names may need escapes
-    /// (and which never names a parent, see [`RepoId::sibling`]).
+    /// points at it. Azure DevOps names keep their `%`-escapes, which git
+    /// reads in an address.
     pub fn clone_url(&self) -> Option<String> {
         match self.service {
-            Service::AzureDevOps => None,
+            Service::AzureDevOps => Some(azure::repo_page(self, "").trim_end_matches('/').to_owned()),
             // Every repository's git address is below `/scm/`.
             Service::BitbucketDataCenter => Some(format!("https://{}/scm/{}.git", self.host, self.slug())),
             Service::SourceHut => Some(format!("https://{}/{}", self.host, self.slug())),
@@ -2117,7 +2118,8 @@ fn explain(error: ureq::Error) -> String {
 ///
 /// What [`Backend::details`] asks comes from more files: GitHub's GraphQL
 /// (review decisions) from `graphql.json`, the repository (a fork's parent)
-/// from `repo.json` on GitHub, Gitea, Forgejo and Bitbucket, and one pull
+/// from `repo.json` on GitHub, Gitea, Forgejo, Bitbucket (Cloud and Data
+/// Center) and Azure DevOps, and one pull
 /// request's reviews (GitHub without a sign-in, Gitea and Forgejo) from
 /// `reviews-<number>.json`; on GitLab a merge request's approvals from
 /// `approvals-<iid>.json`, the project (its parent) from `project.json` and
@@ -2222,6 +2224,8 @@ fn detail_fixture(path: &str) -> Option<String> {
         // Bitbucket's repository; Azure DevOps has `repositories/<id>/...`
         // below its own `_apis/git`, never below `2.0`.
         [.., "2.0", "repositories", _, _] => Some("repo".to_owned()),
+        // Azure DevOps' repository itself (a fork's `parentRepository`).
+        [.., "_apis", "git", "repositories", _] => Some("repo".to_owned()),
         _ => None,
     }
 }

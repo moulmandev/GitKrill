@@ -18,6 +18,11 @@
 //!
 //! There is no ref for a pull request's head on the remote (only for the
 //! merge result), so a pull request is checked out from its branch.
+//!
+//! After the lists the repository itself is asked once: a fork names the
+//! repository it was forked from (`isFork`, `parentRepository`), in the same
+//! organisation. A pull request from a fork into it is opened in that
+//! repository, naming the fork by its id as the `forkSource`.
 
 use std::process::Command;
 
@@ -356,6 +361,11 @@ pub fn parse_pull(text: &str, repo: &RepoId) -> Result<PullRequest, String> {
     json::<RawPull>(text).map(|pull| pull_request(pull, repo))
 }
 
+/// A repository id that can go into an address as it is: a GUID.
+fn guid(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
+}
+
 /// The id of the repository named `name` (escaped, as in [`RepoId::name`])
 /// in a list of the project's repositories.
 pub fn repository_id(text: &str, name: &str) -> Result<Option<String>, String> {
@@ -364,9 +374,31 @@ pub fn repository_id(text: &str, name: &str) -> Result<Option<String>, String> {
         .into_iter()
         .find(|repository| url_escape(&repository.name).eq_ignore_ascii_case(name))
         .map(|repository| repository.id)
-        // A GUID, put in an address as it is.
-        .filter(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'));
+        .filter(|id| guid(id));
     Ok(id)
+}
+
+/// What `GET .../git/repositories/{name}` says of `repo`: its id, and the
+/// repository it was forked from when it is a fork. A fork is in its
+/// parent's organisation (Azure DevOps forks no further), so only the
+/// parent's project and name are read; a name that is not one a remote
+/// could have leaves the parent out.
+pub fn parse_repository(text: &str, repo: &RepoId) -> Result<(Option<String>, Option<Parent>), String> {
+    #[derive(Deserialize, Default)]
+    #[serde(default, rename_all = "camelCase")]
+    struct RawRepo {
+        id: String,
+        is_fork: bool,
+        parent_repository: Option<RawRepository>,
+    }
+    let raw: RawRepo = json(text)?;
+    let organisation = split_owner(repo).0;
+    let parent = raw.parent_repository.filter(|_| raw.is_fork).and_then(|parent| {
+        let (project, name) = (name_part(&parent.project.name)?, name_part(&parent.name)?);
+        let repo = RepoId { service: Service::AzureDevOps, host: HOST.to_owned(), owner: format!("{organisation}/{project}"), name };
+        Some(Parent { repo, default_branch: String::new() })
+    });
+    Ok((Some(raw.id).filter(|id| guid(id)), parent))
 }
 
 #[derive(Deserialize, Default)]
@@ -531,16 +563,20 @@ pub fn parse_work_items(text: &str, ids: &[u64]) -> Result<Vec<Issue>, String> {
     Ok(issues)
 }
 
-/// The body of a new pull request.
-pub fn new_pull_json(new: &NewPull) -> String {
-    serde_json::json!({
+/// The body of a new pull request, from a branch of the fork whose
+/// repository id is `fork` when given (its `forkSource`).
+pub fn new_pull_json(new: &NewPull, fork: Option<&str>) -> String {
+    let mut json = serde_json::json!({
         "sourceRefName": format!("refs/heads/{}", new.head),
         "targetRefName": format!("refs/heads/{}", new.base),
         "title": new.title.trim(),
         "description": new.body,
         "isDraft": new.draft,
-    })
-    .to_string()
+    });
+    if let Some(fork) = fork {
+        json["forkSource"] = serde_json::json!({ "repository": { "id": fork } });
+    }
+    json.to_string()
 }
 
 /// `GET {PROFILE_API}/_apis/profile/profiles/me`: the signed-in user.
@@ -578,12 +614,15 @@ pub struct Client {
     /// yet (`None`), or asked and not found (`Some(None)`, all the
     /// project's builds are shown then).
     repo_id: Option<Option<String>>,
+    /// The repository's parent once asked; `Some(None)` when it has none.
+    parent: Option<Option<Parent>>,
 }
 
 impl Client {
     pub fn new(repo: RepoId, transport: Box<dyn Transport>, secrets: Box<dyn Secrets>) -> Self {
         // A refused sign-in can also come back as 203, with the sign-in page.
-        Client { api: Api::new(repo, transport, secrets, 3, &[401, 203], plain_message), repo_id: None }
+        let api = Api::new(repo, transport, secrets, 3, &[401, 203], plain_message);
+        Client { api, repo_id: None, parent: None }
     }
 
     /// `{API}/{org}/{project}/_apis/{path}`.
@@ -592,7 +631,54 @@ impl Client {
     }
 
     fn pulls_url(&self) -> String {
-        self.project_api(&format!("git/repositories/{}/pullrequests", self.api.repo.name))
+        Self::pulls_of(&self.api.base, &self.api.repo)
+    }
+
+    /// The pull requests of `repo`: this repository, or its parent.
+    fn pulls_of(base: &str, repo: &RepoId) -> String {
+        format!("{base}/{}/_apis/git/repositories/{}/pullrequests", repo.owner, repo.name)
+    }
+
+    /// `repo` itself, by name below its project.
+    fn repository_of(base: &str, repo: &RepoId) -> String {
+        format!("{base}/{}/_apis/git/repositories/{}?{VERSION}", repo.owner, repo.name)
+    }
+
+    /// GET this repository, for its id and the one it was forked from.
+    /// `None` when there was no answer worth keeping (no connection, a rate
+    /// limit, the server failing): asked again next round.
+    fn ask_repository(&mut self, now: u64) -> Option<Option<Parent>> {
+        let url = Self::repository_of(&self.api.base, &self.api.repo);
+        let response = self.api.get(url, None, now).ok()?;
+        match response.status {
+            200..=299 => match parse_repository(&response.body, &self.api.repo) {
+                Ok((id, parent)) => {
+                    if id.is_some() {
+                        self.repo_id = Some(id);
+                    }
+                    Some(parent)
+                }
+                Err(_) => Some(None),
+            },
+            500..=599 => None,
+            // Hidden or refused: no parent to offer.
+            _ => Some(None),
+        }
+    }
+
+    /// The id of `repo`, this repository or another of the organisation (a
+    /// fork the pull request comes from).
+    fn id_of(&mut self, repo: &RepoId, now: u64) -> Result<Option<String>, Problem> {
+        if repo.same(&self.api.repo) {
+            return self.repository_id(now);
+        }
+        let response = self.api.get(Self::repository_of(&self.api.base, repo), None, now)?;
+        match self.api.classify(response)? {
+            Got::Body(response) => {
+                Ok(parse_repository(&response.body, repo).map_err(|error| self.api.unreadable(error))?.0)
+            }
+            Got::Unchanged | Got::Nothing => Ok(None),
+        }
     }
 
     /// The repository's id, asked for once.
@@ -636,15 +722,17 @@ impl Client {
         }
     }
 
-    fn create(&mut self, new: &NewPull, now: u64) -> Result<PullRequest, Problem> {
+    /// POST a new pull request into `into` (this repository, or its
+    /// parent), from the fork whose id is `fork` when given.
+    fn create(&mut self, into: &RepoId, new: &NewPull, fork: Option<&str>, now: u64) -> Result<PullRequest, Problem> {
         self.api.look_again();
-        let url = format!("{}?{VERSION}", self.pulls_url());
-        let response = self.api.post(&url, &new_pull_json(new), true, now)?;
+        let url = format!("{}?{VERSION}", Self::pulls_of(&self.api.base, into));
+        let response = self.api.post(&url, &new_pull_json(new, fork), true, now)?;
         let message = self.api.message(&response.body);
         let lower = message.to_lowercase();
         let (head, base) = (&new.head, &new.base);
         match response.status {
-            200 | 201 => parse_pull(&response.body, &self.api.repo).map_err(|error| self.api.unreadable(error)),
+            200 | 201 => parse_pull(&response.body, into).map_err(|error| self.api.unreadable(error)),
             409 => Err(Problem::Refused(format!("A pull request from {head} into {base} is already open"))),
             404 => Err(Problem::NoAccess),
             400 if lower.contains("branch") && (lower.contains("exist") || lower.contains("not found")) => {
@@ -652,7 +740,7 @@ impl Client {
             }
             400 | 422 if !message.is_empty() => Err(Problem::Refused(message)),
             403 => Err(Problem::Refused(match message.is_empty() {
-                true => format!("No permission to open pull requests in {}", self.api.repo.name),
+                true => format!("No permission to open pull requests in {}", into.name),
                 false => message,
             })),
             status => Err(Problem::Failed(format!("Azure DevOps answered {status}"))),
@@ -703,8 +791,40 @@ impl Backend for Client {
     }
 
     fn create_pull(&mut self, new: &NewPull, now: u64) -> Result<PullRequest, Problem> {
-        let created = self.create(new, now);
+        let into = self.api.repo.clone();
+        let created = self.create(&into, new, None, now);
         created.map_err(|problem| self.api.scrub(problem))
+    }
+
+    /// Opened in `across.into`; a branch of another repository (a fork)
+    /// is named by that repository's id. Both must be in this repository's
+    /// organisation.
+    fn create_pull_across(&mut self, new: &NewPull, across: &Across, now: u64) -> Result<PullRequest, Problem> {
+        let organisation = split_owner(&self.api.repo).0.to_owned();
+        let here = |repo: &RepoId| {
+            repo.service == Service::AzureDevOps && split_owner(repo).0.eq_ignore_ascii_case(&organisation)
+        };
+        if !here(&across.from) || !here(&across.into) {
+            return Err(Problem::Failed(format!("Both repositories must be in the Azure DevOps organisation {organisation}")));
+        }
+        let created = match across.from.same(&across.into) {
+            true => self.create(&across.into, new, None, now),
+            false => match self.id_of(&across.from, now) {
+                Ok(Some(fork)) => self.create(&across.into, new, Some(&fork), now),
+                Ok(None) => Err(Problem::Refused(format!("Azure DevOps does not have the repository {}", across.from.name))),
+                Err(problem) => Err(problem),
+            },
+        };
+        created.map_err(|problem| self.api.scrub(problem))
+    }
+
+    fn details(&mut self, now: u64) -> Option<Details> {
+        if self.parent.is_some() {
+            return None;
+        }
+        let parent = self.ask_repository(now)?;
+        self.parent = Some(parent.clone());
+        parent.map(|parent| Details { pulls: Vec::new(), parent: Some(parent) })
     }
 }
 
@@ -1137,6 +1257,92 @@ mod tests {
         assert!(parse_profile("{}").is_err());
     }
 
+    /// `GET .../git/repositories/app` of a fork, after the reference's
+    /// sample with `isFork` and `parentRepository` (a GitRepositoryRef).
+    const FORK: &str = r#"{"id": "5febef5a-833d-4e14-b9c0-14cb638f91e6", "name": "app", "isFork": true,
+      "project": {"id": "6ce954b1", "name": "Ada", "state": "wellFormed"},
+      "defaultBranch": "refs/heads/main", "remoteUrl": "https://dev.azure.com/acme/Ada/_git/app",
+      "parentRepository": {"id": "3411ebc1-d5aa-464f-9615-0b527bc66719", "name": "app", "isFork": false,
+        "project": {"id": "a7573007", "name": "Web Team", "state": "wellFormed"},
+        "collection": {"id": "e22ddea7", "name": "acme"},
+        "url": "https://dev.azure.com/acme/_apis/git/repositories/3411ebc1-d5aa-464f-9615-0b527bc66719",
+        "remoteUrl": "https://dev.azure.com/acme/Web%20Team/_git/app"}}"#;
+
+    fn fork() -> RepoId {
+        parse_remote("https://dev.azure.com/acme/Ada/_git/app").unwrap()
+    }
+
+    #[test]
+    fn a_forks_parent_is_asked_once_and_built_like_a_remote() {
+        let sent = Log::default();
+        let transport = Script { replies: vec![reply(503, &[], ""), reply(200, &[], FORK)].into(), sent: sent.clone() };
+        let mut client = Client::new(fork(), Box::new(transport), Box::new(with_pat()));
+        // The service failed: nothing learnt, asked again next round.
+        assert_eq!(client.details(NOW), None);
+        let parent = client.details(NOW).unwrap().parent.unwrap();
+        assert_eq!(Some(parent.repo.clone()), parse_remote("https://dev.azure.com/acme/Web%20Team/_git/app"));
+        assert_eq!(client.details(NOW), None);
+        assert_eq!(urls(&sent), ["https://dev.azure.com/acme/Ada/_apis/git/repositories/app?api-version=7.1"; 2]);
+        // Its id came with it: builds are filtered by it without asking.
+        assert_eq!(client.repo_id, Some(Some("5febef5a-833d-4e14-b9c0-14cb638f91e6".to_owned())));
+        // Checking out the parent's pull requests needs its address.
+        assert_eq!(parent.repo.clone_url().as_deref(), Some("https://dev.azure.com/acme/Web%20Team/_git/app"));
+
+        // Not a fork, or a parent whose name a remote could not have.
+        assert_eq!(parse_repository("{}", &fork()).unwrap(), (None, None));
+        let unforked = r#"{"id": "5febef5a-833d-4e14-b9c0-14cb638f91e6", "isFork": false}"#;
+        assert_eq!(parse_repository(unforked, &fork()).unwrap().1, None);
+        let odd = r#"{"isFork": true, "parentRepository": {"name": "a/b", "project": {"name": "Web"}}}"#;
+        assert_eq!(parse_repository(odd, &fork()).unwrap().1, None);
+        assert!(parse_repository("42", &fork()).is_err());
+    }
+
+    #[test]
+    fn a_pull_request_from_a_fork_is_opened_in_its_parent_naming_the_fork() {
+        let parent = parse_remote("https://dev.azure.com/acme/Web%20Team/_git/app").unwrap();
+        let created = r#"{"pullRequestId": 14, "title": "Speed up", "createdBy": {"displayName": "Ada"},
+            "sourceRefName": "refs/heads/feature/fast", "targetRefName": "refs/heads/main",
+            "forkSource": {"repository": {"id": "5febef5a-833d-4e14-b9c0-14cb638f91e6", "name": "app", "project": {"name": "Ada"}}}}"#;
+        let sent = Log::default();
+        let listed = r#"{"count": 1, "value": [{"id": "5febef5a-833d-4e14-b9c0-14cb638f91e6", "name": "app", "project": {"name": "Ada"}}]}"#;
+        let transport = Script { replies: vec![reply(200, &[], listed), reply(201, &[], created)].into(), sent: sent.clone() };
+        let mut client = Client::new(fork(), Box::new(transport), Box::new(with_pat()));
+        let new = NewPull { head: "feature/fast".into(), base: "main".into(), title: "Speed up".into(), body: String::new(), draft: false };
+        let pull = client.create_pull_across(&new, &Across { from: fork(), into: parent.clone() }, NOW).unwrap();
+        assert_eq!((pull.number, pull.head_repo.as_deref()), (14, Some("acme/Ada/app")));
+        assert!(pull.is_from(&fork()));
+        {
+            let sent = sent.lock().unwrap();
+            // The fork's id, from its project's list, then the post.
+            assert_eq!(sent[0].url, "https://dev.azure.com/acme/Ada/_apis/git/repositories?api-version=7.1");
+            assert_eq!(sent[1].url, "https://dev.azure.com/acme/Web%20Team/_apis/git/repositories/app/pullrequests?api-version=7.1");
+            let body: serde_json::Value = serde_json::from_str(sent[1].body.as_deref().unwrap()).unwrap();
+            assert_eq!(body["forkSource"], serde_json::json!({"repository": {"id": "5febef5a-833d-4e14-b9c0-14cb638f91e6"}}));
+            assert_eq!(body["sourceRefName"], "refs/heads/feature/fast");
+        }
+
+        // Within one repository: no fork named.
+        let (mut client, sent) = scripted(vec![reply(201, &[], created)], with_pat());
+        client.create_pull_across(&new, &Across { from: repo(), into: repo() }, NOW).unwrap();
+        let body: serde_json::Value = serde_json::from_str(sent.lock().unwrap()[0].body.as_deref().unwrap()).unwrap();
+        assert!(body.get("forkSource").is_none());
+        // Never into another organisation or service.
+        let elsewhere = parse_remote("https://dev.azure.com/other/Web/_git/app").unwrap();
+        let github = RepoId { service: Service::GitHub, host: "github.com".to_owned(), owner: "acme".to_owned(), name: "app".to_owned() };
+        for into in [elsewhere, github] {
+            let (mut client, sent) = scripted(vec![reply(201, &[], created)], with_pat());
+            assert!(matches!(client.create_pull_across(&new, &Across { from: repo(), into }, NOW), Err(Problem::Failed(_))));
+            assert!(sent.lock().unwrap().is_empty());
+        }
+        // A fork the service does not know.
+        let (mut client, _) = scripted(vec![reply(200, &[], r#"{"name": "app"}"#)], with_pat());
+        let across = Across { from: fork(), into: repo() };
+        assert_eq!(
+            client.create_pull_across(&new, &across, NOW),
+            Err(Problem::Refused("Azure DevOps does not have the repository app".to_owned()))
+        );
+    }
+
     #[test]
     fn the_offline_fixture_serves_azure_endpoints() {
         let dir = std::env::temp_dir().join("gitkrill-tests").join(format!("hosting-canned-azure-{}", std::process::id()));
@@ -1149,6 +1355,10 @@ mod tests {
         assert!(matches!(client.pulls(NOW), Outcome::Fresh { ref items, .. } if items.len() == 2));
         assert!(matches!(client.issues(NOW), Outcome::Fresh { ref items, .. } if items.len() == 2));
         assert!(matches!(client.runs(NOW), Outcome::Fresh { ref items, .. } if items.len() == 3));
+        // The repository itself, for a fork's parent.
+        std::fs::write(dir.join("repo.json"), FORK).unwrap();
+        let mut client = Client::new(fork(), Box::new(Canned { dir: dir.clone(), created: false }), Box::new(NoSecrets));
+        assert!(client.details(NOW).unwrap().parent.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
