@@ -103,6 +103,17 @@ be installed.
   create one there
 - Drag a branch onto another branch, a remote or a commit to merge, rebase,
   fast-forward, push or reset
+- Select several commits: `Ctrl`+click adds or removes one, `Shift`+click
+  takes every commit in between (`Shift+Up` / `Shift+Down` from the
+  keyboard), a plain click or `Esc` goes back to one. The WIP row and
+  stashes are always selected on their own. The right panel lists them;
+  click one to find it in the graph
+- Compare two commits: select both, or use "Compare with HEAD" on a
+  commit's right-click menu, or "Compare with main" (the checked-out
+  branch) on a branch or tag, in the sidebar or on its graph label. The
+  panel lists the files that differ, older commit to newer (Swap turns it
+  round), and opens their diffs. Several commits in one unbroken line show
+  their combined change instead
 - Hide branches, whole folders of branches (say, the ones coding agents
   create for their worktrees), remotes or tags from the graph: click the eye on their
   sidebar row or right-click them, here or on their label in the graph.
@@ -157,6 +168,13 @@ be installed.
   remote, the folder's branches are deleted there in one push
 - Merge, rebase, cherry-pick, revert, reset (soft / mixed / hard)
 - Interactive rebase: pick, reword, squash, fixup, drop and reorder
+- Several selected commits at once, from their right-click menu, the panel
+  or the command palette: cherry-pick them (oldest first) or revert them
+  (newest first) in one git command, so a conflict stops at the commit that
+  causes it and Continue or Abort finish or undo the lot; squash a run of
+  them on the checked-out branch (the interactive rebase opens with them set
+  to squash and their combined message ready to edit, and warns when the
+  upstream already has some of them); copy their SHAs
 - File history (following renames) and blame, from any file's context menu
 - Tags: create (lightweight or annotated), delete, push
 - Stash, apply, pop, delete
@@ -278,8 +296,9 @@ erasing it: git and the other tools keep their sign-in.
 | `Ctrl+Enter` | Commit (from the message fields); start an interactive rebase |
 | `Ctrl+A` / `Ctrl+C` | Select all / copy the text of a diff or blame |
 | `Up` / `Down` | Previous / next commit |
+| `Ctrl`+click / `Shift`+click, `Shift+Up` / `Shift+Down` | Select several commits |
 | `F5` | Refresh |
-| `Esc` | Close the command palette, the current view, then the diff, then the search bar |
+| `Esc` | Close the command palette, the current view, then the diff, then the search bar, then go back to one selected commit |
 | `Ctrl` `+` / `-` / `0` | Zoom |
 
 ## How it is built
@@ -318,6 +337,7 @@ src/
     gitflow.rs   Gitflow setup, start and finish as plain git commands
     conflict.rs  three-way conflict regions and resolutions
     rebase.rs    interactive rebase plans
+    multi.rs     cherry-pick, revert and squash several commits
     blame.rs     file history and blame
     picture.rs   decoding images for the image preview
     cli.rs       running git
@@ -332,6 +352,8 @@ src/
     history.rs   file history, blame
     toolbar.rs   toolbar             dialogs.rs  modals and toasts
     gitflow.rs   Gitflow dialogs, menus and palette entries
+    multi/       several selected commits: selecting (pick.rs), their
+                 panel, comparison, menu and palette entries
     palette.rs   command palette (Ctrl+P)
     image_diff.rs  image preview     update.rs   update offer, status bar
     widgets.rs   shared widgets
@@ -376,6 +398,8 @@ build.rs         the Windows executable's icon and version details
   co-authors from the commit panel
 - Commit search looks at messages, authors and SHAs only: not at the files
   a commit changed, its code (`git log -S`) or its date
+- Commits are compared tree to tree: not with the working tree, and not
+  from where two branches forked (what a branch adds on its own)
 - A commit's whole file tree cannot be browsed, and a file cannot be opened,
   saved or restored as it was in an older commit
 - No creating or applying patch files, and no exporting a commit as an

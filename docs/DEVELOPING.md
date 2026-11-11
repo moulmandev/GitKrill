@@ -30,6 +30,8 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Change the repository | Build a `GitCmd` (`src/git/ops.rs`: `GitCmd::new`, `.step`, `GitCmd::empty` + `Step::new(...).env(...)`) and call `tab.run(cmd)`. Progress, toasts and the refresh afterwards are automatic. Name it with a short imperative label; set `.done("Past tense")` for the success toast; `.quiet()` for routine operations. |
 | Change several branches and tags in one undoable operation | `.undoable(UndoKind::Refs(vec![RefMove::new("refs/heads/develop"), ...]))`: the operator notes where each ref pointed before and after; undo and redo move them all back (or forth), HEAD included, and refuse if one has moved since. `git::gitflow::finish` uses it. |
 | Say what is left when an operation stops on conflicts | `.after_conflict("Finish … again once the merge is committed.")` on the `GitCmd`: added to the "stopped on conflicts" toast. |
+| Know which commits are selected | `tab.selection` is the one the details follow (the *focus*). When several are selected, `tab.multi` (`ui::multi`) has them all: `tab.multi.is_active()`, `tab.multi.contains(oid)`, `tab.multi.picked.ordered(&history)` (graph order). `tab.select(...)` selects one on its own; `tab.focus(...)` moves the focus and keeps the others. `ui::multi::compare(tab, shared, a, b)` selects two commits to compare, loading more history first when one is not in the graph yet. |
+| Run git on several commits | `git::multi::cherry_pick` (oldest first) and `revert` (newest first) are one `git ... --stdin` each, undoable as one HEAD move. `git::multi::check_squash` (reader thread) checks that a run can be squashed; `ui::rebase::RebaseView::squash(base, run, warning)` opens the planner with it set up. `git::multi::facts` says the same from the loaded history alone, cheaply enough for a menu. |
 | Know whether the repository uses Gitflow | `snap.gitflow` (`git::gitflow::Config`, read with every snapshot); `ui::gitflow::open_start` / `open_finish` open the dialogs. |
 | Show a full-size view instead of the graph | Add state to your variant of `Overlay` (`src/state.rs`), set `tab.overlay = Some(...)`. `ui::overlay` calls your `show(ui, tab, shared, view) -> bool` (false closes). Start with `widgets::overlay_bar` for the title bar. Escape closes overlays. |
 | Ask the user something | `shared.show(Dialog::...)` (`src/ui/dialogs.rs`); `Dialog::confirm(title, body, button, cmd)` for destructive confirmations. |
@@ -188,6 +190,8 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   step. Work on other threads (blame, avatars, hosting) is not waited for: add
   a `sleep:`.
 - `press:x,y` / `move:x,y` / `release:x,y` script a drag.
+- `hold:shift` holds a modifier for clicks, but a `key:` step sends its own
+  modifiers: write `key:shift+ArrowDown`, not `hold:shift;key:ArrowDown`.
 - `GITKRILL_HOSTING_FIXTURE=<dir>` makes the hosting sidebar answer from
   `<dir>/<endpoint>.json` instead of the network: `pulls`, `issues` and
   `runs` for GitHub, `merge_requests`, `issues` and `pipelines` for GitLab,

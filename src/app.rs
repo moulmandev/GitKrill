@@ -299,6 +299,8 @@ impl App {
                 tab.diff = None;
             } else if tab.search_open {
                 tab.search_open = false;
+            } else {
+                ui::multi::escape(tab);
             }
         }
     }

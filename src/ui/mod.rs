@@ -12,6 +12,7 @@ pub mod graph;
 pub mod highlight;
 pub mod history;
 pub mod image_diff;
+pub mod multi;
 pub mod hosting;
 pub mod palette;
 pub mod new_pull;

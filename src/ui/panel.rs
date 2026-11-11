@@ -19,6 +19,10 @@ use crate::ui::widgets::{self, icon_button, segmented, tint_button};
 pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
     commit_button::follow_up(ui.ctx(), tab, shared);
     let Some(snap) = tab.snap.clone() else { return };
+    // Several commits selected: see `ui::multi`.
+    if crate::ui::multi::panel(ui, tab, shared, &snap) {
+        return;
+    }
     match tab.selection {
         Selection::Wip => working_tree(ui, tab, shared, &snap),
         Selection::Commit(oid) => commit(ui, tab, shared, &snap, oid),

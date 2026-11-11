@@ -325,6 +325,9 @@ pub struct RepoTab {
     pub error: Option<String>,
 
     pub selection: Selection,
+    /// Commits selected together with `selection` (Ctrl / Shift+click), and
+    /// what is shown and done with them: `crate::ui::multi`.
+    pub multi: crate::ui::multi::Multi,
     pub details: Option<Result<Arc<CommitDetails>, String>>,
     details_for: Option<Oid>,
     pub diff: Option<DiffView>,
@@ -389,6 +392,7 @@ impl RepoTab {
             snap: None,
             error: None,
             selection: Selection::None,
+            multi: Default::default(),
             details: None,
             details_for: None,
             diff: None,
@@ -541,7 +545,18 @@ impl RepoTab {
         }
     }
 
+    /// Selects one commit, or the WIP row, on its own.
     pub fn select(&mut self, selection: Selection) {
+        self.multi.reset(match selection {
+            Selection::Commit(oid) => Some(oid),
+            _ => None,
+        });
+        self.focus(selection);
+    }
+
+    /// Shows the details of `selection` without changing which commits are
+    /// selected together with it (`crate::ui::multi`).
+    pub fn focus(&mut self, selection: Selection) {
         self.selection = selection;
         if let Selection::Commit(oid) = selection
             && self.details_for != Some(oid) {
@@ -712,6 +727,14 @@ impl RepoTab {
 
     fn on_snapshot(&mut self, snap: Arc<RepoSnapshot>) {
         self.error = None;
+        // Commits selected together stay so while they exist.
+        let focus = match self.selection {
+            Selection::Commit(oid) => Some(oid),
+            _ => None,
+        };
+        if let Some(next) = self.multi.retain(&snap.history, focus) {
+            self.selection = Selection::Commit(next);
+        }
         let head_commit = snap.head.oid.filter(|oid| snap.row_of(*oid).is_some());
         let dirty = !snap.status.is_clean();
 
@@ -768,7 +791,7 @@ impl RepoTab {
         }
 
         self.snap = Some(snap);
-        self.select(selection);
+        self.focus(selection);
     }
 
     fn on_op_done(
