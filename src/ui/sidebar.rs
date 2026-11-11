@@ -243,6 +243,16 @@ pub fn section_header(
     shown: usize,
     total: usize,
 ) -> (bool, Response) {
+    let count = if shown == total { total.to_string() } else { format!("{shown}/{total}") };
+    header_row(ui, tab, title, icon, &count)
+}
+
+/// [`section_header`] for a section that lists nothing to count.
+pub fn plain_section_header(ui: &mut Ui, tab: &mut RepoTab, title: &str, icon: &str) -> (bool, Response) {
+    header_row(ui, tab, title, icon, "")
+}
+
+fn header_row(ui: &mut Ui, tab: &mut RepoTab, title: &str, icon: &str, count: &str) -> (bool, Response) {
     let key = format!("section:{title}");
     let open = !tab.collapsed.contains(&key);
     let (rect, response) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::click());
@@ -254,7 +264,6 @@ pub fn section_header(
         let caret = if open { icons::CARET_DOWN } else { icons::CARET_RIGHT };
         painter.text(pos2(rect.left() + 9.0, y), Align2::LEFT_CENTER, caret, theme::font(11.0), theme::text_dim());
         painter.text(pos2(rect.left() + 26.0, y), Align2::LEFT_CENTER, icon, theme::font(15.0), theme::text_dim());
-        let count = if shown == total { total.to_string() } else { format!("{shown}/{total}") };
         let count_rect =
             painter.text(pos2(rect.right() - 12.0, y), Align2::RIGHT_CENTER, count, theme::bold(11.5), theme::accent());
         // The title gives way to the count when the sidebar is narrow.
@@ -604,7 +613,9 @@ pub fn local_branch_menu(
         && menu_item(ui, icons::ARROW_LINE_UP, &format!("Push {} to {remote}", branch.name)) {
             tab.run(ops::push_branch(remote, &branch.name));
         }
-    if let Some(word) = tab.hosting.connected().map(|shown| shown.repo.service.pull_word())
+    // Not on SourceHut, which takes patches by email.
+    let service = tab.hosting.connected().map(|shown| shown.repo.service).filter(|service| service.has_pulls());
+    if let Some(word) = service.map(|service| service.pull_word())
         && menu_item(ui, icons::GIT_PULL_REQUEST, &format!("Create {word}…"))
     {
         crate::ui::new_pull::open(tab, shared, Some(Branch::local(&branch.name)));
@@ -708,7 +719,8 @@ pub fn remote_branch_menu(
     // For the hosted remote, and the others on its server (forks of it).
     let servers = &shared.settings.hosting_servers;
     let hosted = |shown: &crate::hosting::Shown| {
-        crate::ui::new_pull::head_remotes(snap, servers, &shown.remote, &shown.repo).contains(&branch.remote)
+        shown.repo.service.has_pulls()
+            && crate::ui::new_pull::head_remotes(snap, servers, &shown.remote, &shown.repo).contains(&branch.remote)
     };
     if let Some(shown) = tab.hosting.connected().filter(hosted) {
         ui.separator();

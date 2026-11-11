@@ -261,7 +261,8 @@ fn action_icon(action: CommitAction) -> &'static str {
 /// (`RepoPrefs::commit`); `shortcut` is Ctrl+Enter pressed in the message
 /// fields, which runs the default action.
 pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSnapshot, prefs: &RepoCommit, shortcut: bool) {
-    let hosting = tab.hosting.connected();
+    // Not on SourceHut, which takes patches by email.
+    let hosting = tab.hosting.connected().filter(|shown| shown.repo.service.has_pulls());
     let pull = hosting.as_ref().map_or("pull request", |shown| shown.repo.service.pull_word());
     let available = |action: CommitAction| match action {
         CommitAction::Commit => true,

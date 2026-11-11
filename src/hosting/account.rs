@@ -5,7 +5,10 @@
 //!
 //! Bitbucket keeps an account's keys under its id (`/users/{uuid}/ssh-keys`),
 //! and Azure DevOps has no API for them at all: there only the profile is
-//! read, outside any organisation ([`azure::PROFILE_API`]).
+//! read, outside any organisation ([`azure::PROFILE_API`]). Bitbucket Data
+//! Center names the signed-in user only in its answers' `X-AUSERNAME`
+//! header, and SourceHut keeps the account on meta.sr.ht, asked through
+//! GraphQL ([`sourcehut::META_API`]).
 //!
 //! Everything here that blocks (the network, `gh` / `glab` / `tea` / `az` /
 //! `git credential`, `ssh-keygen`, reading `~/.ssh`) runs on an
@@ -25,6 +28,9 @@
 //! (`keys.after.json` once a key was added); an upload is answered from
 //! `keys.post.json` (201 unless `keys.post.head` says otherwise) and the
 //! body sent is left in `keys.sent.json`. Generated keys go to `<dir>/ssh`.
+//! Bitbucket Data Center's `application-properties` and `users/<name>`
+//! are answered from `user.json` too (`user.head` gives the `X-AUSERNAME`
+//! header), and SourceHut's GraphQL from the same files by what it asks.
 //!
 //! [`Disconnected`]: super::Disconnected
 
@@ -41,8 +47,8 @@ use serde::Deserialize;
 
 use super::{
     Canned, FixtureSignIn, HttpRequest, HttpResponse, NoSecrets, Offer, Rate, RepoId, Secrets, Service, System,
-    Token, TokenSource, Transport, Wire, api_base, azure, bitbucket, clock, epoch_now, find_token, gitlab, headers,
-    limited_until, offer_for, public, timestamp, tidy, unsupported, valid_host,
+    Token, TokenSource, Transport, api_base, azure, bitbucket, bitbucket_dc, clock, epoch_now, find_token, gitlab,
+    limited_until, offer_for, public, sourcehut, timestamp, tidy, unsupported, valid_host, wire,
 };
 use crate::git::RemoteInfo;
 
@@ -79,6 +85,10 @@ impl AccountId {
         AccountId { service: Service::AzureDevOps, host: azure::HOST.to_owned() }
     }
 
+    pub fn sourcehut() -> Self {
+        AccountId { service: Service::SourceHut, host: sourcehut::HOST.to_owned() }
+    }
+
     /// On a server the user named, rather than a public service.
     pub fn self_hosted(&self) -> bool {
         public(&self.host).is_none()
@@ -90,10 +100,12 @@ impl AccountId {
     }
 
     /// Where the REST API lives; a token is only ever sent below it. Azure
-    /// DevOps keeps the user's profile outside every organisation.
+    /// DevOps keeps the user's profile outside every organisation, SourceHut
+    /// on meta.sr.ht.
     pub fn api(&self) -> String {
         match self.service {
             Service::AzureDevOps => azure::PROFILE_API.to_owned(),
+            Service::SourceHut => sourcehut::META_API.to_owned(),
             service => api_base(service, &self.host),
         }
     }
@@ -165,7 +177,7 @@ pub fn under_path(host: &str, path: &str) -> Result<String, String> {
     }
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() > 8 || !parts.iter().all(|part| super::path_part(part)) {
-        return Err(format!("\"{}\" is not a path GitLab can be installed under", tidy(path)));
+        return Err(format!("\"{}\" is not a path a server can be installed under", tidy(path)));
     }
     Ok(format!("{host}/{}", parts.join("/")))
 }
@@ -597,6 +609,12 @@ impl Trouble {
                     (service, _) if service.is_gitea() => format!(
                         "Sign in with an access token that has it (Settings > Applications on {site}), then try again."
                     ),
+                    (Service::SourceHut, _) => {
+                        return format!(
+                            "{site} does not let this sign-in {to}: its token needs the {scope} grant. Make a \
+                             personal access token that has it (meta.sr.ht > OAuth 2.0), then try again."
+                        );
+                    }
                     _ => "Sign in with a token that has it, then try again.".to_owned(),
                 };
                 format!("{site} does not let this sign-in {to}: its token needs the {scope} scope. {fix}")
@@ -627,8 +645,11 @@ fn api_message(service: Service, body: &str) -> String {
     if service.is_gitlab() {
         return gitlab::api_message(body);
     }
-    if service == Service::Bitbucket {
-        return bitbucket::api_message(body);
+    match service {
+        Service::Bitbucket => return bitbucket::api_message(body),
+        Service::BitbucketDataCenter => return bitbucket_dc::api_message(body),
+        Service::SourceHut => return sourcehut::api_message(body),
+        _ => {}
     }
     #[derive(Deserialize, Default)]
     #[serde(default)]
@@ -702,7 +723,6 @@ impl Worker {
                 Worker::new(account, Box::new(transport), secrets, Some(ssh))
             }
             None => {
-                let headers = headers(account.service);
                 let home = dirs::home_dir();
                 // `git credential fill` reads the global configuration from
                 // anywhere; the home folder is a place sure to exist.
@@ -713,7 +733,7 @@ impl Worker {
                     Some(dir) => Some(PathBuf::from(dir).join("ssh")),
                     None => home.map(|home| home.join(".ssh")),
                 };
-                Worker::new(account.clone(), Box::new(Wire::new(account.api(), headers)), Box::new(secrets), ssh)
+                Worker::new(account.clone(), Box::new(wire(account.service, account.api())), Box::new(secrets), ssh)
             }
         }
     }
@@ -737,6 +757,37 @@ impl Worker {
         trouble.scrubbed(&tokens)
     }
 
+    /// Whether `response` refuses the token it was sent with: a 401, but
+    /// not Bitbucket Data Center's for a missing permission, and on
+    /// SourceHut also a 403 (an expired or revoked token).
+    fn refuses(&self, response: &HttpResponse) -> bool {
+        match self.account.service {
+            Service::BitbucketDataCenter => response.status == 401 && bitbucket_dc::about_sign_in(response),
+            Service::SourceHut => matches!(response.status, 401 | 403),
+            _ => response.status == 401,
+        }
+    }
+
+    /// A GraphQL question to SourceHut's account service, its `data` once
+    /// answered: a refusal in the answer becomes the grant it says is
+    /// missing (`write` for an upload), or its words.
+    fn graphql(&mut self, body: &str, write: bool, now: u64) -> Result<serde_json::Value, Trouble> {
+        let response = self.send(sourcehut::META_API, Some(body), now)?;
+        match response.status {
+            200 => sourcehut::data(&response.body).map_err(|unusable| match unusable {
+                sourcehut::Unusable::Refused(message) => match sourcehut::missing_grant(&message) {
+                    Some(grant) => Trouble::Scope { scope: grant, fine_grained: false },
+                    None if write && message.to_ascii_lowercase().contains("already") => {
+                        Trouble::Refused("this key is already on a SourceHut account, this one or another".to_owned())
+                    }
+                    None => Trouble::Refused(message),
+                },
+                sourcehut::Unusable::Unreadable(error) => self.unreadable(error),
+            }),
+            status => Err(self.unexpected(status)),
+        }
+    }
+
     /// One request below the API, with the sign-in: a GET, or a POST of
     /// `json`. A refused token (401, which means nothing was done) gives way
     /// to the next one found; with none left, nothing is sent at all.
@@ -751,7 +802,7 @@ impl Worker {
                 Some(json) => self.transport.post(&request, json),
             }
             .map_err(Trouble::Unreachable)?;
-            if response.status == 401 {
+            if self.refuses(&response) {
                 if let Some((token, _)) = self.token.take() {
                     self.rejected.push(token);
                 }
@@ -817,6 +868,8 @@ impl Worker {
                 Some(owner) => Ok(bitbucket::keys_url(owner)),
                 None => Err(Trouble::Failed("The account has not been read yet".to_owned())),
             },
+            Service::BitbucketDataCenter => Ok(bitbucket_dc::keys_url(&self.api)),
+            Service::SourceHut => Ok(sourcehut::META_API.to_owned()),
             Service::AzureDevOps => Err(Trouble::Failed(
                 "Azure DevOps has no API for SSH keys: add them in User settings > SSH public keys".to_owned(),
             )),
@@ -824,8 +877,44 @@ impl Worker {
         }
     }
 
+    /// What a refusal of a Bitbucket Data Center key request says: it has
+    /// no scopes, only permissions, which its message names.
+    fn permission(&self, response: &HttpResponse, to: &str) -> Trouble {
+        let message = api_message(self.account.service, &response.body);
+        Trouble::Refused(if message.is_empty() { format!("this sign-in may not {to}") } else { message })
+    }
+
+    /// Whose sign-in this is on Bitbucket Data Center: any answer names the
+    /// user in its `X-AUSERNAME` header; then the user's own description,
+    /// for the display name and address, when it can be read.
+    fn data_center_profile(&mut self, now: u64) -> Result<Profile, Trouble> {
+        let response = self.send(&bitbucket_dc::whoami_url(&self.api), None, now)?;
+        if response.status != 200 {
+            return Err(self.unexpected(response.status));
+        }
+        let Some(name) = bitbucket_dc::signed_in_user(&response) else {
+            return Err(Trouble::Failed(format!("{} did not say whose sign-in this is", self.account.site())));
+        };
+        let profile = match self.send(&bitbucket_dc::user_url(&self.api, &name), None, now) {
+            Ok(response) if response.status == 200 => bitbucket_dc::parse_user(&response.body, &name),
+            _ => Profile { id: 0, login: name, name: String::new(), email: None },
+        };
+        self.login = Some(profile.login.clone());
+        Ok(profile)
+    }
+
     /// `GET /user` (Azure DevOps: the profile): whose sign-in this is.
     fn profile(&mut self, now: u64) -> Result<Profile, Trouble> {
+        match self.account.service {
+            Service::BitbucketDataCenter => return self.data_center_profile(now),
+            Service::SourceHut => {
+                let data = self.graphql(&sourcehut::request(sourcehut::PROFILE, serde_json::Value::Null), false, now)?;
+                let profile = sourcehut::parse_profile(data).map_err(|e| self.unreadable(e))?;
+                self.login = Some(profile.login.clone());
+                return Ok(profile);
+            }
+            _ => {}
+        }
         let url = match self.account.service {
             Service::AzureDevOps => azure::profile_url(),
             _ => format!("{}/user", self.api),
@@ -852,21 +941,26 @@ impl Worker {
 
     /// `GET /user/keys` (Bitbucket: `/users/{id}/ssh-keys`).
     fn keys(&mut self, now: u64) -> Result<Vec<SshKey>, Trouble> {
+        if self.account.service == Service::SourceHut {
+            let data = self.graphql(&sourcehut::request(sourcehut::KEYS, serde_json::Value::Null), false, now)?;
+            return sourcehut::parse_keys(data).map_err(|e| self.unreadable(e));
+        }
         let page = match self.account.service {
             Service::Bitbucket => "pagelen=100",
             // Gitea and Forgejo cap their pages at 50.
             service if service.is_gitea() => "limit=50",
+            Service::BitbucketDataCenter => "limit=100",
             _ => "per_page=100",
         };
         let url = format!("{}?{page}", self.keys_url()?);
         let response = self.send(&url, None, now)?;
-        match response.status {
-            200 if self.account.service == Service::Bitbucket => {
-                bitbucket::parse_keys(&response.body).map_err(|e| self.unreadable(e))
-            }
-            200 => parse_keys(&response.body).map_err(|e| self.unreadable(e)),
-            403 | 404 => Err(self.refusal(&response, false)),
-            status => Err(self.unexpected(status)),
+        match (self.account.service, response.status) {
+            (Service::Bitbucket, 200) => bitbucket::parse_keys(&response.body).map_err(|e| self.unreadable(e)),
+            (Service::BitbucketDataCenter, 200) => bitbucket_dc::parse_keys(&response.body).map_err(|e| self.unreadable(e)),
+            (Service::BitbucketDataCenter, 401 | 403 | 404) => Err(self.permission(&response, "read SSH keys")),
+            (_, 200) => parse_keys(&response.body).map_err(|e| self.unreadable(e)),
+            (_, 403 | 404) => Err(self.refusal(&response, false)),
+            (_, status) => Err(self.unexpected(status)),
         }
     }
 
@@ -874,19 +968,31 @@ impl Worker {
     /// after a request that may have reached the service, except after a
     /// 401, which means nothing was done.
     fn upload(&mut self, title: &str, key: &PublicKey, now: u64) -> Result<SshKey, Trouble> {
-        let bitbucket = self.account.service == Service::Bitbucket;
-        let body = if bitbucket { bitbucket::new_key_json(title, key) } else { new_key_json(title, key) };
+        let service = self.account.service;
+        if service == Service::SourceHut {
+            let data = self.graphql(&sourcehut::new_key_json(title, key), true, now)?;
+            return sourcehut::parse_added(data).map_err(|e| self.unreadable(e));
+        }
+        let body = match service {
+            Service::Bitbucket => bitbucket::new_key_json(title, key),
+            Service::BitbucketDataCenter => bitbucket_dc::new_key_json(title, key),
+            _ => new_key_json(title, key),
+        };
         let url = self.keys_url()?;
         let response = self.send(&url, Some(&body), now)?;
         let site = self.account.site();
-        match response.status {
-            200 | 201 if bitbucket => bitbucket::parse_key(&response.body).map_err(|e| self.unreadable(e)),
-            200 | 201 => parse_key(&response.body).map_err(|e| self.unreadable(e)),
-            403 | 404 => Err(self.refusal(&response, true)),
-            400 | 409 | 422 => {
+        match (service, response.status) {
+            (Service::Bitbucket, 200 | 201) => bitbucket::parse_key(&response.body).map_err(|e| self.unreadable(e)),
+            (Service::BitbucketDataCenter, 200 | 201) => bitbucket_dc::parse_key(&response.body).map_err(|e| self.unreadable(e)),
+            (Service::BitbucketDataCenter, 401 | 403 | 404) => Err(self.permission(&response, "add SSH keys")),
+            (_, 200 | 201) => parse_key(&response.body).map_err(|e| self.unreadable(e)),
+            (_, 403 | 404) => Err(self.refusal(&response, true)),
+            (_, 400 | 409 | 422) => {
                 let message = api_message(self.account.service, &response.body);
                 let lower = message.to_ascii_lowercase();
-                Err(Trouble::Refused(if lower.contains("already") || lower.contains("been used") {
+                // Bitbucket Data Center's 409 is "the key already exists".
+                let taken = lower.contains("already") || lower.contains("been used") || (response.status == 409 && service == Service::BitbucketDataCenter);
+                Err(Trouble::Refused(if taken {
                     format!("this key is already on a {site} account, this one or another")
                 } else if message.is_empty() {
                     "the key was not accepted".to_owned()
@@ -894,7 +1000,7 @@ impl Worker {
                     message
                 }))
             }
-            status => Err(self.unexpected(status)),
+            (_, status) => Err(self.unexpected(status)),
         }
     }
 
@@ -963,28 +1069,54 @@ struct CannedAccount {
     added: bool,
 }
 
+impl CannedAccount {
+    /// The key list, or the one after a key was added.
+    fn keys(&self) -> HttpResponse {
+        match self.added && self.canned.dir.join("keys.after.json").exists() {
+            true => self.canned.answer("keys.after", 200),
+            false => self.canned.answer("keys", 200),
+        }
+    }
+
+    /// An upload: the body is left in `keys.sent.json`, the answer comes
+    /// from `keys.post.json` (`status` unless `keys.post.head` says).
+    fn upload(&mut self, body: &str, status: u16) -> HttpResponse {
+        let _ = std::fs::write(self.canned.dir.join("keys.sent.json"), body);
+        let response = self.canned.answer("keys.post", status);
+        self.added |= response.status == status;
+        response
+    }
+}
+
 impl Transport for CannedAccount {
     fn get(&mut self, request: &HttpRequest<'_>) -> Result<HttpResponse, String> {
         let path = request.url.split('?').next().unwrap_or_default();
-        // Bitbucket's keys are `.../ssh-keys`, Azure DevOps' profile `.../me`.
-        match path.rsplit('/').next() {
-            Some("user" | "me") => Ok(self.canned.answer("user", 200)),
-            Some("keys" | "ssh-keys") if self.added && self.canned.dir.join("keys.after.json").exists() => {
-                Ok(self.canned.answer("keys.after", 200))
-            }
-            Some("keys" | "ssh-keys") => Ok(self.canned.answer("keys", 200)),
+        let mut parts = path.rsplit('/');
+        // Bitbucket's keys are `.../ssh-keys`, Azure DevOps' profile `.../me`,
+        // Bitbucket Data Center's account `.../application-properties` and
+        // `.../users/<name>`.
+        match (parts.next(), parts.next()) {
+            (Some("user" | "me" | "application-properties"), _) | (_, Some("users")) => Ok(self.canned.answer("user", 200)),
+            (Some("keys" | "ssh-keys"), _) => Ok(self.keys()),
             _ => Err("no fixture for this address".to_owned()),
         }
     }
 
     fn post(&mut self, request: &HttpRequest<'_>, body: &str) -> Result<HttpResponse, String> {
-        if !request.url.ends_with("/user/keys") && !request.url.ends_with("/ssh-keys") {
+        // SourceHut's GraphQL, told apart by what it asks.
+        if request.url == sourcehut::META_API {
+            return Ok(if body.contains("createSSHKey") {
+                self.upload(body, 200)
+            } else if body.contains("sshKeys") {
+                self.keys()
+            } else {
+                self.canned.answer("user", 200)
+            });
+        }
+        if !["/user/keys", "/ssh-keys", "/ssh/1.0/keys"].iter().any(|end| request.url.ends_with(end)) {
             return Err("no fixture for this address".to_owned());
         }
-        let _ = std::fs::write(self.canned.dir.join("keys.sent.json"), body);
-        let response = self.canned.answer("keys.post", 201);
-        self.added |= response.status == 201;
-        Ok(response)
+        Ok(self.upload(body, 201))
     }
 }
 
@@ -1487,6 +1619,91 @@ mod tests {
     }
 
     #[test]
+    fn bitbucket_data_center_and_sourcehut_accounts_are_asked_where_each_keeps_them() {
+        // Bitbucket Data Center names the user in a header, then describes it.
+        let server = AccountId { service: Service::BitbucketDataCenter, host: "acme.com/bitbucket".to_owned() };
+        assert_eq!(server.api(), "https://acme.com/bitbucket/rest");
+        let token = Fake {
+            env: vec![("BITBUCKET_SERVER_HOST", "acme.com"), ("BITBUCKET_SERVER_TOKEN", SECRET)],
+            ..Default::default()
+        };
+        let whoami = [("x-ausername", "ada")];
+        let user = r#"{"name": "ada", "displayName": "Ada Lovelace", "emailAddress": "ada@acme.com", "slug": "ada"}"#;
+        let keys = format!(r#"{{"isLastPage": true, "values": [{{"id": 3, "text": "{PUBLIC}", "label": "Laptop"}}]}}"#);
+        let added = format!(r#"{{"id": 4, "text": "{PUBLIC}", "label": "New"}}"#);
+        let (mut worker, sent) = scripted(
+            server.clone(),
+            vec![reply(200, &whoami, "{}"), reply(200, &[], user), reply(200, &[], &keys), reply(201, &[], &added)],
+            token.clone(),
+        );
+        let profile = worker.profile(NOW).unwrap();
+        assert_eq!((profile.login.as_str(), profile.display_name(), profile.email.as_deref()), ("ada", "Ada Lovelace", Some("ada@acme.com")));
+        assert_eq!(worker.keys(NOW).unwrap()[0].title, "Laptop");
+        let key = parse_public_key(PUBLIC).unwrap();
+        assert_eq!(worker.upload("New", &key, NOW).unwrap().id, 4);
+        {
+            let sent = sent.lock().unwrap();
+            let urls: Vec<&str> = sent.iter().map(|request| request.url.as_str()).collect();
+            let base = "https://acme.com/bitbucket/rest";
+            assert_eq!(
+                urls,
+                [
+                    format!("{base}/api/1.0/application-properties"),
+                    format!("{base}/api/1.0/users/ada"),
+                    format!("{base}/ssh/1.0/keys?limit=100"),
+                    format!("{base}/ssh/1.0/keys"),
+                ]
+            );
+            let body: serde_json::Value = serde_json::from_str(sent[3].body.as_deref().unwrap()).unwrap();
+            assert_eq!(body, serde_json::json!({"text": key.line(), "label": "New"}));
+        }
+        // Without its header the answer says nobody; a missing permission
+        // is not a refused sign-in, and a key already there says so.
+        let denied = r#"{"errors": [{"message": "You are not permitted to access this resource", "exceptionName": "com.atlassian.bitbucket.AuthorisationException"}]}"#;
+        let exists = r#"{"errors": [{"message": "This SSH key is already in use", "exceptionName": "com.atlassian.bitbucket.ssh.DuplicateSshKeyException"}]}"#;
+        let (mut worker, _) = scripted(
+            server.clone(),
+            vec![reply(200, &[], "{}"), reply(401, &[], denied), reply(409, &[], exists)],
+            token,
+        );
+        assert!(matches!(worker.profile(NOW), Err(Trouble::Failed(text)) if text.contains("did not say whose sign-in")));
+        assert_eq!(worker.keys(NOW), Err(Trouble::Refused("You are not permitted to access this resource".to_owned())));
+        assert!(matches!(worker.upload("x", &key, NOW), Err(Trouble::Refused(text)) if text.contains("already on a acme.com/bitbucket account")));
+
+        // SourceHut: GraphQL questions to meta.sr.ht.
+        let account = AccountId::sourcehut();
+        assert_eq!((account.api(), account.site(), account.self_hosted()), (sourcehut::META_API.to_owned(), "SourceHut".to_owned(), false));
+        let me = r#"{"data": {"me": {"canonicalName": "~ada", "username": "ada", "email": "ada@example.org"}}}"#;
+        let keys = format!(r#"{{"data": {{"me": {{"sshKeys": {{"cursor": null, "results": [{{"id": 5, "keyType": "ssh-ed25519", "key": "{BLOB}", "comment": "Laptop"}}]}}}}}}}}"#);
+        let added = format!(r#"{{"data": {{"createSSHKey": {{"id": 6, "keyType": "ssh-ed25519", "key": "{BLOB}", "comment": "New"}}}}}}"#);
+        let token = Fake { env: vec![("SRHT_TOKEN", SECRET)], ..Default::default() };
+        let (mut worker, sent) =
+            scripted(account.clone(), vec![reply(200, &[], me), reply(200, &[], &keys), reply(200, &[], &added)], token.clone());
+        assert_eq!(worker.profile(NOW).unwrap().login, "~ada");
+        let listed = worker.keys(NOW).unwrap();
+        assert_eq!((listed[0].title.as_str(), listed[0].fingerprint.as_str()), ("Laptop", FINGERPRINT));
+        assert_eq!(worker.upload("New", &key, NOW).unwrap().id, 6);
+        {
+            let sent = sent.lock().unwrap();
+            assert!(sent.iter().all(|request| request.url == sourcehut::META_API && request.token.as_deref() == Some(SECRET)));
+            let asked: Vec<String> = sent
+                .iter()
+                .map(|request| serde_json::from_str::<serde_json::Value>(request.body.as_deref().unwrap()).unwrap()["query"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(asked, [sourcehut::PROFILE, sourcehut::KEYS, sourcehut::ADD_KEY]);
+        }
+        // A missing grant names it; an expired token is refused outright.
+        let denied = r#"{"data": null, "errors": [{"message": "Access denied, missing SSH_KEYS:RO grant", "extensions": {"code": "ERR_ACCESS_DENIED"}}]}"#;
+        let expired = r#"{"errors": [{"message": "Invalid or expired OAuth 2.0 bearer token"}]}"#;
+        let (mut worker, _) = scripted(account.clone(), vec![reply(200, &[], denied), reply(403, &[], expired)], token);
+        let trouble = worker.keys(NOW).unwrap_err();
+        assert_eq!(trouble, Trouble::Scope { scope: "SSH_KEYS:RO", fine_grained: false });
+        let text = trouble.explain(&account, Some(TokenSource::Env("SRHT_TOKEN")), "read your SSH keys");
+        assert!(text.contains("SSH_KEYS:RO grant") && text.contains("meta.sr.ht"), "{text}");
+        assert_eq!(worker.profile(NOW), Err(Trouble::Rejected));
+    }
+
+    #[test]
     fn without_a_sign_in_nothing_is_sent() {
         let (mut worker, sent) = scripted(AccountId::github(), vec![], Fake::default());
         assert_eq!(worker.profile(NOW), Err(Trouble::NoToken));
@@ -1685,6 +1902,39 @@ mod tests {
             worker.add("New", &dir.join("new.pub"), NOW),
             Err(Trouble::Scope { scope: "write:public_key", fine_grained: false })
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_offline_fixture_answers_bitbucket_data_center_and_sourcehut_accounts() {
+        let dir = temp("fixture-more");
+        std::fs::write(dir.join("new.pub"), PUBLIC).unwrap();
+        // Bitbucket Data Center: the header from `user.head`.
+        std::fs::write(dir.join("user.head"), "200\nX-AUSERNAME: ada\n").unwrap();
+        std::fs::write(dir.join("user.json"), r#"{"name": "ada", "displayName": "Ada Lovelace"}"#).unwrap();
+        std::fs::write(dir.join("keys.json"), r#"{"isLastPage": true, "values": []}"#).unwrap();
+        std::fs::write(dir.join("keys.post.json"), format!(r#"{{"id": 4, "text": "{PUBLIC}", "label": "New"}}"#)).unwrap();
+        let server = AccountId { service: Service::BitbucketDataCenter, host: "git.acme.com".to_owned() };
+        let transport = CannedAccount { canned: Canned { dir: dir.clone(), created: false }, added: false };
+        let mut worker = Worker::new(server, Box::new(transport), Box::new(FixtureSignIn), None);
+        assert_eq!(worker.profile(NOW).unwrap().display_name(), "Ada Lovelace");
+        assert!(worker.keys(NOW).unwrap().is_empty());
+        assert_eq!(worker.add("New", &dir.join("new.pub"), NOW).unwrap().id, 4);
+        let sent: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("keys.sent.json")).unwrap()).unwrap();
+        assert_eq!(sent["label"], "New");
+
+        // SourceHut: the same files, told apart by what is asked.
+        let _ = std::fs::remove_file(dir.join("user.head"));
+        std::fs::write(dir.join("user.json"), r#"{"data": {"me": {"canonicalName": "~ada", "username": "ada", "email": ""}}}"#).unwrap();
+        std::fs::write(dir.join("keys.json"), r#"{"data": {"me": {"sshKeys": {"results": [], "cursor": null}}}}"#).unwrap();
+        std::fs::write(dir.join("keys.post.json"), format!(r#"{{"data": {{"createSSHKey": {{"id": 9, "keyType": "ssh-ed25519", "key": "{BLOB}", "comment": "New"}}}}}}"#)).unwrap();
+        let transport = CannedAccount { canned: Canned { dir: dir.clone(), created: false }, added: false };
+        let mut worker = Worker::new(AccountId::sourcehut(), Box::new(transport), Box::new(FixtureSignIn), None);
+        assert_eq!(worker.profile(NOW).unwrap().login, "~ada");
+        assert!(worker.keys(NOW).unwrap().is_empty());
+        assert_eq!(worker.add("New", &dir.join("new.pub"), NOW).unwrap().id, 9);
+        let sent: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("keys.sent.json")).unwrap()).unwrap();
+        assert!(sent["variables"]["key"].as_str().unwrap().ends_with(" New"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

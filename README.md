@@ -400,22 +400,31 @@ be installed.
 - Optionally keep submodules at the commits HEAD records after checkout,
   pull, merge, rebase, reset, cherry-pick and revert
 - GitHub, GitHub Enterprise, GitLab (gitlab.com or your own server),
-  Bitbucket Cloud, Azure DevOps (dev.azure.com and the older
-  visualstudio.com addresses), Codeberg, and your own Gitea or Forgejo:
-  open pull requests (merge requests on GitLab), issues (work items on
-  Azure DevOps; Bitbucket Cloud removed its issue tracker in August 2026)
-  and CI runs (Actions, pipelines, Azure Pipelines builds) in
-  the sidebar, each request with the CI status of its head; check out a
-  pull or merge request as a local branch, from a fork too (on Bitbucket
-  and Azure DevOps, which keep no ref for it, only from a branch in the
-  repository itself)
+  Bitbucket Cloud, your own Bitbucket Data Center, Azure DevOps
+  (dev.azure.com and the older visualstudio.com addresses), Codeberg, and
+  your own Gitea or Forgejo: open pull requests (merge requests on GitLab),
+  issues (work items on Azure DevOps; Bitbucket Cloud removed its issue
+  tracker in August 2026, and Bitbucket Data Center leaves issues to Jira)
+  and CI runs (Actions, pipelines, Azure Pipelines builds, and on Bitbucket
+  Data Center the builds CI servers reported for the open pull requests and
+  the ten most recently changed branches) in the sidebar, each request with
+  the CI status of its head; check out a pull or merge request as a local
+  branch, from a fork too (on Bitbucket and Azure DevOps, which keep no ref
+  for it, only from a branch in the repository itself)
+- SourceHut (git.sr.ht): the tickets of the tracker named like the
+  repository on todo.sr.ht and the repository's builds on builds.sr.ht,
+  each section shown when there are any. SourceHut has no pull requests:
+  patches go to the project's mailing list with `git send-email`, which the
+  sidebar says, linking SourceHut's guide. Its API answers only with a
+  sign-in
 - What the reviewers say, at the right of each pull request: approved,
   changes requested, or review required (GitHub's review decision, and the
   reviews themselves where no rule requires any; without a sign-in, each
   pull request's reviews, a few per refresh within GitHub's 60 requests an
   hour); on GitLab the approvals, `1/2` while some are missing; on Azure
   DevOps the reviewers' votes, with required reviewers counted the same
-  way; on Bitbucket who approved or asked for changes; on Gitea, Forgejo
+  way; on Bitbucket who approved or asked for changes (needs work on
+  Bitbucket Data Center); on Gitea, Forgejo
   and Codeberg each reviewer's latest approval or request for changes
   (reviews that count for the branch's rules, dismissed ones left out).
   Reviews are asked again only for pull requests that changed. The
@@ -429,20 +438,25 @@ be installed.
   their fork mark in the accent colour, and check out from the remote that
   points at the parent, or from its HTTPS address when none does
 - A remote on a server other than the public services is offered as
-  "Connect <server>…": say whether it runs GitLab, GitHub Enterprise, Gitea
-  or Forgejo and its lists appear; right-click the remote to disconnect it
-  again. A GitLab installed under a path (`example.com/gitlab`) is added
-  with that path in Preferences > Integrations > GitLab Self-Managed; its
-  HTTPS and SSH remotes are then recognised
+  "Connect <server>…": say whether it runs GitLab, GitHub Enterprise,
+  Gitea, Forgejo or Bitbucket Data Center and its lists appear; right-click
+  the remote to disconnect it again. A GitLab installed under a path
+  (`example.com/gitlab`) is added with that path in Preferences >
+  Integrations > GitLab Self-Managed, a Bitbucket Data Center likewise (or
+  at once from an HTTPS remote, whose `/scm/` shows the path in front of
+  it); their HTTPS and SSH remotes are then recognised. Bitbucket Data
+  Center remotes are `https://<server>/scm/<project>/<repo>.git` and
+  `ssh://git@<server>:7999/<project>/<repo>.git`, personal repositories
+  under `~<user>`
 - Open a pull or merge request: drop a branch on the list, right-click it,
   or use the list's + button. Title and description are filled in from
   the commits, the branch is pushed first when the remote lacks it, and
   "Open on GitHub" (or the service it is on) works without signing in
 - In a fork, the pull request goes into the parent repository by default
   (Repository in the dialog), from `owner:branch`, on GitHub, GitLab,
-  Gitea, Forgejo, Codeberg and Bitbucket; it shows in the parent's list at
-  once. A branch on another remote of the same server, such as your fork
-  of the repository shown, can be proposed too
+  Gitea, Forgejo, Codeberg, Bitbucket and Bitbucket Data Center; it shows
+  in the parent's list at once. A branch on another remote of the same
+  server, such as your fork of the repository shown, can be proposed too
 
 **Profiles, SSH and signing** (File > Preferences)
 - Profiles: an author name and email, an SSH key and signing settings each;
@@ -510,7 +524,7 @@ in the **Help** menu, LFS locks with the automatic fetch, the others in the
 | Feature | What is sent | Where |
 | --- | --- | --- |
 | Author pictures | SHA-256 of each author's email address, or the GitHub user id from a `noreply` address | gravatar.com, avatars.githubusercontent.com |
-| Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, and the requests you open, with a token when one is found for that host (below). Then, for the requests that changed since: their review states (one GraphQL request on GitHub signed in, each pull request's reviews without a sign-in, at most five a refresh and none once fewer than 20 of the hour's requests are left; each merge request's approvals on GitLab; each pull request's reviews on Gitea, Forgejo and Codeberg), the projects GitLab merge requests come from, and once whether the repository is a fork. In a fork switched to its parent, the same for the parent, and the fork's own lists only when shown again. While Preferences > Integrations shows an account: whose token it is, its SSH keys, and the public keys you add there | api.github.com, gitlab.com, api.bitbucket.org, codeberg.org, dev.azure.com (app.vssps.visualstudio.com for your Azure DevOps profile), and only the servers you connected |
+| Hosting sidebar | Requests for the repository's pull or merge requests, issues and CI runs, and the requests you open, with a token when one is found for that host (below). On Bitbucket Data Center, signed in, its ten most recently changed branches, which of their tips and of the pull requests' heads have builds, and the builds of those that changed. Then, for the requests that changed since: their review states (one GraphQL request on GitHub signed in, each pull request's reviews without a sign-in, at most five a refresh and none once fewer than 20 of the hour's requests are left; each merge request's approvals on GitLab; each pull request's reviews on Gitea, Forgejo and Codeberg), the projects GitLab merge requests come from, and once whether the repository is a fork. In a fork switched to its parent, the same for the parent, and the fork's own lists only when shown again. On SourceHut, signed in only: the tracker's tickets and the owner's latest build jobs. While Preferences > Integrations shows an account: whose token it is, its SSH keys, and the public keys you add there | api.github.com, gitlab.com, api.bitbucket.org, codeberg.org, dev.azure.com (app.vssps.visualstudio.com for your Azure DevOps profile), todo.sr.ht and builds.sr.ht (meta.sr.ht for your SourceHut account), and only the servers you connected |
 | Automatic fetch | `git fetch --prune --all` (without `--prune` when Auto-Prune is off), as you would run it | your remotes |
 | Updates | A request for the latest release shortly after start and every six hours; the download when there is a newer one | api.github.com, github.com and its download host |
 | LFS locks | In repositories that use LFS, `git lfs locks` when the file lists show and then at the automatic fetch interval; with automatic fetch off, only when Preferences > LFS opens or a file is locked or unlocked | your LFS server |
@@ -524,8 +538,8 @@ commands (a password, a passphrase); only those commands know the random
 token it accepts.
 
 A server other than the public services (github.com, gitlab.com,
-bitbucket.org, codeberg.org, Azure DevOps) is never sent anything until
-you have said what it runs; the answer is kept in the settings file
+bitbucket.org, codeberg.org, Azure DevOps, git.sr.ht) is never sent
+anything until you have said what it runs; the answer is kept in the settings file
 (`hosting_servers`). Tokens are looked for per host and sent only to that
 host's API over HTTPS. They are never stored, logged or shown.
 
@@ -539,6 +553,8 @@ host's API over HTTPS. They are never stored, logged or shown.
 | Azure DevOps | `AZURE_DEVOPS_EXT_PAT` (a personal access token), `az account get-access-token` (after `az login`), git's credential helper for the repository's address on dev.azure.com |
 | codeberg.org | `CODEBERG_TOKEN`, `FORGEJO_TOKEN` when `FORGEJO_HOST` names codeberg.org, the login `tea` keeps for codeberg.org, git's credential helper for codeberg.org |
 | Your Gitea / Forgejo | `GITEA_TOKEN` when `GITEA_HOST` names the server (`FORGEJO_TOKEN` and `FORGEJO_HOST` for Forgejo), the login `tea` keeps for the server, git's credential helper for the server |
+| Your Bitbucket Data Center | `BITBUCKET_SERVER_TOKEN` (an HTTP access token, sent as a bearer token) when `BITBUCKET_SERVER_HOST` names the server, git's credential helper for the server (its user name and password, or the password as an access token) |
+| SourceHut (git.sr.ht) | `SRHT_TOKEN` (a personal access token from meta.sr.ht > OAuth 2.0), the `access-token` hut's configuration keeps for sr.ht (not `access-token-cmd`), git's credential helper for git.sr.ht; sent to SourceHut's GraphQL endpoints only |
 
 A server installed under a path is asked about by its name alone
 (`example.com` for `example.com/gitlab`, as git's credential helper and
@@ -598,10 +614,12 @@ src/
   update.rs      checking for, downloading and applying updates
   notification.rs  system notifications
   hosting/       pull / merge requests, issues and CI: github.rs (GitHub
-                 and Enterprise), gitlab.rs, bitbucket.rs, gitea.rs (Gitea,
-                 Forgejo, Codeberg), azure.rs (Azure DevOps), shared sign-in
-                 and network (signin.rs for the last three); account.rs:
-                 the accounts and their SSH keys
+                 and Enterprise), gitlab.rs, bitbucket.rs (Bitbucket
+                 Cloud), bitbucket_dc.rs (Bitbucket Data Center), gitea.rs
+                 (Gitea, Forgejo, Codeberg), azure.rs (Azure DevOps),
+                 sourcehut.rs (SourceHut), shared sign-in and network
+                 (signin.rs for all but the first two); account.rs: the
+                 accounts and their SSH keys
   git/
     repo.rs      snapshot loading (refs, status, history walk)
     graph.rs     lane layout and line colours
@@ -677,9 +695,13 @@ build.rs         the Windows executable's icon and version details
   of a detached HEAD, several cherry-picks, reverts or mails whose last one
   was skipped, or anything committed on top before GitKrill looked (the
   reflog still has them)
-- Bitbucket Data Center (Server), SourceHut and other hosts; Azure DevOps SSH
-  keys cannot be listed or added in Preferences > Integrations (it has no
-  API for them)
+- SourceHut is covered on sr.ht only: a SourceHut of your own keeps its
+  tickets and builds on hosts of their own, which nothing in a remote
+  names. The patches sent to its mailing lists are not listed (the sidebar
+  only says how to send them), and builds are found among the owner's
+  latest 25 jobs. Other hosts (Gitee, ...) are not covered; Azure DevOps
+  SSH keys cannot be listed or added in Preferences > Integrations (it has
+  no API for them)
 - "Review required" (the branch's rules want approvals not given yet) is
   not shown on Gitea, Forgejo and Codeberg, whose rules only repository
   admins may read, nor on GitHub without a sign-in, where only GraphQL

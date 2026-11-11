@@ -1,7 +1,8 @@
-//! What the Bitbucket, Gitea / Forgejo and Azure DevOps clients share: the
-//! sign-in they use (looked for, refused, replaced by the next one found),
-//! the rate limit, conditional requests, and one request below the API with
-//! redirects followed only inside it.
+//! What the Bitbucket (Cloud and Data Center), Gitea / Forgejo, Azure
+//! DevOps and SourceHut clients share: the sign-in they use (looked for,
+//! refused, replaced by the next one found), the rate limit, conditional
+//! requests, and one request below the API with redirects followed only
+//! inside it.
 //!
 //! The GitHub and GitLab clients predate this and keep their own copies of
 //! the same rules.
@@ -39,6 +40,10 @@ pub(super) struct Api {
     /// Statuses that mean "this sign-in is refused": 401, and for Azure
     /// DevOps also 203 (its sign-in page, sent in place of a 401).
     refusals: &'static [u16],
+    /// For a service whose refusal status also means something else
+    /// (Bitbucket Data Center answers 401 for a missing permission too):
+    /// whether an answer with one of `refusals` is about the sign-in.
+    about_sign_in: fn(&HttpResponse) -> bool,
     /// The service's own words in an error answer.
     message: fn(&str) -> String,
 }
@@ -64,8 +69,20 @@ impl Api {
             etags: vec![None; lists],
             vouched: false,
             refusals,
+            about_sign_in: |_| true,
             message,
         }
+    }
+
+    /// The same, telling the refusals of the sign-in from other answers
+    /// with the same status by `about_sign_in`.
+    pub fn telling_refusals(self, about_sign_in: fn(&HttpResponse) -> bool) -> Self {
+        Api { about_sign_in, ..self }
+    }
+
+    /// Whether `response` turns the sign-in it was sent with away.
+    fn refuses(&self, response: &HttpResponse) -> bool {
+        self.refusals.contains(&response.status) && (self.about_sign_in)(response)
     }
 
     /// "Bitbucket", "Codeberg", "Azure DevOps"...
@@ -204,7 +221,7 @@ impl Api {
                     }
                     _ => return Err(self.unexpected_redirect()),
                 },
-                status if self.refusals.contains(&status) && self.token.is_some() => {
+                _ if self.refuses(&response) && self.token.is_some() => {
                     if self.vouched {
                         return Err(self.scope_problem());
                     }
@@ -247,7 +264,7 @@ impl Api {
             }
             match response.status {
                 300..=399 => return Err(self.unexpected_redirect()),
-                status if self.refusals.contains(&status) && self.token.is_some() => {
+                _ if self.refuses(&response) && self.token.is_some() => {
                     if self.vouched {
                         return Err(self.scope_problem());
                     }

@@ -1,6 +1,9 @@
 //! Sidebar sections for pull requests (merge requests on GitLab), issues
-//! (work items on Azure DevOps) and CI runs, the offer to connect a
-//! self-hosted server, and the dialog that asks what runs on it.
+//! (work items on Azure DevOps, tickets on SourceHut) and CI runs, the
+//! offer to connect a self-hosted server, and the dialog that asks what
+//! runs on it. SourceHut has no pull requests: its section says how patches
+//! are sent instead, and a section the service says the repository does
+//! not have (`Feed::absent`) is left out.
 //!
 //! In a fork whose parent is known (`hosting::Family`), a Fork / Parent
 //! switch above the sections picks whose lists they show, remembered per
@@ -18,7 +21,7 @@ use crate::state::{Dialog, RepoTab, Shared};
 use crate::theme::{self, icons};
 use crate::ui::dialogs;
 use crate::ui::graph::drag::{self, Branch};
-use crate::ui::sidebar::{leaf, row, section, section_header};
+use crate::ui::sidebar::{leaf, plain_section_header, row, section, section_header};
 use crate::ui::widgets::{elided, elided_pair, menu_item, segmented_wide, spinner};
 
 /// What a click or a menu entry asked for; applied once the lists are drawn.
@@ -136,7 +139,10 @@ fn lists(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, shown: &Shown, act
     };
     let now = hosting::epoch_now() as i64;
 
-    // ---- pull / merge requests ----
+    // ---- pull / merge requests, or how patches are sent ----
+    if !service.has_pulls() {
+        patches_section(ui, tab, shown, act);
+    }
     let mut pulls: Vec<&PullRequest> = view
         .pulls
         .items
@@ -150,7 +156,7 @@ fn lists(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, shown: &Shown, act
     let count = (pulls.len(), view.pulls.items.len());
     let url = repo.pulls_url();
     let top = ui.cursor().top();
-    if header(ui, tab, shown, (service.pulls_title(), pull_icon(service), &url), count, true, act) {
+    if service.has_pulls() && header(ui, tab, shown, (service.pulls_title(), pull_icon(service), &url), count, true, act) {
         notice(ui, shown, &view.pulls, act);
         for pr in pulls {
             pull_row(ui, snap, shown, pr, act);
@@ -159,7 +165,9 @@ fn lists(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, shown: &Shown, act
     }
     // A branch dropped anywhere on the list opens the dialog for it.
     let list = Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=ui.cursor().top());
-    if let Some(branch) = drop_target(ui, snap, shown, list) {
+    if service.has_pulls()
+        && let Some(branch) = drop_target(ui, snap, shown, list)
+    {
         *act = Some(Act::NewPull(Some(branch)));
     }
 
@@ -172,7 +180,9 @@ fn lists(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, shown: &Shown, act
         .collect();
     let count = (issues.len(), view.issues.items.len());
     let url = repo.issues_url();
-    if service.has_issues() && header(ui, tab, shown, (service.issues_title(), icons::RADIO_BUTTON, &url), count, false, act) {
+    let icon = if service == Service::SourceHut { icons::TICKET } else { icons::RADIO_BUTTON };
+    let issues_shown = service.has_issues() && !view.issues.absent;
+    if issues_shown && header(ui, tab, shown, (service.issues_title(), icon, &url), count, false, act) {
         notice(ui, shown, &view.issues, act);
         for issue in issues {
             issue_row(ui, shown, issue, act);
@@ -189,7 +199,7 @@ fn lists(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, shown: &Shown, act
         .collect();
     let count = (runs.len(), view.runs.items.len());
     let url = repo.runs_url();
-    if header(ui, tab, shown, (service.ci_title(), icons::PLAY_CIRCLE, &url), count, false, act) {
+    if !view.runs.absent && header(ui, tab, shown, (service.ci_title(), icons::PLAY_CIRCLE, &url), count, false, act) {
         notice(ui, shown, &view.runs, act);
         for run in runs {
             run_row(ui, shown, run, now, act);
@@ -200,6 +210,46 @@ fn lists(ui: &mut Ui, tab: &mut RepoTab, snap: &RepoSnapshot, shown: &Shown, act
 
 fn pull_icon(service: Service) -> &'static str {
     if service.is_gitlab() { icons::GIT_MERGE } else { icons::GIT_PULL_REQUEST }
+}
+
+/// SourceHut's stand-in for the pull request list: patches go by email to
+/// the project's mailing list. The row opens SourceHut's guide to setting
+/// `git send-email` up.
+fn patches_section(ui: &mut Ui, tab: &mut RepoTab, shown: &Shown, act: &mut Option<Act>) {
+    let (open, response) = plain_section_header(ui, tab, "PATCHES", icons::ENVELOPE_SIMPLE);
+    let home = shown.repo.home_url();
+    response.context_menu(|ui| {
+        ui.set_min_width(200.0);
+        if menu_item(ui, icons::ARROW_SQUARE_OUT, &format!("Open on {}", shown.repo.site())) {
+            browse(&home);
+        }
+    });
+    if !open {
+        return;
+    }
+    let row = leaf(ui, 0, false, icons::PAPER_PLANE_TILT, "Patches go by email", theme::text(), "");
+    if opened(&row) {
+        browse(hosting::sourcehut::SEND_EMAIL_GUIDE);
+    }
+    row.context_menu(|ui| {
+        ui.set_min_width(220.0);
+        if menu_item(ui, icons::ARROW_SQUARE_OUT, "How to send patches (git-send-email.io)") {
+            browse(hosting::sourcehut::SEND_EMAIL_GUIDE);
+        }
+        if menu_item(ui, icons::ARROW_SQUARE_OUT, &format!("Open {} on SourceHut", shown.repo.slug())) {
+            browse(&home);
+        }
+        ui.separator();
+        refresh_item(ui, act);
+    });
+    row.on_hover_ui(|ui| {
+        ui.set_max_width(320.0);
+        ui.label(
+            "SourceHut has no pull requests. Patches are mailed to the project's mailing list with \
+             git send-email; the repository's page or its README names the list. Click for SourceHut's \
+             guide to setting git send-email up.",
+        );
+    });
 }
 
 /// Makes `rect` (the pull request section) a place to drop a branch: it is
@@ -367,6 +417,7 @@ fn notice<T>(ui: &mut Ui, shown: &Shown, feed: &Feed<T>, act: &mut Option<Act>) 
     if let Some(problem) = &feed.problem {
         let icon = match problem {
             hosting::Problem::RateLimited { .. } => icons::HOURGLASS,
+            hosting::Problem::SignInNeeded { .. } => icons::SIGN_IN,
             _ => icons::WARNING,
         };
         let response = row(ui, 0, false, |painter, rect, x| {
@@ -482,14 +533,19 @@ fn local_branch<'a>(snap: &'a RepoSnapshot, shown: &Shown, pr: &PullRequest) -> 
     })
 }
 
-fn checks_mark(service: Service, checks: Checks) -> (&'static str, Color32, &'static str) {
-    let pipelines = service.has_pipelines();
+fn checks_mark(service: Service, checks: Checks) -> (&'static str, Color32, String) {
+    // "Pipeline", "Builds" or "Checks".
+    let what = if service.has_pipelines() {
+        "Pipeline"
+    } else if service.has_builds() {
+        "Builds"
+    } else {
+        "Checks"
+    };
     match checks {
-        Checks::Passing => (icons::CHECK, theme::green(), if pipelines { "Pipeline passed" } else { "Checks passed" }),
-        Checks::Failing => (icons::X, theme::red(), if pipelines { "Pipeline failed" } else { "Checks failed" }),
-        Checks::Pending => {
-            (icons::CIRCLE_NOTCH, theme::yellow(), if pipelines { "Pipeline running" } else { "Checks running" })
-        }
+        Checks::Passing => (icons::CHECK, theme::green(), format!("{what} passed")),
+        Checks::Failing => (icons::X, theme::red(), format!("{what} failed")),
+        Checks::Pending => (icons::CIRCLE_NOTCH, theme::yellow(), format!("{what} running")),
     }
 }
 
@@ -556,8 +612,8 @@ fn pull_row(ui: &mut Ui, snap: &RepoSnapshot, shown: &Shown, pr: &PullRequest, a
         (false, false) => (theme::green(), theme::text()),
     };
     let mut marks = Vec::new();
-    if let Some((mark, color, _)) = checks {
-        marks.push((mark, 13.0, color));
+    if let Some((mark, color, _)) = &checks {
+        marks.push((*mark, 13.0, *color));
     }
     if let Some((mark, color, _)) = &review {
         // An icon alone, or with a count of approvals (smaller).
@@ -644,7 +700,7 @@ fn pull_row(ui: &mut Ui, snap: &RepoSnapshot, shown: &Shown, pr: &PullRequest, a
             }
             (None, _) => {}
         }
-        if let Some((_, _, meaning)) = checks {
+        if let Some((_, _, meaning)) = &checks {
             text.push_str(&format!("\n{meaning}"));
         }
         if let Some(branch) = local {
@@ -721,7 +777,7 @@ fn run_row(ui: &mut Ui, shown: &Shown, run: &Run, now: i64, act: &mut Option<Act
         painter.galley(pos2(x + 20.0, (y - galley.size().y / 2.0).round()), galley, theme::text());
     });
 
-    let url = shown.repo.run_url(run.id);
+    let url = shown.repo.run_page(run);
     if opened(&response) {
         browse(&url);
     }
@@ -733,7 +789,11 @@ fn run_row(ui: &mut Ui, shown: &Shown, run: &Run, now: i64, act: &mut Option<Act
     });
     response.on_hover_ui(|ui| {
         ui.set_max_width(360.0);
-        let mut text = format!("{} #{}  ·  {}", run.workflow, run.number, run.outcome);
+        // Bitbucket Data Center's builds are not always numbered.
+        let mut text = match run.number {
+            0 => format!("{}  ·  {}", run.workflow, run.outcome),
+            number => format!("{} #{number}  ·  {}", run.workflow, run.outcome),
+        };
         // Scheduled runs are titled after their workflow: say it once.
         if !run.title.is_empty() && run.title != run.workflow {
             text.push_str(&format!("\n{}", run.title));
@@ -777,8 +837,8 @@ fn offer_section(ui: &mut Ui, tab: &mut RepoTab, offers: &[Offer], act: &mut Opt
         response.on_hover_ui(|ui| {
             ui.set_max_width(320.0);
             ui.label(format!(
-                "{} is on {}. Say what it runs (GitLab, GitHub Enterprise, Gitea or Forgejo) \
-                 to see its requests, issues and CI here. Nothing is sent to {} until then.",
+                "{} is on {}. Say what it runs (GitLab, GitHub Enterprise, Gitea, Forgejo or Bitbucket \
+                 Data Center) to see its requests, issues and CI here. Nothing is sent to {} until then.",
                 offer.path, offer.host, offer.host
             ));
         });
@@ -829,6 +889,9 @@ pub fn remote_menu(ui: &mut Ui, shared: &mut Shared, remote: &RemoteInfo) {
 /// The body of [`Dialog::ConnectServer`]. Returns true when it should close.
 pub fn connect_body(ui: &mut Ui, shared: &mut Shared, host: &str, path: &str, choice: &mut Option<ServerKind>) -> bool {
     dialogs::title(ui, &format!("Connect {host}"));
+    // Where the server is kept: with the path it is installed under, for a
+    // Bitbucket Data Center whose HTTPS remote shows one.
+    let key = |kind: ServerKind| hosting::server_key(kind, host, path);
     // Opened from Preferences > Integrations, it is about no repository in
     // particular.
     let path = if path.is_empty() { "its repositories" } else { path };
@@ -845,6 +908,7 @@ pub fn connect_body(ui: &mut Ui, shared: &mut Shared, host: &str, path: &str, ch
         (ServerKind::GitHubEnterprise, icons::GITHUB_LOGO, "GitHub Enterprise"),
         (ServerKind::Gitea, icons::COFFEE, "Gitea"),
         (ServerKind::Forgejo, icons::HAMMER, "Forgejo"),
+        (ServerKind::BitbucketDataCenter, icons::PAINT_BUCKET, "Bitbucket Data Center"),
         (ServerKind::Ignored, icons::PROHIBIT, "None of these: don't offer again"),
     ];
     for (kind, icon, label) in options {
@@ -896,6 +960,12 @@ pub fn connect_body(ui: &mut Ui, shared: &mut Shared, host: &str, path: &str, ch
              FORGEJO_TOKEN when FORGEJO_HOST names it, tea's sign-in, or Git's credential manager.",
             hosting::api_base(Service::Forgejo, host)
         ),
+        // Kept with the path it is installed under when the remote shows one.
+        Some(ServerKind::BitbucketDataCenter) => format!(
+            "Requests go to {} only. A token is used if one is found for this server: \
+             BITBUCKET_SERVER_TOKEN when BITBUCKET_SERVER_HOST names it, or Git's credential manager.",
+            hosting::api_base(Service::BitbucketDataCenter, &key(ServerKind::BitbucketDataCenter))
+        ),
         Some(ServerKind::Ignored) => format!(
             "{host} is not contacted, and not offered again. Right-click the remote to \
              connect it later."
@@ -914,7 +984,7 @@ pub fn connect_body(ui: &mut Ui, shared: &mut Shared, host: &str, path: &str, ch
     match dialogs::buttons(ui, button, choice.is_some(), false) {
         Some(true) => {
             if let Some(kind) = *choice {
-                shared.settings.hosting_servers.insert(host.to_owned(), kind);
+                shared.settings.hosting_servers.insert(key(kind), kind);
             }
             true
         }

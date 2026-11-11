@@ -188,6 +188,16 @@ fn fixture_files_are_named_after_the_detail_asked_for() {
         ("https://dev.azure.com/org/proj/_apis/git/repositories/app/pullrequests", None),
         ("https://gitlab.com/api/v4/projects/group%2Fapp/merge_requests", None),
         ("https://gitlab.com/api/v4/projects/7/pipelines", None),
+        // Bitbucket Data Center: the repository, a commit's builds, and its
+        // lists below the repository.
+        ("https://git.acme.com/rest/api/1.0/projects/PRJ/repos/app", Some("repo")),
+        (
+            "https://git.acme.com/rest/build-status/1.0/commits/1111111111111111111111111111111111111111",
+            Some("builds-1111111111111111111111111111111111111111"),
+        ),
+        ("https://git.acme.com/rest/build-status/1.0/commits/../../x", None),
+        ("https://git.acme.com/rest/api/1.0/projects/PRJ/repos/app/pull-requests", None),
+        ("https://git.acme.com/rest/api/1.0/projects/~ADA/repos/app/branches", None),
     ] {
         assert_eq!(detail_fixture(path).as_deref(), name, "{path}");
     }

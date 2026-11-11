@@ -420,13 +420,16 @@ pub fn entries(tabs: &[RepoTab], active: usize, settings: &Settings) -> Vec<Entr
     crate::ui::image_diff::palette_entries(&mut list);
     if let Some(shown) = tab.and_then(|tab| tab.hosting.connected()) {
         let service = shown.repo.service;
-        list.push(
-            Entry::on_tab("create-pr", if service.is_gitlab() { icons::GIT_MERGE } else { icons::GIT_PULL_REQUEST }, format!("Create {}", service.pull_word()), |tab, shared| {
-                crate::ui::new_pull::open(tab, shared, None)
-            })
-            .detail(format!("on {}", shown.repo.site()))
-            .keywords("pull request merge request mr pr open propose"),
-        );
+        // SourceHut takes patches by email: no pull request to create.
+        if service.has_pulls() {
+            list.push(
+                Entry::on_tab("create-pr", if service.is_gitlab() { icons::GIT_MERGE } else { icons::GIT_PULL_REQUEST }, format!("Create {}", service.pull_word()), |tab, shared| {
+                    crate::ui::new_pull::open(tab, shared, None)
+                })
+                .detail(format!("on {}", shown.repo.site()))
+                .keywords("pull request merge request mr pr open propose"),
+            );
+        }
         // A fork: the sidebar's Fork / Parent switch.
         if let Some(family) = &shown.family {
             let parent = !family.parent_shown;

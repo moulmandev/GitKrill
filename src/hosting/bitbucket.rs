@@ -1,5 +1,5 @@
 //! Bitbucket Cloud (bitbucket.org): the REST API 2.0 endpoints and their
-//! JSON. Bitbucket Data Center has another API and is not covered.
+//! JSON. Bitbucket Data Center has another API: see [`super::bitbucket_dc`].
 //!
 //! Lists come in pages (`{"values": [...], "next": "..."}`). A pull
 //! request's head commit is listed by its first 12 digits only; the CI

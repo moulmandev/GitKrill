@@ -57,6 +57,14 @@ pub fn open(tab: &mut RepoTab, shared: &mut Shared, branch: Option<Branch>) {
         );
         return;
     };
+    if !shown.repo.service.has_pulls() {
+        shared.toast(
+            ToastKind::Error,
+            format!("{} has no pull requests", shown.repo.site()),
+            "Send the branch as patches to the project's mailing list with git send-email. git-send-email.io shows how to set it up.",
+        );
+        return;
+    }
     let related = hosting::related(&snap.remotes, &shared.settings.hosting_servers, &shown.repo);
     let hosted = hosted_remotes(&shown.remote, &related);
     let head = branch

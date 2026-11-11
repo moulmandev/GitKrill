@@ -1,10 +1,11 @@
 //! Preferences > Integrations: the hosting accounts GitKrill talks to.
 //!
 //! A column of services (GitHub, GitHub Enterprise Server, GitLab, GitLab
-//! Self-Managed, Bitbucket, Azure DevOps, Codeberg, Gitea, Forgejo, with the
-//! servers connected under the self-hosted ones) beside the one chosen: the
-//! sign-in GitKrill finds there and where it came from, the account it
-//! belongs to, and that account's SSH keys.
+//! Self-Managed, Bitbucket, Bitbucket Data Center, Azure DevOps, Codeberg,
+//! Gitea, Forgejo, SourceHut, with the servers connected under the
+//! self-hosted ones) beside the one chosen: the sign-in GitKrill finds there
+//! and where it came from, the account it belongs to, and that account's
+//! SSH keys.
 //!
 //! Nothing is looked up before an account is shown, and nothing at all while
 //! the hosting integration is off. Each account's lookups run on a thread of
@@ -39,12 +40,15 @@ enum Entry {
     /// Self-managed GitLab servers: one of them, or (`None`) the list.
     SelfManaged(Option<String>),
     Bitbucket,
+    /// Bitbucket Data Center servers: one of them, or (`None`) the list.
+    DataCenter(Option<String>),
     Azure,
     Codeberg,
     /// Gitea servers: one of them, or (`None`) the list.
     Gitea(Option<String>),
     /// Forgejo servers: one of them, or (`None`) the list.
     Forgejo(Option<String>),
+    SourceHut,
 }
 
 /// Servers the remotes of the open repositories point at, read once in the
@@ -66,7 +70,8 @@ pub struct State {
     found: Found,
     /// "Add a server": what is typed, and why it was turned down.
     new_server: String,
-    /// The path a GitLab is installed under, when it is not at the root.
+    /// The path a GitLab or Bitbucket Data Center is installed under, when
+    /// it is not at the root.
     new_server_path: String,
     new_server_error: Option<String>,
     /// A server the connect dialog was opened for: chosen once it is added.
@@ -137,6 +142,9 @@ fn follow_settings(page: &Page<'_>, state: &mut State) {
         Entry::Forgejo(Some(host)) if servers.get(host) != Some(&ServerKind::Forgejo) => {
             state.entry = Entry::Forgejo(None);
         }
+        Entry::DataCenter(Some(host)) if servers.get(host) != Some(&ServerKind::BitbucketDataCenter) => {
+            state.entry = Entry::DataCenter(None);
+        }
         _ => {}
     }
 }
@@ -146,6 +154,7 @@ fn entry_for(kind: ServerKind, host: Option<String>) -> Entry {
         ServerKind::GitLab => Entry::SelfManaged(host),
         ServerKind::Gitea => Entry::Gitea(host),
         ServerKind::Forgejo => Entry::Forgejo(host),
+        ServerKind::BitbucketDataCenter => Entry::DataCenter(host),
         _ => Entry::Enterprise(host),
     }
 }
@@ -163,6 +172,7 @@ fn services(ui: &mut Ui, page: &Page<'_>, state: &mut State) {
     let gitlab = servers_of(page, ServerKind::GitLab);
     let gitea = servers_of(page, ServerKind::Gitea);
     let forgejo = servers_of(page, ServerKind::Forgejo);
+    let data_center = servers_of(page, ServerKind::BitbucketDataCenter);
     Frame::new()
         .fill(theme::bg_panel())
         .corner_radius(6.0)
@@ -171,15 +181,19 @@ fn services(ui: &mut Ui, page: &Page<'_>, state: &mut State) {
             // Top to bottom, inside the page's left-to-right row.
             ui.with_layout(Layout::top_down(Align::Min), |ui| {
                 column(ui, state, enterprise, gitlab);
-                more_services(ui, state, gitea, forgejo);
+                more_services(ui, state, data_center, gitea, forgejo);
             });
         });
 }
 
-/// Bitbucket, Azure DevOps, Codeberg, then Gitea and Forgejo with their
-/// servers.
-fn more_services(ui: &mut Ui, state: &mut State, gitea: Vec<String>, forgejo: Vec<String>) {
+/// Bitbucket and Bitbucket Data Center with its servers, Azure DevOps,
+/// Codeberg, Gitea and Forgejo with their servers, then SourceHut.
+fn more_services(ui: &mut Ui, state: &mut State, data_center: Vec<String>, gitea: Vec<String>, forgejo: Vec<String>) {
     service_row(ui, state, Entry::Bitbucket, icons::PAINT_BUCKET, "Bitbucket", false);
+    service_row(ui, state, Entry::DataCenter(None), icons::PAINT_BUCKET, "Bitbucket Data Center", false);
+    for host in data_center {
+        service_row(ui, state, Entry::DataCenter(Some(host.clone())), icons::HARD_DRIVES, &host, true);
+    }
     service_row(ui, state, Entry::Azure, icons::INFINITY, "Azure DevOps", false);
     service_row(ui, state, Entry::Codeberg, icons::MOUNTAINS, "Codeberg", false);
     service_row(ui, state, Entry::Gitea(None), icons::COFFEE, "Gitea", false);
@@ -190,6 +204,7 @@ fn more_services(ui: &mut Ui, state: &mut State, gitea: Vec<String>, forgejo: Ve
     for host in forgejo {
         service_row(ui, state, Entry::Forgejo(Some(host.clone())), icons::HARD_DRIVES, &host, true);
     }
+    service_row(ui, state, Entry::SourceHut, icons::CIRCLE, "SourceHut", false);
 }
 
 /// The services, each followed by its servers.
@@ -263,6 +278,14 @@ fn detail(ui: &mut Ui, page: &mut Page<'_>, state: &mut State) {
         Entry::Forgejo(None) => server_list(ui, page, state, ServerKind::Forgejo),
         Entry::Gitea(Some(host)) => server_page(ui, page, state, AccountId { service: Service::Gitea, host }),
         Entry::Forgejo(Some(host)) => server_page(ui, page, state, AccountId { service: Service::Forgejo, host }),
+        Entry::DataCenter(None) => server_list(ui, page, state, ServerKind::BitbucketDataCenter),
+        Entry::DataCenter(Some(host)) => {
+            server_page(ui, page, state, AccountId { service: Service::BitbucketDataCenter, host });
+        }
+        Entry::SourceHut => {
+            title(ui, "SourceHut", Some("git.sr.ht, with its tickets on todo.sr.ht and builds on builds.sr.ht."));
+            account_rows(ui, page, state, AccountId::sourcehut());
+        }
     }
 }
 
@@ -496,6 +519,7 @@ fn source_words(account: &AccountId, source: TokenSource) -> String {
         TokenSource::Cli if account.service.is_gitlab() => "the GitLab CLI (glab)".to_owned(),
         TokenSource::Cli if account.service.is_gitea() => "the Gitea CLI (tea)".to_owned(),
         TokenSource::Cli if account.service == Service::AzureDevOps => "the Azure CLI (az)".to_owned(),
+        TokenSource::Cli if account.service == Service::SourceHut => "hut's sign-in".to_owned(),
         TokenSource::Cli => "the GitHub CLI (gh)".to_owned(),
         TokenSource::CredentialHelper => "Git's credential manager".to_owned(),
     }
@@ -531,6 +555,20 @@ fn sign_in_help(account: &AccountId) -> String {
                     login`), then Git's credential manager. The credential manager signs in per organisation, \
                     so its sign-in is used in the sidebar of each repository but cannot be shown here. Sign in \
                     one of these ways, then click Check again."
+                .to_owned();
+        }
+        Service::BitbucketDataCenter => {
+            return format!(
+                "GitKrill looks for a sign-in for {host} in $BITBUCKET_SERVER_TOKEN while $BITBUCKET_SERVER_HOST \
+                 is {host} (an HTTP access token), then Git's credential manager, which keeps one after a push \
+                 or fetch over HTTPS. Sign in one of these ways, then click Check again."
+            );
+        }
+        Service::SourceHut => {
+            return "GitKrill looks for a sign-in for SourceHut in $SRHT_TOKEN, then hut's sign-in (run `hut \
+                    init`), then Git's credential manager. Use a personal access token from meta.sr.ht > OAuth \
+                    2.0: reading your account needs its PROFILE grant, your keys SSH_KEYS. Sign in one of these \
+                    ways, then click Check again."
                 .to_owned();
         }
         Service::Codeberg => ("$CODEBERG_TOKEN".to_owned(), "tea's sign-in (run `tea login add`)".to_owned()),
@@ -729,6 +767,7 @@ fn kind_name(kind: ServerKind) -> &'static str {
         ServerKind::GitLab => "GitLab Self-Managed",
         ServerKind::Gitea => "Gitea",
         ServerKind::Forgejo => "Forgejo",
+        ServerKind::BitbucketDataCenter => "Bitbucket Data Center",
         _ => "GitHub Enterprise Server",
     }
 }
@@ -810,16 +849,20 @@ fn server_list(ui: &mut Ui, page: &mut Page<'_>, state: &mut State, kind: Server
                 state.new_server_error = None;
             }
             let mut entered = field.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter));
-            // GitLab can be installed under a path (a relative URL root);
-            // GitHub Enterprise cannot.
-            let gitlab = kind == ServerKind::GitLab;
-            if gitlab {
+            // GitLab and Bitbucket Data Center can be installed under a path
+            // (a relative URL root, a context path); the others cannot.
+            let rooted = matches!(kind, ServerKind::GitLab | ServerKind::BitbucketDataCenter);
+            if rooted {
                 ui.label(RichText::new("/").size(14.0).color(theme::text_dim()));
                 let path = TextEdit::singleline(&mut state.new_server_path)
                     .hint_text("path")
                     .desired_width(110.0)
                     .margin(vec2(8.0, 5.0));
-                let path = ui.add(path).on_hover_text("Only when GitLab is not at the root of the server: gitlab for example.com/gitlab");
+                let tip = match kind {
+                    ServerKind::GitLab => "Only when GitLab is not at the root of the server: gitlab for example.com/gitlab",
+                    _ => "Only when Bitbucket is not at the root of the server: bitbucket for example.com/bitbucket",
+                };
+                let path = ui.add(path).on_hover_text(tip);
                 if path.changed() {
                     state.new_server_error = None;
                 }
@@ -827,7 +870,7 @@ fn server_list(ui: &mut Ui, page: &mut Page<'_>, state: &mut State, kind: Server
             }
             let clicked = form::button(ui, "Connect…", theme::accent()).clicked();
             if (entered || clicked) && !state.new_server.trim().is_empty() {
-                let path = if gitlab { state.new_server_path.as_str() } else { "" };
+                let path = if rooted { state.new_server_path.as_str() } else { "" };
                 match account::server_host(&state.new_server).and_then(|host| account::under_path(&host, path)) {
                     Ok(host) => {
                         connect = Some((host, String::new()));
@@ -846,6 +889,11 @@ fn server_list(ui: &mut Ui, page: &mut Page<'_>, state: &mut State, kind: Server
                 "Its name, as in your remotes' addresses, and the path GitLab is installed under when it is not \
                  at the root (gitlab for example.com/gitlab). You confirm what runs there before anything is sent to it."
             }
+            ServerKind::BitbucketDataCenter => {
+                "Its name, as in your remotes' addresses, and the path Bitbucket is installed under when it is \
+                 not at the root (what comes before /scm/ in its HTTPS addresses). You confirm what runs there \
+                 before anything is sent to it."
+            }
             _ => "Its name, as in your remotes' addresses. You confirm what runs there before anything is sent to it.",
         };
         form::help(ui, help);
@@ -858,7 +906,9 @@ fn server_list(ui: &mut Ui, page: &mut Page<'_>, state: &mut State, kind: Server
         forget_server(page, state, &host);
     }
     if let Some((host, path)) = connect {
-        state.awaiting = Some((host.clone(), kind));
+        // The name it is kept under, which may take the path in front of
+        // a Bitbucket Data Center's `/scm/`.
+        state.awaiting = Some((crate::hosting::server_key(kind, &host, &path), kind));
         page.shared.show(Dialog::ConnectServer { host, path, choice: Some(kind) });
     }
 }

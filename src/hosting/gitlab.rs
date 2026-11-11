@@ -716,6 +716,7 @@ impl Backend for Client {
                 Outcome::Fresh { items, more }
             }
             Outcome::Unchanged => Outcome::Unchanged,
+            Outcome::Absent => Outcome::Absent,
             Outcome::Failed(problem) => Outcome::Failed(problem),
         }
     }

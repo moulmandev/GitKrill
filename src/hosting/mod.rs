@@ -6,14 +6,16 @@
 //!   ([`find_token`]), the network ([`Wire`]) and the per-tab
 //!   [`HostingState`] are shared by every service.
 //! * [`github`] (github.com and GitHub Enterprise), [`gitlab`] (gitlab.com
-//!   and self-managed GitLab), [`bitbucket`] (bitbucket.org), [`gitea`]
-//!   (Gitea, Forgejo and codeberg.org) and [`azure`] (Azure DevOps) hold the
-//!   REST endpoints and their JSON, each behind the [`Backend`] trait. The
-//!   last three share their sign-in and request handling (`signin`).
+//!   and self-managed GitLab), [`bitbucket`] (bitbucket.org),
+//!   [`bitbucket_dc`] (Bitbucket Data Center), [`gitea`] (Gitea, Forgejo
+//!   and codeberg.org), [`azure`] (Azure DevOps) and [`sourcehut`]
+//!   (git.sr.ht, with todo.sr.ht and builds.sr.ht, through GraphQL) hold
+//!   the endpoints and their JSON, each behind the [`Backend`] trait. All
+//!   but the first two share their sign-in and request handling (`signin`).
 //!
 //! Which service a remote is on comes from its host. github.com,
-//! gitlab.com, bitbucket.org, codeberg.org and Azure DevOps are known; any
-//! other host is contacted only once the user has said what runs there
+//! gitlab.com, bitbucket.org, codeberg.org, Azure DevOps and git.sr.ht are
+//! known; any other host is contacted only once the user has said what runs there
 //! ([`Servers`], kept in the settings). Until then the sidebar merely offers
 //! to connect it ([`offers`]).
 //!
@@ -88,6 +90,12 @@ pub enum Service {
     /// Azure DevOps Services: dev.azure.com, and the older
     /// `<organisation>.visualstudio.com` addresses.
     AzureDevOps,
+    /// Bitbucket Data Center (formerly Bitbucket Server) on a host the user
+    /// named, possibly installed under a path.
+    BitbucketDataCenter,
+    /// SourceHut's git.sr.ht, with its tickets on todo.sr.ht and its builds
+    /// on builds.sr.ht. It has no pull requests: patches go by email.
+    SourceHut,
 }
 
 impl Service {
@@ -101,6 +109,8 @@ impl Service {
             Service::Forgejo => "Forgejo",
             Service::Codeberg => "Codeberg",
             Service::AzureDevOps => "Azure DevOps",
+            Service::BitbucketDataCenter => "Bitbucket Data Center",
+            Service::SourceHut => "SourceHut",
         }
     }
 
@@ -115,15 +125,16 @@ impl Service {
     }
 
     /// The service's own command line tool, which GitKrill asks for the
-    /// sign-in it keeps: `gh`, `glab`, `tea` (Gitea's, for Forgejo too) or
-    /// `az`. Bitbucket has none.
+    /// sign-in it keeps: `gh`, `glab`, `tea` (Gitea's, for Forgejo too),
+    /// `az` or `hut` (SourceHut's). Bitbucket has none.
     pub fn cli_tool(self) -> Option<&'static str> {
         match self {
             Service::GitHub | Service::GitHubEnterprise => Some("gh"),
             Service::GitLab => Some("glab"),
             Service::Gitea | Service::Forgejo | Service::Codeberg => Some("tea"),
             Service::AzureDevOps => Some("az"),
-            Service::Bitbucket => None,
+            Service::SourceHut => Some("hut"),
+            Service::Bitbucket | Service::BitbucketDataCenter => None,
         }
     }
 
@@ -136,21 +147,42 @@ impl Service {
     /// Whether the remote keeps a ref following each pull request's head
     /// ([`Service::pull_ref`]). Bitbucket Cloud has none, and Azure DevOps
     /// only the merge result: there a pull request is checked out from its
-    /// branch ([`checkout_pull_request`]).
+    /// branch ([`checkout_pull_request`]). Bitbucket Data Center keeps
+    /// `refs/pull-requests/<id>/from`, also for pull requests from forks.
     pub fn has_pull_refs(self) -> bool {
-        !matches!(self, Service::Bitbucket | Service::AzureDevOps)
+        !matches!(self, Service::Bitbucket | Service::AzureDevOps | Service::SourceHut)
+    }
+
+    /// Whether the service has pull requests at all. SourceHut takes
+    /// patches by email instead: its sidebar says how, and nothing offers
+    /// to open a pull request there.
+    pub fn has_pulls(self) -> bool {
+        self != Service::SourceHut
     }
 
     /// Whether the service has an issue tracker to list. Bitbucket Cloud
     /// removed its own on 20 August 2026 (its endpoints answer 410 Gone),
-    /// so nothing is asked and the sidebar has no section for it.
+    /// and Bitbucket Data Center leaves issues to Jira, so nothing is asked
+    /// and the sidebar has no section for them.
     pub fn has_issues(self) -> bool {
-        self != Service::Bitbucket
+        !matches!(self, Service::Bitbucket | Service::BitbucketDataCenter)
     }
 
-    /// Sidebar title of the issue section: Azure DevOps has work items.
+    /// Whether its API answers only with a sign-in, about public
+    /// repositories too (SourceHut's GraphQL APIs): then nothing is asked
+    /// without one.
+    pub fn needs_sign_in(self) -> bool {
+        self == Service::SourceHut
+    }
+
+    /// Sidebar title of the issue section: Azure DevOps has work items,
+    /// SourceHut tickets.
     pub fn issues_title(self) -> &'static str {
-        if self == Service::AzureDevOps { "WORK ITEMS" } else { "ISSUES" }
+        match self {
+            Service::AzureDevOps => "WORK ITEMS",
+            Service::SourceHut => "TICKETS",
+            _ => "ISSUES",
+        }
     }
 
     /// "pull request", or "merge request" on GitLab.
@@ -174,9 +206,17 @@ impl Service {
             "PIPELINES"
         } else if self.is_gitea() {
             "ACTIONS"
+        } else if self.has_builds() {
+            "BUILDS"
         } else {
             "GITHUB ACTIONS"
         }
+    }
+
+    /// Its CI results are called builds: Bitbucket Data Center's build
+    /// statuses, SourceHut's build jobs.
+    pub fn has_builds(self) -> bool {
+        matches!(self, Service::BitbucketDataCenter | Service::SourceHut)
     }
 
     /// A pull request's number as the service writes it: `#12`, or `!12`
@@ -202,6 +242,7 @@ impl Service {
     fn pull_ref(self, number: u64) -> String {
         match self {
             Service::GitLab => format!("merge-requests/{number}/head"),
+            Service::BitbucketDataCenter => format!("refs/pull-requests/{number}/from"),
             _ => format!("pull/{number}/head"),
         }
     }
@@ -215,6 +256,7 @@ pub enum ServerKind {
     GitLab,
     Gitea,
     Forgejo,
+    BitbucketDataCenter,
     /// Neither: never contacted, and not offered again. An entry this
     /// version does not understand reads as this too.
     Ignored,
@@ -227,6 +269,7 @@ impl ServerKind {
             ServerKind::GitLab => Some(Service::GitLab),
             ServerKind::Gitea => Some(Service::Gitea),
             ServerKind::Forgejo => Some(Service::Forgejo),
+            ServerKind::BitbucketDataCenter => Some(Service::BitbucketDataCenter),
             ServerKind::Ignored => None,
         }
     }
@@ -238,6 +281,7 @@ impl ServerKind {
             Service::GitLab => Some(ServerKind::GitLab),
             Service::Gitea => Some(ServerKind::Gitea),
             Service::Forgejo => Some(ServerKind::Forgejo),
+            Service::BitbucketDataCenter => Some(ServerKind::BitbucketDataCenter),
             _ => None,
         }
     }
@@ -250,6 +294,7 @@ impl From<String> for ServerKind {
             "gitlab" => ServerKind::GitLab,
             "gitea" => ServerKind::Gitea,
             "forgejo" => ServerKind::Forgejo,
+            "bitbucket-data-center" => ServerKind::BitbucketDataCenter,
             _ => ServerKind::Ignored,
         }
     }
@@ -262,6 +307,7 @@ impl From<ServerKind> for &'static str {
             ServerKind::GitLab => "gitlab",
             ServerKind::Gitea => "gitea",
             ServerKind::Forgejo => "forgejo",
+            ServerKind::BitbucketDataCenter => "bitbucket-data-center",
             ServerKind::Ignored => "ignored",
         }
     }
@@ -285,9 +331,11 @@ pub type Disconnected = BTreeSet<String>;
 /// that path, made like `owner`; `owner` and `name` only letters, digits,
 /// `.`, `_` and `-`, with `/` between the groups of a GitLab path (and
 /// between an Azure DevOps organisation and project, whose names keep
-/// anything else `%`-escaped). The parsers reject everything else, so the
-/// links built here are safe to hand to the operating system as they are,
-/// and [`server_name`] of `host` is safe in a credential-helper query.
+/// anything else `%`-escaped). A SourceHut owner, and the personal project
+/// of a Bitbucket Data Center user, start with `~`. The parsers reject
+/// everything else, so the links built here are safe to hand to the
+/// operating system as they are, and [`server_name`] of `host` is safe in a
+/// credential-helper query.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RepoId {
     pub service: Service,
@@ -298,7 +346,9 @@ pub struct RepoId {
     pub host: String,
     /// The account or organisation; on GitLab the whole group path, which
     /// may have subgroups (`group/subgroup`); on Bitbucket the workspace; on
-    /// Azure DevOps `organisation/project`.
+    /// Azure DevOps `organisation/project`; on Bitbucket Data Center the
+    /// project key, or `~user` for a personal repository; on SourceHut
+    /// `~user`.
     pub owner: String,
     pub name: String,
 }
@@ -327,19 +377,32 @@ impl RepoId {
     }
 
     /// A page of the repository's web site. GitLab keeps them under `/-/`,
-    /// Azure DevOps under `/_git/`.
+    /// Azure DevOps under `/_git/`, Bitbucket Data Center under
+    /// `/projects/<key>/repos/` (or a user's `/users/<name>/repos/`).
     fn page(&self, path: &str) -> String {
-        if self.service == Service::AzureDevOps {
-            return azure::repo_page(self, path);
+        match self.service {
+            Service::AzureDevOps => return azure::repo_page(self, path),
+            Service::BitbucketDataCenter => return bitbucket_dc::repo_page(self, path),
+            _ => {}
         }
         let separator = if self.service.is_gitlab() { "/-/" } else { "/" };
         format!("https://{}/{}{separator}{path}", self.host, self.slug())
     }
 
+    /// The repository's own page, its home on the service.
+    pub fn home_url(&self) -> String {
+        match self.service {
+            Service::AzureDevOps | Service::BitbucketDataCenter => self.page("").trim_end_matches('/').to_owned(),
+            _ => format!("https://{}/{}", self.host, self.slug()),
+        }
+    }
+
+    /// SourceHut has no pull requests: its repository page stands in.
     pub fn pulls_url(&self) -> String {
         match self.service {
-            Service::Bitbucket => self.page("pull-requests"),
+            Service::Bitbucket | Service::BitbucketDataCenter => self.page("pull-requests"),
             Service::AzureDevOps => self.page("pullrequests"),
+            Service::SourceHut => self.home_url(),
             _ => self.page(if self.service.is_gitlab() { "merge_requests" } else { "pulls" }),
         }
     }
@@ -347,17 +410,21 @@ impl RepoId {
     pub fn pull_url(&self, number: u64) -> String {
         match self.service {
             Service::Bitbucket => self.page(&format!("pull-requests/{number}")),
+            Service::BitbucketDataCenter => self.page(&format!("pull-requests/{number}/overview")),
             Service::AzureDevOps => self.page(&format!("pullrequest/{number}")),
+            Service::SourceHut => self.home_url(),
             service if service.is_gitea() => self.page(&format!("pulls/{number}")),
             service if service.is_gitlab() => self.page(&format!("merge_requests/{number}")),
             _ => self.page(&format!("pull/{number}")),
         }
     }
 
-    /// Azure DevOps has work items, kept by the project.
+    /// Azure DevOps has work items, kept by the project; SourceHut tickets,
+    /// on the tracker named like the repository.
     pub fn issues_url(&self) -> String {
         match self.service {
             Service::AzureDevOps => azure::project_page(self, "_workitems"),
+            Service::SourceHut => sourcehut::tracker_page(self, ""),
             _ => self.page("issues"),
         }
     }
@@ -365,27 +432,48 @@ impl RepoId {
     pub fn issue_url(&self, number: u64) -> String {
         match self.service {
             Service::AzureDevOps => azure::project_page(self, &format!("_workitems/edit/{number}")),
+            Service::SourceHut => sourcehut::tracker_page(self, &number.to_string()),
             _ => self.page(&format!("issues/{number}")),
         }
     }
 
+    /// Bitbucket Data Center lists builds on the commits they are about;
+    /// builds.sr.ht lists an owner's builds by their tags, the first of
+    /// which is the repository's name.
     pub fn runs_url(&self) -> String {
         match self.service {
             Service::AzureDevOps => azure::project_page(self, "_build"),
+            Service::BitbucketDataCenter => self.page("commits"),
+            Service::SourceHut => sourcehut::builds_page(self, &self.name),
             service if service.has_pipelines() => self.page("pipelines"),
             _ => self.page("actions"),
         }
     }
 
     /// Bitbucket numbers a pipeline's page by its build number, Gitea and
-    /// Forgejo a run's by its number in the repository: what their
-    /// backends put in [`Run::id`].
+    /// Forgejo a run's by its number in the repository, SourceHut a job's
+    /// by its id: what their backends put in [`Run::id`]. Bitbucket Data
+    /// Center's builds have no page of their own: see [`RepoId::run_page`].
     pub fn run_url(&self, id: u64) -> String {
         match self.service {
             Service::Bitbucket => self.page(&format!("pipelines/results/{id}")),
             Service::AzureDevOps => azure::project_page(self, &format!("_build/results?buildId={id}")),
+            Service::BitbucketDataCenter => self.runs_url(),
+            Service::SourceHut => sourcehut::builds_page(self, &format!("job/{id}")),
             service if service.is_gitlab() => self.page(&format!("pipelines/{id}")),
             _ => self.page(&format!("actions/runs/{id}")),
+        }
+    }
+
+    /// The page to open for `run`: [`RepoId::run_url`] of its id, or on
+    /// Bitbucket Data Center the page of the commit it is about, which
+    /// shows its builds. A commit id that is not plain hexadecimal is not
+    /// put in a link.
+    pub fn run_page(&self, run: &Run) -> String {
+        let hex = (7..=64).contains(&run.head_sha.len()) && run.head_sha.bytes().all(|b| b.is_ascii_hexdigit());
+        match self.service {
+            Service::BitbucketDataCenter if hex => self.page(&format!("commits/{}", run.head_sha)),
+            _ => self.run_url(run.id),
         }
     }
 
@@ -417,6 +505,14 @@ impl RepoId {
                 url_escape(head),
                 url_escape(base)
             )),
+            // The page Bitbucket Data Center itself links to after a push.
+            Service::BitbucketDataCenter => self.page(&format!(
+                "pull-requests?create&sourceBranch=refs/heads/{}&targetBranch=refs/heads/{}",
+                url_escape(head),
+                url_escape(base)
+            )),
+            // Patches go by email: the repository's page says where.
+            Service::SourceHut => self.home_url(),
         }
     }
 
@@ -445,7 +541,10 @@ impl RepoId {
             )),
             // These start a pull request from the repository the branch is
             // in, whose form offers the one it was forked from.
-            Service::GitLab | Service::Bitbucket | Service::AzureDevOps => from.compare_url(base, head),
+            Service::GitLab | Service::Bitbucket | Service::AzureDevOps | Service::BitbucketDataCenter => {
+                from.compare_url(base, head)
+            }
+            Service::SourceHut => self.compare_url(base, head),
         }
     }
 
@@ -459,11 +558,18 @@ impl RepoId {
             Service::GitHub | Service::GitHubEnterprise => parts.len() == 2,
             Service::GitLab => (2..=32).contains(&parts.len()) && parts.iter().all(|part| !part.starts_with('-')),
             Service::Bitbucket | Service::Gitea | Service::Forgejo | Service::Codeberg => parts.len() == 2,
+            // A project key or `~user`, then the repository.
+            Service::BitbucketDataCenter => parts.len() == 2,
             // An organisation and project whose names may need escapes:
-            // never taken from an answer.
-            Service::AzureDevOps => false,
+            // never taken from an answer. SourceHut has no forks.
+            Service::AzureDevOps | Service::SourceHut => false,
         };
-        if !fits || !parts.iter().all(|part| path_part(part)) {
+        let owner_part = |part: &&str| match self.service {
+            Service::BitbucketDataCenter => path_part(part) || tilde_part(part),
+            _ => path_part(part),
+        };
+        let (last, front) = parts.split_last()?;
+        if !fits || !path_part(last) || !front.iter().all(owner_part) {
             return None;
         }
         let (name, owner) = parts.split_last()?;
@@ -480,7 +586,13 @@ impl RepoId {
     /// points at it. `None` on Azure DevOps, whose names may need escapes
     /// (and which never names a parent, see [`RepoId::sibling`]).
     pub fn clone_url(&self) -> Option<String> {
-        (self.service != Service::AzureDevOps).then(|| format!("https://{}/{}.git", self.host, self.slug()))
+        match self.service {
+            Service::AzureDevOps => None,
+            // Every repository's git address is below `/scm/`.
+            Service::BitbucketDataCenter => Some(format!("https://{}/scm/{}.git", self.host, self.slug())),
+            Service::SourceHut => Some(format!("https://{}/{}", self.host, self.slug())),
+            _ => Some(format!("https://{}/{}.git", self.host, self.slug())),
+        }
     }
 }
 
@@ -491,6 +603,12 @@ fn path_part(part: &str) -> bool {
         && part != "."
         && part != ".."
         && part.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// `~` and a [`path_part`]: a SourceHut user, or a Bitbucket Data Center
+/// user's personal project.
+fn tilde_part(part: &str) -> bool {
+    part.strip_prefix('~').is_some_and(path_part)
 }
 
 /// The server's own name in a [`RepoId::host`], with its port but without
@@ -526,6 +644,22 @@ pub fn api_base(service: Service, host: &str) -> String {
         Service::Gitea | Service::Forgejo | Service::Codeberg => format!("https://{host}/api/v1"),
         // Every organisation's API is below its name on dev.azure.com.
         Service::AzureDevOps => azure::API.to_owned(),
+        // Its REST APIs (the core one, build statuses, SSH keys) are all
+        // below `/rest`.
+        Service::BitbucketDataCenter => format!("https://{host}/rest"),
+        // git.sr.ht's GraphQL endpoint; the tickets and builds are asked of
+        // todo.sr.ht's and builds.sr.ht's (`sourcehut::ENDPOINTS`).
+        Service::SourceHut => sourcehut::GIT_API.to_owned(),
+    }
+}
+
+/// The addresses outside [`api_base`] (and [`beside`] it) that a token for
+/// `service` may go to, exactly as written: SourceHut's other services,
+/// each of which has its GraphQL endpoint on a host of its own.
+pub fn also_addresses(service: Service) -> Vec<String> {
+    match service {
+        Service::SourceHut => sourcehut::ENDPOINTS.iter().map(|endpoint| (*endpoint).to_owned()).collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -538,7 +672,8 @@ struct Address {
     /// ports (SSH's) say nothing about where the web server listens.
     port: Option<u16>,
     /// The path's parts with `.git` taken off the last: at least two, each
-    /// made only of letters, digits, `.`, `_` and `-`.
+    /// made only of letters, digits, `.`, `_` and `-`, after a `~` for a
+    /// SourceHut or Bitbucket Data Center user.
     path: Vec<String>,
     /// An `http(s)://` URL: its path starts with the one the server is
     /// installed under, if any. SSH paths never have it.
@@ -600,12 +735,7 @@ fn address(url: &str) -> Option<Address> {
     {
         *last = stripped.to_owned();
     }
-    let valid = |part: &String| {
-        !part.is_empty()
-            && part != "."
-            && part != ".."
-            && part.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
-    };
+    let valid = |part: &String| path_part(part) || tilde_part(part);
     if !(2..=32).contains(&path.len()) || !path.iter().all(valid) {
         return None;
     }
@@ -623,13 +753,15 @@ fn valid_host(name: &str) -> bool {
 }
 
 /// The public services (github.com, gitlab.com, bitbucket.org,
-/// codeberg.org, Azure DevOps), under every name their remotes use.
+/// codeberg.org, Azure DevOps, git.sr.ht), under every name their remotes
+/// use.
 fn public(name: &str) -> Option<(Service, &'static str)> {
     match name {
         "github.com" | "www.github.com" | "ssh.github.com" => Some((Service::GitHub, "github.com")),
         "gitlab.com" | "www.gitlab.com" | "altssh.gitlab.com" => Some((Service::GitLab, "gitlab.com")),
         "bitbucket.org" | "www.bitbucket.org" | "altssh.bitbucket.org" => Some((Service::Bitbucket, "bitbucket.org")),
         "codeberg.org" | "www.codeberg.org" => Some((Service::Codeberg, "codeberg.org")),
+        sourcehut::HOST => Some((Service::SourceHut, sourcehut::HOST)),
         // Its remotes are read by `azure::parse_remote`; this is the host
         // its repositories are known by.
         name if azure::is_host(name) => Some((Service::AzureDevOps, azure::HOST)),
@@ -638,20 +770,26 @@ fn public(name: &str) -> Option<(Service, &'static str)> {
 }
 
 /// Well-known hosts GitKrill cannot show, and subdomains of the public
-/// services that are not servers of their own (gists): not worth offering
-/// to connect.
+/// services that are not servers of their own (gists, SourceHut's
+/// Mercurial host): not worth offering to connect.
 fn unsupported(name: &str) -> bool {
-    let others = ["git.sr.ht", "gitee.com", "huggingface.co", "source.developers.google.com"];
+    let others = ["gitee.com", "huggingface.co", "source.developers.google.com"];
     others.contains(&name)
-        || [".github.com", ".gitlab.com", ".bitbucket.org", ".codeberg.org"]
+        || [".github.com", ".gitlab.com", ".bitbucket.org", ".codeberg.org", ".sr.ht"]
             .iter()
             .any(|end| name.ends_with(end))
 }
 
-/// What a server's name suggests it runs. Never more than a pre-selection.
-fn guess(name: &str) -> Option<ServerKind> {
+/// What a remote's server suggests it runs, by its name or, for Bitbucket
+/// Data Center, by the `/scm/` its HTTPS addresses have before the
+/// project. Never more than a pre-selection.
+fn guess(address: &Address) -> Option<ServerKind> {
+    let name = address.name.as_str();
     let first = name.split('.').next().unwrap_or_default();
-    if first.starts_with("gitlab") || name.contains(".gitlab.") {
+    let scm = address.web && address.path.iter().rev().nth(2).is_some_and(|part| part == "scm");
+    if scm || first.starts_with("bitbucket") || first.starts_with("stash") || name.contains(".bitbucket.") {
+        Some(ServerKind::BitbucketDataCenter)
+    } else if first.starts_with("gitlab") || name.contains(".gitlab.") {
         Some(ServerKind::GitLab)
     } else if first.starts_with("github") || first == "ghe" || name.ends_with(".ghe.com") {
         Some(ServerKind::GitHubEnterprise)
@@ -665,10 +803,10 @@ fn guess(name: &str) -> Option<ServerKind> {
 }
 
 /// The hosted repository a remote URL points at: on a public service
-/// (github.com, gitlab.com, bitbucket.org, codeberg.org, Azure DevOps), or
-/// on a server listed in `servers` as GitHub Enterprise, GitLab, Gitea or
-/// Forgejo. Anything else, including hosts whose name merely looks like one
-/// of those, is `None`.
+/// (github.com, gitlab.com, bitbucket.org, codeberg.org, Azure DevOps,
+/// git.sr.ht), or on a server listed in `servers` as GitHub Enterprise,
+/// GitLab, Gitea, Forgejo or Bitbucket Data Center. Anything else,
+/// including hosts whose name merely looks like one of those, is `None`.
 pub fn parse_remote(url: &str, servers: &Servers) -> Option<RepoId> {
     // Azure DevOps paths have a shape (and escapes) of their own.
     if let Some(repo) = azure::parse_remote(url) {
@@ -681,16 +819,32 @@ pub fn parse_remote(url: &str, servers: &Servers) -> Option<RepoId> {
     };
     // Past the path the server is installed under, if any.
     let path = &address.path[skip..];
+    // Bitbucket Data Center serves git over HTTPS below `/scm/` (its SSH
+    // addresses have the project at once).
+    let path = match service {
+        Service::BitbucketDataCenter if address.web => match path.split_first() {
+            Some((scm, rest)) if scm == "scm" => rest,
+            _ => return None,
+        },
+        _ => path,
+    };
+    let tilde = |part: &String| part.starts_with('~');
     let fits = match service {
         Service::GitHub | Service::GitHubEnterprise | Service::Bitbucket => path.len() == 2,
         Service::Gitea | Service::Forgejo | Service::Codeberg => path.len() == 2,
         // GitLab paths never start with `-`, which also keeps the `/-/` of
         // its web addresses from passing for a group.
         Service::GitLab => path.len() >= 2 && path.iter().all(|part| !part.starts_with('-')),
+        // A project key, or `~user` for a personal repository.
+        Service::BitbucketDataCenter => path.len() == 2 && !tilde(&path[1]),
+        // Every repository is a `~user`'s.
+        Service::SourceHut => path.len() == 2 && tilde(&path[0]) && !tilde(&path[1]),
         // Taken apart by `azure::parse_remote` above when it is one.
         Service::AzureDevOps => false,
     };
-    if !fits {
+    // Only those two name users with a `~`.
+    let tildes = matches!(service, Service::BitbucketDataCenter | Service::SourceHut) || !path.iter().any(tilde);
+    if !fits || !tildes {
         return None;
     }
     let (name, owner) = path.split_last()?;
@@ -774,8 +928,8 @@ pub fn parent_of(
     }
 }
 
-/// A remote on a server that may run GitHub Enterprise, GitLab, Gitea or
-/// Forgejo.
+/// A remote on a server that may run GitHub Enterprise, GitLab, Gitea,
+/// Forgejo or Bitbucket Data Center.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Offer {
     /// The server, as the settings name it.
@@ -800,8 +954,26 @@ pub fn offer_for(remote: &RemoteInfo) -> Option<Offer> {
         host: address.host(),
         path: address.path.join("/"),
         remote: remote.name.clone(),
-        guess: guess(&address.name),
+        guess: guess(&address),
     })
+}
+
+/// The name a server is kept under in [`Servers`] once the user said it
+/// runs `kind`: `host`, or for Bitbucket Data Center seen through an HTTPS
+/// remote at `path` (an [`Offer::path`]) that has more before its `/scm/`,
+/// the host and that path (`example.com/bitbucket` for
+/// `https://example.com/bitbucket/scm/PRJ/app.git`).
+pub fn server_key(kind: ServerKind, host: &str, path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').collect();
+    let root = match parts.len().checked_sub(3) {
+        Some(at) if at > 0 && parts[at] == "scm" => &parts[..at],
+        _ => &[][..],
+    };
+    let fits = kind == ServerKind::BitbucketDataCenter && !host.contains('/') && root.iter().all(|part| path_part(part));
+    match fits && !root.is_empty() {
+        true => format!("{host}/{}", root.join("/")),
+        false => host.to_owned(),
+    }
 }
 
 /// Servers the sidebar offers to connect: `origin`'s when the user has not
@@ -1074,6 +1246,10 @@ pub enum Problem {
     RateLimited { until: u64 },
     /// No token, and the service will not show the repository without one.
     NotSignedIn,
+    /// The service shows this list (`what`: "builds") only to someone
+    /// signed in, whatever the repository, and there is no sign-in: nothing
+    /// was asked.
+    SignInNeeded { what: &'static str },
     /// Every token we found was refused, and anonymous access is not enough.
     SignInRejected,
     /// Signed in, but the account cannot see the repository (or it is gone).
@@ -1093,7 +1269,10 @@ impl Problem {
         let repository = service.repo_word();
         match self {
             Problem::RateLimited { until } => format!("Rate limited until {}", clock(*until)),
+            // Its API answers nobody signed out, whatever the repository.
+            Problem::NotSignedIn if service.needs_sign_in() => "Not signed in".to_owned(),
             Problem::NotSignedIn => format!("Not signed in: private {repository}"),
+            Problem::SignInNeeded { what } => format!("Sign in to see {what}"),
             Problem::SignInRejected => format!("Sign-in refused: private {repository}"),
             Problem::NoAccess => "No access with this sign-in".to_owned(),
             Problem::Refused(message) => format!("{host} refused: {message}"),
@@ -1108,7 +1287,7 @@ impl Problem {
         let host = service.name();
         match self {
             Problem::RateLimited { until } => format!("Limited until {}", clock(*until)),
-            Problem::NotSignedIn => "Not signed in".to_owned(),
+            Problem::NotSignedIn | Problem::SignInNeeded { .. } => "Not signed in".to_owned(),
             Problem::SignInRejected => "Sign-in refused".to_owned(),
             Problem::NoAccess => "No access".to_owned(),
             Problem::Refused(_) => format!("{host} refused"),
@@ -1127,10 +1306,16 @@ impl Problem {
                 "{host} asked us to slow down. What is shown is the last good answer; \
                  refreshing resumes by itself. Signing in raises the limit."
             ),
+            Problem::NotSignedIn if service.needs_sign_in() => {
+                format!("{host}'s API answers only someone signed in, about public {repositories} too. {sign_in}")
+            }
             Problem::NotSignedIn => format!(
                 "{host} only shows public {repositories} without a sign-in, and it does not \
                  show this one. {sign_in}"
             ),
+            Problem::SignInNeeded { what } => {
+                format!("{host} shows {what} only to someone signed in, about public {repositories} too. {sign_in}")
+            }
             Problem::SignInRejected => format!(
                 "{host} refused the saved sign-in (expired or revoked?), and does not show \
                  this {repository} without one. {sign_in}"
@@ -1202,6 +1387,15 @@ pub fn sign_in_advice(service: Service) -> &'static str {
             "Set AZURE_DEVOPS_EXT_PAT (a personal access token), run `az login`, or sign in \
              through Git's credential manager (any HTTPS fetch or push does it), then refresh."
         }
+        Service::BitbucketDataCenter => {
+            "Set BITBUCKET_SERVER_TOKEN (an HTTP access token) and BITBUCKET_SERVER_HOST (this \
+             server's name), or sign in through Git's credential manager (any HTTPS fetch or push \
+             does it), then refresh."
+        }
+        Service::SourceHut => {
+            "Set SRHT_TOKEN to a personal access token (meta.sr.ht > OAuth 2.0), or sign in with \
+             `hut init`, then refresh."
+        }
     }
 }
 
@@ -1232,6 +1426,9 @@ pub enum Outcome<T> {
     },
     /// Nothing changed since the last answer (a conditional request hit).
     Unchanged,
+    /// The repository has no such list at all: SourceHut's tracker or
+    /// builds when there are none for it. Its section is not shown.
+    Absent,
     Failed(Problem),
 }
 
@@ -1244,11 +1441,14 @@ pub struct Feed<T> {
     /// At least one answer has arrived.
     pub loaded: bool,
     pub problem: Option<Problem>,
+    /// The service said the repository has no such list ([`Outcome::Absent`]):
+    /// its section is left out.
+    pub absent: bool,
 }
 
 impl<T> Default for Feed<T> {
     fn default() -> Self {
-        Feed { items: Vec::new(), more: false, loaded: false, problem: None }
+        Feed { items: Vec::new(), more: false, loaded: false, problem: None, absent: false }
     }
 }
 
@@ -1256,8 +1456,9 @@ impl<T> Feed<T> {
     pub fn apply(&mut self, outcome: Outcome<T>) {
         match outcome {
             Outcome::Fresh { items, more } => {
-                *self = Feed { items, more, loaded: true, problem: None };
+                *self = Feed { items, more, loaded: true, problem: None, absent: false };
             }
+            Outcome::Absent => *self = Feed { loaded: true, absent: true, ..Feed::default() },
             Outcome::Unchanged => self.problem = None,
             // Keep showing the last good answer.
             Outcome::Failed(problem) => self.problem = Some(problem),
@@ -1286,7 +1487,11 @@ pub enum Auth {
 
 impl Auth {
     pub fn describe(self, service: Service) -> String {
-        let repositories = format!("public {} only", service.repos_word());
+        // Without a sign-in SourceHut shows nothing at all.
+        let repositories = match service.needs_sign_in() {
+            true => "nothing shown".to_owned(),
+            false => format!("public {} only", service.repos_word()),
+        };
         match self {
             Auth::Unknown => String::new(),
             Auth::Anonymous => format!("Not signed in: {repositories}"),
@@ -1295,6 +1500,7 @@ impl Auth {
                 Service::GitLab => "Signed in through the GitLab CLI".to_owned(),
                 Service::Gitea | Service::Forgejo | Service::Codeberg => "Signed in through tea's sign-in".to_owned(),
                 Service::AzureDevOps => "Signed in through the Azure CLI".to_owned(),
+                Service::SourceHut => "Signed in through hut's sign-in".to_owned(),
                 _ => "Signed in through the GitHub CLI".to_owned(),
             },
             Auth::SignedIn(TokenSource::CredentialHelper) => {
@@ -1485,8 +1691,10 @@ fn env_names(secrets: &dyn Secrets, repo: &RepoId) -> &'static [&'static str] {
             _ => &[],
         },
         Service::Gitea | Service::Forgejo | Service::Codeberg => gitea::env_names(repo.service, |name| names(name)),
-        // Their tokens come with a sign-in scheme: see `bitbucket` and `azure`.
-        Service::Bitbucket | Service::AzureDevOps => &[],
+        Service::SourceHut => &["SRHT_TOKEN"],
+        // Their tokens come with a sign-in scheme: see `bitbucket`,
+        // `bitbucket_dc` and `azure`.
+        Service::Bitbucket | Service::AzureDevOps | Service::BitbucketDataCenter => &[],
     }
 }
 
@@ -1510,6 +1718,7 @@ pub fn find_token(secrets: &dyn Secrets, repo: &RepoId, rejected: &[Token]) -> O
     match repo.service {
         Service::Bitbucket => return bitbucket::find_token(secrets, repo, rejected),
         Service::AzureDevOps => return azure::find_token(secrets, repo, rejected),
+        Service::BitbucketDataCenter => return bitbucket_dc::find_token(secrets, repo, rejected),
         _ => {}
     }
     let usable = |raw: Option<String>| {
@@ -1563,6 +1772,8 @@ impl Secrets for System {
         match service {
             // tea keeps its sign-ins in a file and prints none of them.
             Service::Gitea | Service::Forgejo | Service::Codeberg => gitea::tea_token(host),
+            // hut prints only its first instance's: its file is read too.
+            Service::SourceHut => sourcehut::hut_token(host),
             // `az` takes a few seconds to start.
             Service::AzureDevOps => capture(cli_command(service, host)?, b"", Duration::from_secs(30)),
             _ => capture(cli_command(service, host)?, b"", Duration::from_secs(10)),
@@ -1597,6 +1808,7 @@ fn cli_command(service: Service, host: &str) -> Option<Command> {
     match service {
         Service::AzureDevOps => return Some(azure::cli_command()),
         Service::Bitbucket | Service::Gitea | Service::Forgejo | Service::Codeberg => return None,
+        Service::BitbucketDataCenter | Service::SourceHut => return None,
         Service::GitHub | Service::GitHubEnterprise => {
             cmd = Command::new("gh");
             cmd.args(["auth", "token", "--hostname", host])
@@ -1780,6 +1992,9 @@ pub struct Wire {
     /// The API's address (no trailing slash). Requests below it carry the
     /// token; anything else is sent without one.
     api: String,
+    /// The addresses outside `api` that carry the token too, exactly as
+    /// written ([`beside`], [`also_addresses`]).
+    also: Vec<String>,
     /// Headers the service wants on every request.
     headers: &'static [(&'static str, &'static str)],
 }
@@ -1797,7 +2012,15 @@ impl Wire {
             .timeout_global(Some(Duration::from_secs(25)))
             .user_agent(concat!("GitKrill/", env!("CARGO_PKG_VERSION")))
             .build();
-        Wire { agent: config.into(), api, headers }
+        let also = beside(&api).into_iter().collect();
+        Wire { agent: config.into(), api, also, headers }
+    }
+
+    /// The same, with the token also going to each of `addresses` exactly
+    /// (no further below them), all of which must be HTTPS.
+    pub fn also(mut self, addresses: Vec<String>) -> Self {
+        self.also.extend(addresses.into_iter().filter(|address| address.starts_with("https://")));
+        self
     }
 
     /// The `Authorization` header for `request`: the one place a token
@@ -1805,7 +2028,7 @@ impl Wire {
     /// (`https_only` refuses anything else before it is sent).
     fn authorization(&self, request: &HttpRequest<'_>) -> Option<String> {
         let token = request.token?;
-        let allowed = within(&self.api, request.url) || beside(&self.api).as_deref() == Some(request.url);
+        let allowed = within(&self.api, request.url) || self.also.iter().any(|address| address == request.url);
         (self.api.starts_with("https://") && allowed).then(|| token.authorization())
     }
 }
@@ -1877,9 +2100,11 @@ fn explain(error: ureq::Error) -> String {
 /// path: `pulls`, `issues` and `runs` on GitHub, Gitea and Forgejo (`tasks`
 /// for runs on servers older than the runs endpoint), `merge_requests`,
 /// `issues` and `pipelines` on GitLab, `pullrequests` and `pipelines` on
-/// Bitbucket (which has no issues any more), and `pullrequests`, `wiql` (the work item
-/// query), `workitems`, `builds` and `repositories` on Azure DevOps. An
-/// optional `<endpoint>.head` gives a status
+/// Bitbucket (which has no issues any more), `pullrequests`, `wiql` (the work item
+/// query), `workitems`, `builds` and `repositories` on Azure DevOps,
+/// `pull-requests`, `branches`, `stats` (a POST) and `builds-<commit id>`
+/// on Bitbucket Data Center, and SourceHut's GraphQL after the service
+/// asked (`todo`, `builds`). An optional `<endpoint>.head` gives a status
 /// code on its first line and `name: value` headers after it, which is how
 /// to stage a rate limit or an outage.
 ///
@@ -1936,12 +2161,14 @@ impl Transport for Canned {
         }
         let endpoints = ["pulls", "issues", "runs", "merge_requests", "pipelines"];
         // Bitbucket and Azure DevOps (`pullrequests`), Azure DevOps' builds,
-        // work items and repositories, older Gitea and Forgejo runs (`tasks`).
-        let more = ["pullrequests", "builds", "workitems", "repositories", "tasks"];
+        // work items and repositories, older Gitea and Forgejo runs (`tasks`),
+        // Bitbucket Data Center's pull requests and branches.
+        let more = ["pullrequests", "builds", "workitems", "repositories", "tasks", "pull-requests", "branches"];
         let list = endpoints.into_iter().chain(more).find(|list| path.rsplit('/').next() == Some(*list));
         let list = list.ok_or("no fixture for this address")?;
         let after = format!("{list}.after");
-        if matches!(list, "pulls" | "pullrequests") && self.created && self.dir.join(format!("{after}.json")).exists() {
+        let pulls = matches!(list, "pulls" | "pullrequests" | "pull-requests");
+        if pulls && self.created && self.dir.join(format!("{after}.json")).exists() {
             return Ok(self.answer(&after, 200));
         }
         Ok(self.answer(list, 200))
@@ -1956,7 +2183,15 @@ impl Transport for Canned {
         if path.ends_with("/wiql") {
             return Ok(self.answer("wiql", 200));
         }
-        if !["/pulls", "/merge_requests", "/pullrequests"].iter().any(|end| path.ends_with(end)) {
+        // Bitbucket Data Center's build statuses of several commits.
+        if path.ends_with("/commits/stats") {
+            return Ok(self.answer("stats", 200));
+        }
+        // SourceHut's GraphQL, after the service: `todo.json`, `builds.json`.
+        if let Some(service) = sourcehut::fixture_name(path) {
+            return Ok(self.answer(service, 200));
+        }
+        if !["/pulls", "/merge_requests", "/pullrequests", "/pull-requests"].iter().any(|end| path.ends_with(end)) {
             return Err("no fixture for this address".to_owned());
         }
         let _ = std::fs::write(self.dir.join("create.sent.json"), body);
@@ -1974,6 +2209,13 @@ fn detail_fixture(path: &str) -> Option<String> {
     match parts.as_slice() {
         [.., "merge_requests", iid, "approvals"] => Some(format!("approvals-{iid}")),
         [.., "pulls", number, "reviews"] if digits(number) => Some(format!("reviews-{number}")),
+        // Bitbucket Data Center: a commit's build statuses, the repository;
+        // its lists below the repository are lists, not GitHub's `repos/`.
+        [.., "build-status", _, "commits", sha] if sha.bytes().all(|b| b.is_ascii_hexdigit()) => {
+            Some(format!("builds-{sha}"))
+        }
+        [.., "projects", _, "repos", _] => Some("repo".to_owned()),
+        [.., "projects", _, "repos", _, _] => None,
         [.., "projects", id] if digits(id) => Some(format!("project-{id}")),
         [.., "projects", _] => Some("project".to_owned()),
         [.., "repos", _, _] => Some("repo".to_owned()),
@@ -2172,7 +2414,7 @@ fn connect(repo: &RepoId, workdir: &Path, signed_out: bool) -> Box<dyn Backend> 
                     if dir.join("signed-in").exists() { Box::new(FixtureSignIn) } else { Box::new(NoSecrets) };
                 (Box::new(Canned { dir: fixture_dir(&dir, repo), created: false }), secrets)
             }
-            None => (Box::new(Wire::new(repo.api_base(), headers(repo.service))), Box::new(System::new(workdir))),
+            None => (Box::new(wire(repo.service, repo.api_base())), Box::new(System::new(workdir))),
         };
     let secrets = signed_out_secrets(signed_out, secrets);
     match repo.service {
@@ -2185,7 +2427,15 @@ fn connect(repo: &RepoId, workdir: &Path, signed_out: bool) -> Box<dyn Backend> 
             Box::new(gitea::Client::new(repo.clone(), transport, secrets))
         }
         Service::AzureDevOps => Box::new(azure::Client::new(repo.clone(), transport, secrets)),
+        Service::BitbucketDataCenter => Box::new(bitbucket_dc::Client::new(repo.clone(), transport, secrets)),
+        Service::SourceHut => Box::new(sourcehut::Client::new(repo.clone(), transport, secrets)),
     }
+}
+
+/// The network for `service`'s API at `api`: a token goes below it, and to
+/// the few other addresses the service's API is spread over.
+pub fn wire(service: Service, api: String) -> Wire {
+    Wire::new(api, headers(service)).also(also_addresses(service))
 }
 
 /// The headers `service` wants on every request.
@@ -2196,6 +2446,8 @@ pub fn headers(service: Service) -> &'static [(&'static str, &'static str)] {
         Service::Bitbucket => bitbucket::HEADERS,
         Service::Gitea | Service::Forgejo | Service::Codeberg => gitea::HEADERS,
         Service::AzureDevOps => azure::HEADERS,
+        Service::BitbucketDataCenter => bitbucket_dc::HEADERS,
+        Service::SourceHut => sourcehut::HEADERS,
     }
 }
 
@@ -2207,10 +2459,12 @@ fn signed_out_secrets(signed_out: bool, secrets: Box<dyn Secrets>) -> Box<dyn Se
 pub mod account;
 pub mod azure;
 pub mod bitbucket;
+pub mod bitbucket_dc;
 pub mod gitea;
 pub mod github;
 pub mod gitlab;
 mod signin;
+pub mod sourcehut;
 
 // ---- the background thread ------------------------------------------------
 
@@ -5162,10 +5416,12 @@ mod tests {
             ("github.acme.com", Some(ServerKind::GitHubEnterprise)),
             ("ghe.acme.com", Some(ServerKind::GitHubEnterprise)),
             ("acme.ghe.com", Some(ServerKind::GitHubEnterprise)),
+            ("bitbucket.acme.com", Some(ServerKind::BitbucketDataCenter)),
+            ("stash.acme.com", Some(ServerKind::BitbucketDataCenter)),
             ("code.acme.com", None),
             ("notgitlab.acme.com", None),
         ] {
-            assert_eq!(guess(host), expected, "{host}");
+            assert_eq!(guess(&address(&format!("https://{host}/team/app")).unwrap()), expected, "{host}");
         }
     }
 

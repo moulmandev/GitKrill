@@ -81,7 +81,8 @@ pub fn show(ui: &mut Ui, page: &mut Page<'_>, state: &mut State) {
     let workdir = tab.path.clone();
     let mut prefs = crate::prefs::repo(&page.shared.settings, &workdir).commit.clone();
     let before = prefs.clone();
-    let hosting = tab.hosting.connected();
+    // SourceHut takes patches by email: no pull request to open there.
+    let hosting = tab.hosting.connected().filter(|shown| shown.repo.service.has_pulls());
     let pull = hosting.as_ref().map_or("pull request", |shown| shown.repo.service.pull_word());
     let has_remote = tab.snap.as_ref().is_some_and(|snap| !snap.remotes.is_empty());
 
@@ -100,7 +101,7 @@ pub fn show(ui: &mut Ui, page: &mut Page<'_>, state: &mut State) {
             }
             CommitAction::CommitAndPullRequest if hosting.is_none() => form::warning(
                 ui,
-                "No GitHub or GitLab remote is connected for this repository, so the button only commits.",
+                "No hosting service with pull requests is connected for this repository, so the button only commits.",
             ),
             _ => {}
         }

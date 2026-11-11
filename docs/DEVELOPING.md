@@ -67,8 +67,8 @@ signing, credential helpers and the user's config behave as in a terminal.
 | Add trailers or flags to the panel's commits | `git::trailers::CommitOptions`: `message` adds `Co-authored-by:` trailers the message does not have yet (before a trailing sign-off), `apply` adds `--signoff` (left out when `ident` already signed the message) and `--no-verify` to the `git commit` steps. `ui::commit_options::options(ctx, tab, prefs)` is what the next commit gets, `sign_off_ident` who git signs off as, `committed` resets them. |
 | Know how a pull request stands with its reviewers, or where it comes from | `PullRequest::review` (`hosting::Review`, `Unknown` until the service has said) and `approvals`; `head_repo` and `is_from(repo)` for forks. A backend learns them in `Backend::details`, called after the three lists each round: return what changed (`Details`), and apply what is already known to a fresh list in `pulls()` so it does not flicker. `hosting::Reviews` does that bookkeeping for review states asked one round after another: `listed` (a fresh list, filled in), `stale(limit)` (what changed since asked), `learnt` (what to put in `Details`), `ask_again` (a refresh by hand). Spend a small request budget with `Limiter::left(now)` (what the service said is left of its window). `View::parent` is the repository's parent when it is a fork. |
 | Show a fork's parent | `hosting::parent_of(repo, view.parent, remotes, servers)` (the service's word, else a remote called `upstream`). `Shown::family` (`hosting::Family`: the fork and its remote, the parent and the remote pointing at it, which is shown) is set whenever there is one; `HostingState::sync(.., show_parent)` then runs a second session for the parent and shows it, `RepoPrefs::hosting_parent` remembering the choice (`ui::hosting::show_parent`). `HostingState::connected` is always the fork's session (pull requests are opened from it); `parent_shown()` is the parent's while shown; `refresh()` refreshes what is shown, `refresh_connected()` the fork. |
-| Open a pull request between forks | `HostingState::create_pull_across(new, Across { from, into })` (`Backend::create_pull_across`, on GitHub, GitLab, Gitea / Forgejo and Bitbucket); one opened in the parent is added to the parent's session at once. `hosting::related(remotes, servers, repo)` lists the remotes on the same server that point at other repositories. `ui::new_pull::{targets, route}` decide where a pull request goes and which remote its branch is pushed to. |
-| Add a hosting service | A backend file in `src/hosting/` behind the `Backend` trait, built on `signin::Api` (sign-in found, refused and replaced, rate limit, redirects inside the API, `classify` for the usual statuses); a `Service` variant with its words (`pull_word`, `ci_title`, `issues_title`, `pull_number`, `has_pull_refs`, `has_issues`), its remote URLs in `parse_remote`/`public`, its token sources in `find_token`, and its arms in `connect`, `headers`, `api_base`, the `RepoId` links and `account.rs`. A token that is not a bearer token is `Token::basic(user, secret)`. `checkout_pull_request` checks a pull request out on any service. |
+| Open a pull request between forks | `HostingState::create_pull_across(new, Across { from, into })` (`Backend::create_pull_across`, on GitHub, GitLab, Gitea / Forgejo, Bitbucket and Bitbucket Data Center); one opened in the parent is added to the parent's session at once. `hosting::related(remotes, servers, repo)` lists the remotes on the same server that point at other repositories. `ui::new_pull::{targets, route}` decide where a pull request goes and which remote its branch is pushed to. |
+| Add a hosting service | A backend file in `src/hosting/` behind the `Backend` trait, built on `signin::Api` (sign-in found, refused and replaced, rate limit, redirects inside the API, `classify` for the usual statuses; `telling_refusals` when the refusal status also means something else, as Bitbucket Data Center's 401); a `Service` variant with its words (`pull_word`, `ci_title`, `issues_title`, `pull_number`, `has_pull_refs`, `has_pulls`, `has_issues`, `has_builds`, `needs_sign_in`), its remote URLs in `parse_remote`/`public`, its token sources in `find_token`, and its arms in `connect`, `headers`, `api_base` (`also_addresses` when its API is spread over hosts, as SourceHut's), the `RepoId` links (`run_page` when a run has no page of its own) and `account.rs`. A token that is not a bearer token is `Token::basic(user, secret)`. A list the repository does not have at all is `Outcome::Absent`, and its section is left out. A self-hosted service is also a `ServerKind` (the connect dialog in `ui::hosting::connect_body`, `server_key` when a remote shows the path it is installed under, an entry in Preferences > Integrations). `checkout_pull_request` checks a pull request out on any service. |
 | Ask a hosting account something (who is signed in, its SSH keys) | `hosting::account::AccountSession::start(account, ctx)`, polled from the UI; `account::local_keys`, `parse_public_key` and `fingerprint` read `.pub` files. A host in `settings.hosting_disconnected` is never signed in to. |
 | Know who commits | `prefs::identity`: `settings.identity.current()` is the profile in use; `identity::generation()` changes whenever the identity git commands get may have changed (ask git again then, as `ui::prefs::profiles::commit_author` does). |
 | Show the text of a file (not git's own data) | Decode it in the background with `git::text::format_for(workdir)` (the repository's encoding and the tab width: `display_text_in`, `decode_file`), keep the `Format` with the result, and load again when `text::generation()` has moved on (`ui/diff.rs` does). |
@@ -276,20 +276,29 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
   runs endpoint), `merge_requests`, `issues` and `pipelines` for GitLab,
   `pullrequests` and `pipelines` for Bitbucket (no issues), `pullrequests`,
   `wiql`, `workitems`, `builds` and `repositories` for Azure DevOps,
+  `pull-requests`, `branches`, `stats` (the POST asking which commits have
+  builds) and `builds-<commit id>` (one commit's builds) for Bitbucket Data
+  Center (signed in only: builds need a sign-in there), and for SourceHut,
+  whose GraphQL APIs each have a host of their own, `todo` (the tracker's
+  tickets) and `builds` (the owner's jobs), answered only with `signed-in`,
   in each API's own JSON. `<endpoint>.head` stages a status and headers
   (a rate limit, an outage). To show a GitLab or self-hosted remote, point
   the demo's origin at it (`git remote set-url origin
   https://gitlab.com/group/app.git`) and put `"auto_fetch_minutes": 0` in
   the run's `cfg/settings.json` first, so the app never fetches from the
   real host; `"hosting_servers": {"git.example.com": "gitlab"}` there
-  connects a made-up server without clicking through the offer.
+  connects a made-up server without clicking through the offer
+  (`"bitbucket-data-center"` for a Bitbucket Data Center, whose origin is
+  then `https://git.example.com/scm/prj/app.git`).
 - Opening a pull request is answered from `create.json` (and `create.head`
   for another status), the request body is written to `create.sent.json`,
   and `pulls.after.json` replaces `pulls.json` once one was opened
-  (`pullrequests.after.json` on Bitbucket and Azure DevOps).
+  (`pullrequests.after.json` on Bitbucket and Azure DevOps,
+  `pull-requests.after.json` on Bitbucket Data Center).
 - Review states and forks: GitHub's GraphQL answer (review decisions) comes
   from `graphql.json`, and the repository itself (a fork's `parent`) from
-  `repo.json` on GitHub, Gitea, Forgejo and Bitbucket; one pull request's
+  `repo.json` on GitHub, Gitea, Forgejo, Bitbucket and Bitbucket Data
+  Center (its `origin`); one pull request's
   reviews (GitHub without a sign-in, Gitea, Forgejo) from
   `reviews-<number>.json`; on GitLab each merge request's approvals from
   `approvals-<iid>.json`, the project (`forked_from_project`) from
@@ -314,8 +323,11 @@ tools/shot.sh scratch/demo scratch/shots/final.png "rclick:560,234;shot:menu.png
 - Preferences > Integrations reads the account from `user.json` (`GET
   /user`, in the service's own JSON: `login` for GitHub, Gitea and Forgejo,
   `username` for GitLab, `username` and `uuid` for Bitbucket, Azure DevOps'
-  profile with `displayName` and `emailAddress`) and its keys from
-  `keys.json` (Bitbucket's `/users/{uuid}/ssh-keys` too; `keys.head` stages a refusal such
+  profile with `displayName` and `emailAddress`; on Bitbucket Data Center
+  the user, while `user.head` (`200` then `X-AUSERNAME: ada`) names who is
+  signed in; on SourceHut meta.sr.ht's GraphQL answer to `me`) and its keys from
+  `keys.json` (Bitbucket's `/users/{uuid}/ssh-keys` too, Bitbucket Data
+  Center's `/rest/ssh/1.0/keys`, SourceHut's `sshKeys`; `keys.head` stages a refusal such
   as a missing scope: `404` with `x-accepted-oauth-scopes`, or GitLab's
   `403`). Adding a key is answered from `keys.post.json` (201 unless
   `keys.post.head` says otherwise), the body sent is written to
