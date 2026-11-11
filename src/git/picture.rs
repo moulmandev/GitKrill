@@ -1,11 +1,16 @@
 //! Images for the diff view's preview of image files: both versions read
 //! from the object database (or the working tree) and decoded on the reader
-//! thread, so the UI only has to upload pixels.
+//! thread, so the UI only has to upload pixels. SVG files are drawn with
+//! resvg the same way, beside their text diff.
 
 use std::fmt;
 use std::io::Cursor;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+
+use resvg::usvg::fontdb;
+use resvg::{tiny_skia, usvg};
 
 use git2::{Oid, Repository};
 
@@ -27,6 +32,11 @@ pub fn is_image_path(path: &str) -> bool {
         .extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| EXTENSIONS.iter().any(|known| known.eq_ignore_ascii_case(ext)))
+}
+
+/// Whether `path` names an SVG file: text that the preview can also draw.
+pub fn is_svg_path(path: &str) -> bool {
+    Path::new(path).extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
 }
 
 /// Both versions of an image file. A side is `None` when the file did not
@@ -76,6 +86,21 @@ pub struct Picture {
 /// the diff (zero when the side is missing or not hashed); `workdir_file`
 /// is read for the new side when it has no blob, as for unstaged changes.
 pub fn load(repo: &Repository, old: Option<Oid>, new: Option<Oid>, workdir_file: Option<&Path>) -> ImageDiff {
+    load_with(repo, old, new, workdir_file, decode)
+}
+
+/// Reads and draws both versions of an SVG file, as [`load`] does images.
+pub fn load_svg(repo: &Repository, old: Option<Oid>, new: Option<Oid>, workdir_file: Option<&Path>) -> ImageDiff {
+    load_with(repo, old, new, workdir_file, decode_svg)
+}
+
+fn load_with(
+    repo: &Repository,
+    old: Option<Oid>,
+    new: Option<Oid>,
+    workdir_file: Option<&Path>,
+    decode: fn(&[u8]) -> Side,
+) -> ImageDiff {
     let blob = |id: Option<Oid>| -> Option<Side> {
         let id = id.filter(|id| !id.is_zero())?;
         let blob = repo.find_blob(id).ok()?;
@@ -92,9 +117,103 @@ pub fn load(repo: &Repository, old: Option<Oid>, new: Option<Oid>, workdir_file:
     ImageDiff { old: blob(old), new: new_side }
 }
 
+impl ImageDiff {
+    /// Every version there is was drawn: an SVG that does not parse is
+    /// shown as text alone.
+    pub fn all_drawn(&self) -> bool {
+        let sides = [&self.old, &self.new];
+        sides.iter().any(|side| side.is_some()) && sides.iter().flat_map(|side| side.as_ref()).all(|side| side.picture.is_ok())
+    }
+}
+
+/// Different for every decode, so the UI can tell when to upload anew.
+fn next_id() -> u64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+/// SVG files larger than this are not drawn.
+const MAX_SVG_BYTES: u64 = 8 * 1024 * 1024;
+/// A drawn SVG has at least this many pixels on its longest side, so that
+/// it stays sharp when the preview enlarges a small icon, and at most
+/// [`MAX_SIDE`].
+const SVG_SIDE: f32 = 1024.0;
+
+/// The fonts text in an SVG is drawn with: the app's own (a sans-serif and
+/// a monospace face, which it carries anyway), standing in for every family
+/// an SVG may ask for. No system fonts: looking through them takes a while
+/// and would make the preview depend on the machine.
+static SVG_FONTS: LazyLock<Arc<fontdb::Database>> = LazyLock::new(|| {
+    /// One of egui's fonts as a font source, without copying it.
+    struct Font(Arc<eframe::egui::FontData>);
+    impl AsRef<[u8]> for Font {
+        fn as_ref(&self) -> &[u8] {
+            &self.0.font
+        }
+    }
+    let mut db = fontdb::Database::new();
+    let fonts = eframe::egui::FontDefinitions::default().font_data;
+    let mut family = |name: &str| -> Option<String> {
+        let id = *db.load_font_source(fontdb::Source::Binary(Arc::new(Font(fonts.get(name)?.clone())))).first()?;
+        Some(db.face(id)?.families.first()?.0.clone())
+    };
+    let (sans, mono) = (family("Ubuntu-Light"), family("Hack"));
+    if let Some(sans) = sans {
+        db.set_sans_serif_family(sans.clone());
+        // Also what a family nobody has falls back to.
+        db.set_serif_family(sans.clone());
+        db.set_cursive_family(sans.clone());
+        db.set_fantasy_family(sans);
+    }
+    if let Some(mono) = mono {
+        db.set_monospace_family(mono);
+    }
+    Arc::new(db)
+});
+
+/// Draws one SVG file's bytes.
+pub fn decode_svg(bytes: &[u8]) -> Side {
+    let size = bytes.len() as u64;
+    let picture = (|| {
+        if size > MAX_SVG_BYTES {
+            return Err("Too large to preview".to_owned());
+        }
+        let options = usvg::Options { fontdb: SVG_FONTS.clone(), ..usvg::Options::default() };
+        let tree = usvg::Tree::from_data(bytes, &options).map_err(|_| "Not a valid SVG".to_owned())?;
+        let own = tree.size();
+        let (width, height) = (own.width().ceil().max(1.0), own.height().ceil().max(1.0));
+        if width > MAX_DIMENSION as f32 || height > MAX_DIMENSION as f32 {
+            return Err("Too large to preview".to_owned());
+        }
+        let longest = width.max(height);
+        let scale = if longest < SVG_SIDE { SVG_SIDE / longest } else { (MAX_SIDE as f32 / longest).min(1.0) };
+        let pixels = |side: f32| ((side * scale).round() as u32).clamp(1, MAX_SIDE);
+        let (w, h) = (pixels(width), pixels(height));
+        let mut pixmap = tiny_skia::Pixmap::new(w, h).ok_or_else(|| "Too large to preview".to_owned())?;
+        let transform = tiny_skia::Transform::from_scale(w as f32 / own.width(), h as f32 / own.height());
+        resvg::render(&tree, transform, &mut pixmap.as_mut());
+        let rgba = pixmap
+            .pixels()
+            .iter()
+            .flat_map(|pixel| {
+                let color = pixel.demultiply();
+                [color.red(), color.green(), color.blue(), color.alpha()]
+            })
+            .collect();
+        Ok(Picture {
+            id: next_id(),
+            format: "SVG",
+            width: width as u32,
+            height: height as u32,
+            rgba,
+            rgba_size: [w as usize, h as usize],
+        })
+    })();
+    Side { bytes: size, picture }
+}
+
 /// Decodes one file's bytes, scaled down for display when it is large.
 pub fn decode(bytes: &[u8]) -> Side {
-    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     let size = bytes.len() as u64;
     let picture = (|| {
         if size > MAX_BYTES {
@@ -125,7 +244,7 @@ pub fn decode(bytes: &[u8]) -> Side {
         let rgba = shown.to_rgba8();
         let rgba_size = [rgba.width() as usize, rgba.height() as usize];
         Ok(Picture {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_id(),
             format,
             width,
             height,
@@ -199,6 +318,40 @@ pub(crate) mod tests {
             }
         }
         !crc
+    }
+
+    const SQUARE: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="16" height="8" viewBox="0 0 16 8">
+<rect width="8" height="8" fill="#ff0000"/><text x="9" y="7" font-family="Arial" font-size="6">A</text></svg>"##;
+
+    #[test]
+    fn an_svg_is_drawn_sharp_enough_to_enlarge() {
+        assert!(is_svg_path("art/Logo.SVG") && !is_svg_path("logo.svgz") && !is_image_path("logo.svg"));
+        let picture = decode_svg(SQUARE.as_bytes()).picture.unwrap();
+        assert_eq!((picture.format, picture.width, picture.height), ("SVG", 16, 8));
+        // Drawn at 1024 pixels on its longest side.
+        assert_eq!(picture.rgba_size, [1024, 512]);
+        let pixel = |x: usize, y: usize| &picture.rgba[(y * 1024 + x) * 4..][..4];
+        assert_eq!(pixel(10, 10), [255, 0, 0, 255]);
+        // Right of the square: transparent but for the letter.
+        assert_eq!(pixel(1020, 10)[3], 0);
+        // The text is drawn, in the app's own font for want of Arial.
+        let inked = (576..1024).flat_map(|x| (0..512).map(move |y| (x, y))).filter(|&(x, y)| pixel(x, y)[3] > 0).count();
+        assert!(inked > 1000, "{inked} pixels of text");
+    }
+
+    #[test]
+    fn broken_or_huge_svgs_are_not_drawn() {
+        assert_eq!(decode_svg(b"<svg").picture.err().as_deref(), Some("Not a valid SVG"));
+        assert!(decode_svg(b"not xml at all").picture.is_err());
+        let huge = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100000" height="10"/>"#;
+        assert_eq!(decode_svg(huge.as_bytes()).picture.err().as_deref(), Some("Too large to preview"));
+        // A big one is drawn at most 2048 pixels wide.
+        let big = r#"<svg xmlns="http://www.w3.org/2000/svg" width="4000" height="1000"><rect width="10" height="10"/></svg>"#;
+        assert_eq!(decode_svg(big.as_bytes()).picture.unwrap().rgba_size, [2048, 512]);
+        let drawn = ImageDiff { old: Some(decode_svg(SQUARE.as_bytes())), new: None };
+        assert!(drawn.all_drawn());
+        let half = ImageDiff { old: Some(decode_svg(SQUARE.as_bytes())), new: Some(decode_svg(b"<svg")) };
+        assert!(!half.all_drawn() && !ImageDiff::default().all_drawn());
     }
 
     #[test]

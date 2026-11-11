@@ -19,6 +19,10 @@ const CONTEXT: u32 = 3;
 /// Context that takes in every line of a file. Not `u32::MAX`: xdiff adds
 /// it to line numbers in a C `long`, which has 32 bits on Windows.
 const WHOLE_FILE_CONTEXT: u32 = 1 << 24;
+/// A diff of the hunks of a file no larger than this (either version) comes
+/// with all its lines (`FileDiff::whole`), so that syntax colours can follow
+/// the file from its start. Larger files are coloured hunk by hunk.
+pub const WHOLE_FOR_COLOURS_BYTES: u64 = 1024 * 1024;
 
 // ---- how a diff is worked out ---------------------------------------------------
 
@@ -105,6 +109,28 @@ impl Loader {
         } else if mode.whole_file && !out.binary && !out.hunks.is_empty() {
             let (whole, _) = self.collect(target, mode, WHOLE_FILE_CONTEXT, format)?;
             fill_gaps(&mut out, whole);
+        } else if !out.binary
+            && !out.hunks.is_empty()
+            && crate::prefs::editor::look().highlight
+            && blobs.is_some_and(|(old, new)| self.small_for_colours(target, old, new, out.kind))
+        {
+            let (whole, _) = self.collect(target, mode, WHOLE_FILE_CONTEXT, format)?;
+            out.whole = only_hunk(whole);
+        }
+
+        // An SVG is text, and a picture too: both versions drawn, unless one
+        // does not parse (its text alone is shown then).
+        if !out.binary
+            && picture::is_svg_path(&target.path)
+            && let Some((old, new)) = blobs
+        {
+            let on_disk = (target.source == DiffSource::Unstaged && out.kind != Some(super::ChangeKind::Deleted))
+                .then(|| repo.workdir().map(|dir| dir.join(&target.path)))
+                .flatten();
+            let images = picture::load_svg(repo, Some(old), Some(new), on_disk.as_deref());
+            if images.all_drawn() {
+                out.images = Some(std::sync::Arc::new(images));
+            }
         }
 
         // Nothing left once whitespace is ignored: say whether that is
@@ -276,11 +302,30 @@ impl Loader {
         Ok((out, blobs))
     }
 
+    /// Whether both versions of the file are small enough to come with the
+    /// diff whole, for syntax colours (`WHOLE_FOR_COLOURS_BYTES`).
+    fn small_for_colours(&self, target: &DiffTarget, old: git2::Oid, new: git2::Oid, kind: Option<super::ChangeKind>) -> bool {
+        let repo = &self.repo;
+        let blob_size = |id: git2::Oid| {
+            if id.is_zero() {
+                return Some(0);
+            }
+            repo.odb().ok()?.read_header(id).ok().map(|(size, _)| size as u64)
+        };
+        let new_size = match (target.source, kind) {
+            (DiffSource::Unstaged, kind) if kind != Some(super::ChangeKind::Deleted) => {
+                repo.workdir().and_then(|dir| std::fs::metadata(dir.join(&target.path)).ok()).map(|meta| meta.len())
+            }
+            _ => blob_size(new),
+        };
+        [blob_size(old), new_size].iter().all(|size| size.is_some_and(|size| size <= WHOLE_FOR_COLOURS_BYTES))
+    }
+
     /// UTF-16 is binary to git: it is full of zero bytes. When a version of
-    /// the file starts with a UTF-16 byte order mark (or the repository is
-    /// set to UTF-16), both are turned into UTF-8 and diffed as text. Such a
-    /// diff is for reading: it has no patch header, so nothing in it can be
-    /// staged by hunk or line.
+    /// the file is UTF-16 (`text::utf16_encoding`: a byte order mark, the
+    /// repository set to UTF-16, or text that plainly is), both are turned
+    /// into UTF-8 and diffed as text. Its hunks and lines are applied by
+    /// GitKrill itself, in the file's encoding (`FileDiff::transcoded`).
     fn utf16_diff(
         &self,
         target: &DiffTarget,
@@ -308,11 +353,17 @@ impl Loader {
         };
         let (old_bytes, new_bytes) = (blob(old)?, new_bytes?);
         let default = out.format.encoding;
-        if ![&old_bytes, &new_bytes].iter().any(|bytes| !bytes.is_empty() && text::detect(bytes, default).encoding.is_utf16()) {
+        let utf16 = |bytes: &[u8]| (!bytes.is_empty()).then(|| text::utf16_encoding(bytes, default)).flatten();
+        let (old_found, new_found) = (utf16(&old_bytes), utf16(&new_bytes));
+        if old_found.is_none() && new_found.is_none() {
             return None;
         }
-        let (old_text, _) = text::decode_file(&old_bytes, default);
-        let (new_text, _) = text::decode_file(&new_bytes, default);
+        let read = |bytes: &[u8], found: Option<text::FileEncoding>| {
+            let found = found.unwrap_or_else(|| text::detect(bytes, default));
+            (text::decode_as(bytes, found), found)
+        };
+        let (old_text, old_encoding) = read(&old_bytes, old_found);
+        let (new_text, new_encoding) = read(&new_bytes, new_found);
         // Zero bytes left after decoding: binary after all.
         if old_text.contains('\0') || new_text.contains('\0') {
             return None;
@@ -341,10 +392,32 @@ impl Loader {
         (out.additions, out.deletions, out.max_chars) = (lines.additions, lines.deletions, lines.max_chars);
         out.format = format;
         out.file_header.clear();
-        if mode.whole_file && !out.hunks.is_empty() {
-            let whole = patch(WHOLE_FILE_CONTEXT)?;
-            let whole = FileDiff { hunks: whole.hunks, truncated: whole.truncated, max_chars: whole.max_chars, ..FileDiff::default() };
-            fill_gaps(out, whole);
+        if !out.hunks.is_empty() {
+            let whole = || {
+                let whole = patch(WHOLE_FILE_CONTEXT)?;
+                Some(FileDiff { hunks: whole.hunks, truncated: whole.truncated, max_chars: whole.max_chars, ..FileDiff::default() })
+            };
+            let small = [&old_text, &new_text].iter().all(|text| text.len() as u64 <= WHOLE_FOR_COLOURS_BYTES);
+            if mode.whole_file {
+                fill_gaps(out, whole()?);
+            } else if small && crate::prefs::editor::look().highlight {
+                out.whole = whole().and_then(only_hunk);
+            }
+        }
+
+        // What it takes to stage, unstage and discard its hunks and lines.
+        let old_side = (!old.is_zero()).then_some(&old_bytes[..]);
+        let new_side = (out.kind != Some(super::ChangeKind::Deleted)).then_some(&new_bytes[..]);
+        let sides = super::utf16::Sides::new(
+            &target.path,
+            super::utf16::Side::new(old_side, old_text.clone(), old_encoding),
+            &old_bytes,
+            super::utf16::Side::new(new_side, new_text.clone(), new_encoding),
+            &new_bytes,
+        );
+        if let Some(sides) = sides {
+            out.file_header = sides.header();
+            out.transcoded = Some(std::sync::Arc::new(sides));
         }
         Some(())
     }
@@ -395,6 +468,16 @@ fn patch_lines(patch: &git2::Patch, format: &text::Format) -> Option<PatchLines>
 }
 
 // ---- the whole file -----------------------------------------------------------------
+
+/// The one hunk of a diff worked out with a context that takes in the whole
+/// file, unless it was cut short.
+fn only_hunk(whole: FileDiff) -> Option<std::sync::Arc<Hunk>> {
+    if whole.truncated {
+        return None;
+    }
+    let [all]: [Hunk; 1] = whole.hunks.try_into().ok()?;
+    Some(std::sync::Arc::new(all))
+}
 
 /// Puts the unchanged lines between the hunks of `out` back, from `whole`:
 /// the same diff worked out with a context that takes in the whole file.
@@ -1155,8 +1238,8 @@ mod tests {
         assert_eq!(changes(&diff), owned(&[('-', "second"), ('+', "second, changed")]));
         assert_eq!(diff.hunks[0].lines[0].text, "caf\u{e9}");
         assert_eq!((diff.additions, diff.deletions), (1, 1));
-        // For reading only: there is no patch to stage parts of.
-        assert!(diff.file_header.is_empty() && diff.hunk_patch(0).is_none());
+        // Its parts are applied in the file's own encoding (see `git::utf16`).
+        assert!(diff.transcoded.is_some() && diff.hunk_patch(0).is_some());
         assert_eq!(diff.hunks[0].sources(diff.format.encoding).unwrap()[1], "second");
 
         // Committed, the same.
@@ -1532,5 +1615,60 @@ mod tests {
         assert!(!super::with_gaps(&mut stray, &all));
         assert_eq!(stray.len(), 1);
         assert!(!stray[0].gap);
+    }
+
+    #[test]
+    fn a_diff_of_the_hunks_comes_with_every_line_of_a_small_file() {
+        let fx = Fixture::new("diff-whole-for-colours");
+        let original = "/* a comment\n".to_owned() + &numbered(1..=20) + "*/\n";
+        fx.write("lib.rs", &original);
+        fx.commit_all("lib");
+        fx.write("lib.rs", &original.replace("line 15\n", "line fifteen\n"));
+        let diff = diff_in(&fx, Unstaged, "lib.rs", Mode::default());
+        assert_eq!(diff.hunks.len(), 1);
+        let whole = diff.whole.as_ref().expect("every line comes with it");
+        let lines: Vec<(char, &str)> = whole.lines.iter().map(|l| (l.origin, l.text.as_str())).collect();
+        assert_eq!(lines.len(), 23);
+        assert_eq!(lines[0], (' ', "/* a comment"));
+        assert!(lines.contains(&('-', "line 15")) && lines.contains(&('+', "line fifteen")));
+        // A whole-file diff has them all already.
+        assert!(diff_in(&fx, Unstaged, "lib.rs", WHOLE).whole.is_none());
+
+        // Too large: hunk by hunk.
+        let big = numbered(1..=60_000);
+        fx.write("big.txt", &big);
+        fx.commit_all("big");
+        fx.write("big.txt", &big.replace("line 7\n", "line seven\n"));
+        assert!(diff_in(&fx, Unstaged, "big.txt", Mode::default()).whole.is_none());
+    }
+
+    #[test]
+    fn svg_changes_come_drawn_unless_they_do_not_parse() {
+        let fx = Fixture::new("diff-svg");
+        let svg = |fill: &str| {
+            format!("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"4\" height=\"4\">\n<rect width=\"4\" height=\"4\" fill=\"{fill}\"/>\n</svg>\n")
+        };
+        fx.write("art/logo one.svg", &svg("red"));
+        fx.commit_all("logo");
+        fx.write("art/logo one.svg", &svg("blue"));
+        let diff = diff_in(&fx, Unstaged, "art/logo one.svg", Mode::default());
+        assert!(!diff.binary && !diff.file_header.is_empty(), "still a text diff, stageable");
+        let images = diff.images.as_ref().expect("drawn");
+        let red = &images.old.as_ref().unwrap().picture.as_ref().unwrap().rgba[..4];
+        let blue = &images.new.as_ref().unwrap().picture.as_ref().unwrap().rgba[..4];
+        assert_eq!((red, blue), (&[255, 0, 0, 255][..], &[0, 0, 255, 255][..]));
+
+        // Half written: the text alone.
+        fx.write("art/logo one.svg", "<svg xmlns=\"http://www.w3.org/2000/svg\">\n<rect\n");
+        let broken = diff_in(&fx, Unstaged, "art/logo one.svg", Mode::default());
+        assert!(broken.images.is_none() && !broken.hunks.is_empty());
+
+        // Committed, and added: one picture.
+        fx.write("art/logo one.svg", &svg("blue"));
+        fx.write("new.svg", &svg("green"));
+        fx.commit_all("blue");
+        let added = diff_in(&fx, Commit(head(&fx)), "new.svg", Mode::default());
+        let images = added.images.as_ref().expect("drawn");
+        assert!(images.old.is_none() && images.new.is_some());
     }
 }

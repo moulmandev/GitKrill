@@ -417,6 +417,7 @@ pub fn entries(tabs: &[RepoTab], active: usize, settings: &Settings) -> Vec<Entr
     editor_actions(&mut list, settings);
     crate::ui::diff_mode::palette_entries(&mut list, settings);
     crate::ui::conflict::palette_entries(&mut list, snap, settings);
+    crate::ui::image_diff::palette_entries(&mut list);
     if let Some(shown) = tab.and_then(|tab| tab.hosting.connected()) {
         let service = shown.repo.service;
         list.push(

@@ -8,13 +8,24 @@
 //! something (or because an unrelated file changed) keeps its colours without
 //! a flicker.
 //!
-//! A hunk is all the parser gets to see, so it starts every hunk in the
-//! syntax's initial state: a hunk that begins inside a block comment or a
-//! multi-line string is coloured as if it did not. (The unchanged stretches
-//! of a whole-file diff are hunks of their own, `Hunk::gap`.) The old side (context and
-//! removed lines) and the new side (context and added lines) are parsed as
-//! two separate streams, so a string opened on a removed line cannot leak
-//! into the added lines after it.
+//! The old side (context and removed lines) and the new side (context and
+//! added lines) are parsed as two separate streams, so a string opened on a
+//! removed line cannot leak into the added lines after it. While the two
+//! sides are in the same state (between the changes, mostly), a context line
+//! is parsed once.
+//!
+//! Colours follow the whole file: when a diff has every line of the file
+//! (a whole-file diff, `Hunk::gap` hunks between the real ones; or the
+//! `FileDiff::whole` the loader adds to a diff of the hunks of a file no
+//! larger than `git::diff::WHOLE_FOR_COLOURS_BYTES`), those lines are parsed
+//! from the top as one stream, and each line shown takes its colours from
+//! there, so a hunk that begins inside a block comment or a multi-line
+//! string is coloured as such. Until the stream has got that far, a line
+//! shows the colours of the same line in the version of the file shown
+//! before (after staging, or saving in an editor), or else those of its
+//! hunk parsed on its own, which is quick. Files of more than
+//! [`STREAM_MAX_LINES`] lines (or [`STREAM_MAX_BYTES`]) are coloured hunk by
+//! hunk only, each hunk starting in the syntax's initial state.
 
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -24,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use eframe::egui::text::{LayoutJob, TextFormat};
 use eframe::egui::{self, Color32, FontId};
-use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxDefinition, SyntaxSet};
+use syntect::parsing::{ParseState, Scope, ScopeStack, SyntaxDefinition, SyntaxSet, SyntaxSetBuilder};
 
 use crate::git::{DiffLine, FileDiff, Hunk};
 use crate::theme;
@@ -48,6 +59,13 @@ const MAX_PAIRING_CELLS: usize = 256;
 const RECENT_DIFFS: usize = 6;
 /// Finished lines are published this many at a time.
 const BATCH: usize = 256;
+/// Files with more lines than this (both versions together, as a whole-file
+/// diff shows them) are coloured hunk by hunk instead of from the top.
+pub const STREAM_MAX_LINES: usize = 20_000;
+/// The same limit in bytes.
+pub const STREAM_MAX_BYTES: usize = 1_500_000;
+/// No line: in a map from shown lines to the lines of a stream.
+const NONE: u32 = u32::MAX;
 
 // ---- token classes and their colours ---------------------------------------
 
@@ -197,36 +215,123 @@ const SELECTORS: &[(&str, Class)] = &[
 /// File extensions the bundled syntaxes do not know, and the bundled syntax
 /// that is close enough to be worth using for them.
 const ALIASES: &[(&str, &str)] = &[
-    ("ts", "js"),
-    ("mts", "js"),
-    ("cts", "js"),
-    ("tsx", "js"),
-    ("jsx", "js"),
+    // JSX is TSX without the types; the JavaScript grammar does not know it.
+    ("jsx", "tsx"),
     ("mjs", "js"),
     ("cjs", "js"),
+    ("mts", "ts"),
+    ("cts", "ts"),
     ("jsonc", "json"),
     ("json5", "json"),
     ("webmanifest", "json"),
-    ("scss", "css"),
-    ("less", "css"),
-    ("vue", "html"),
-    ("svelte", "html"),
-    ("kt", "java"),
-    ("kts", "java"),
     ("pyi", "py"),
     ("mdx", "md"),
     ("zsh", "sh"),
     ("csproj", "xml"),
+    ("fsproj", "xml"),
+    ("vbproj", "xml"),
     ("props", "xml"),
     ("targets", "xml"),
     ("xaml", "xml"),
+    ("resx", "xml"),
+    ("ps1xml", "xml"),
     ("lock", "toml"),
-    ("ini", "toml"),
-    ("cfg", "toml"),
-    ("conf", "toml"),
-    ("editorconfig", "toml"),
-    ("gitconfig", "toml"),
+    ("cfg", "ini"),
+    ("conf", "ini"),
+    ("editorconfig", "ini"),
+    ("gitconfig", "ini"),
 ];
+
+/// PowerShell. Bat's grammar for it needs regular expressions that the
+/// pure-Rust engine syntect runs here does not have, so this smaller one
+/// stands in: comments, strings (here-strings too) with the variables in
+/// them, variables, keywords, `-eq`-style operators, parameters, cmdlet
+/// names, types and numbers.
+const POWERSHELL_SYNTAX: &str = r##"%YAML 1.2
+---
+name: PowerShell
+file_extensions: [ps1, psm1, psd1]
+scope: source.powershell
+contexts:
+  main:
+    - match: '<#'
+      scope: punctuation.definition.comment.begin.powershell
+      push:
+        - meta_scope: comment.block.powershell
+        - match: '#>'
+          scope: punctuation.definition.comment.end.powershell
+          pop: true
+    - match: '#.*$'
+      scope: comment.line.number-sign.powershell
+    - match: '@"(?=\s*$)'
+      scope: punctuation.definition.string.begin.powershell
+      push:
+        - meta_scope: string.quoted.double.heredoc.powershell
+        - match: '^"@'
+          scope: punctuation.definition.string.end.powershell
+          pop: true
+        - include: interpolation
+    - match: "@'(?=\\s*$)"
+      scope: punctuation.definition.string.begin.powershell
+      push:
+        - meta_scope: string.quoted.single.heredoc.powershell
+        - match: "^'@"
+          scope: punctuation.definition.string.end.powershell
+          pop: true
+    - match: '"'
+      scope: punctuation.definition.string.begin.powershell
+      push:
+        - meta_scope: string.quoted.double.powershell
+        - match: '""'
+          scope: constant.character.escape.powershell
+        - include: interpolation
+        - match: '"'
+          scope: punctuation.definition.string.end.powershell
+          pop: true
+    - match: "'"
+      scope: punctuation.definition.string.begin.powershell
+      push:
+        - meta_scope: string.quoted.single.powershell
+        - match: "''"
+          scope: constant.character.escape.powershell
+        - match: "'"
+          scope: punctuation.definition.string.end.powershell
+          pop: true
+    - match: '\$(?i:true|false|null)\b'
+      scope: constant.language.powershell
+    - match: '\$\{[^}]*\}|\$(?:\w+:)?\w+|\$[$?^]'
+      scope: variable.other.readwrite.powershell
+    - match: '(?i)\b(function|filter|workflow|configuration)\s+([\w-]+)'
+      captures:
+        1: storage.type.powershell
+        2: entity.name.function.powershell
+    - match: '(?i)\b(class|enum)\s+(\w+)'
+      captures:
+        1: storage.type.powershell
+        2: entity.name.type.powershell
+    - match: '(?i)\b(?:begin|break|catch|continue|data|do|dynamicparam|else|elseif|end|exit|finally|for|foreach|from|hidden|if|in|param|process|return|static|switch|throw|trap|try|until|using|while)\b'
+      scope: keyword.control.powershell
+    - match: '(?i)(?<![\w-])-(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|contains|notcontains|in|notin|replace|split|join|is|isnot|as|and|or|xor|not|band|bor|bxor|bnot|shl|shr|f|c(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|contains|notcontains|in|notin|replace|split)|i(?:eq|ne|gt|ge|lt|le|like|notlike|match|notmatch|contains|notcontains|in|notin|replace|split))\b'
+      scope: keyword.other.word-operator.powershell
+    - match: '(?<![\w-])-[A-Za-z]\w*'
+      scope: entity.other.attribute-name.parameter.powershell
+    - match: '(?<![\w$-])[A-Za-z]+-[A-Za-z]\w*'
+      scope: support.function.cmdlet.powershell
+    - match: '(\[)([A-Za-z][\w.]*(?:\[\])?)(\])'
+      captures:
+        1: punctuation.section.brackets.powershell
+        2: support.type.powershell
+        3: punctuation.section.brackets.powershell
+    - match: '\b(?:0x[0-9A-Fa-f]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)(?i:[kmgtp]b)?\b'
+      scope: constant.numeric.powershell
+    - match: '[{}()\[\];,|=+*/%!<>.]'
+      scope: punctuation.powershell
+  interpolation:
+    - match: '`.'
+      scope: constant.character.escape.powershell
+    - match: '\$\{[^}]*\}|\$(?:\w+:)?\w+'
+      scope: constant.other.placeholder.powershell
+"##;
 
 /// TOML is not among the bundled syntaxes, and a Rust project's diffs are
 /// full of it. This small grammar also does for INI-style files.
@@ -315,6 +420,15 @@ struct Lines {
     spans: Vec<Span>,
 }
 
+impl Lines {
+    /// The runs of line `line`, once it is done.
+    fn get(&self, line: usize) -> Option<&[Span]> {
+        let end = *self.ends.get(line)?;
+        let start = if line == 0 { 0 } else { self.ends[line - 1] };
+        self.spans.get(start as usize..end as usize)
+    }
+}
+
 /// One emphasised stretch: line index, then the range in characters.
 type Stretch = (u32, u32, u32);
 
@@ -329,22 +443,81 @@ pub struct HunkStyle {
 /// Styling of one diff: one entry per hunk.
 pub struct DiffStyle {
     hunks: Vec<Arc<HunkStyle>>,
+    /// The colours of the whole file, when the diff has all its lines.
+    stream: Option<StreamLink>,
+}
+
+/// Where the lines of a diff are in the stream of every line of the file
+/// (see the module comment), and that stream's colours.
+struct StreamLink {
+    style: Arc<HunkStyle>,
+    /// The first shown line of every hunk among all of them.
+    starts: Vec<usize>,
+    /// The stream line of every shown line, hunk after hunk ([`NONE`]: not
+    /// in it); `None` when the stream is the shown lines themselves.
+    map: Option<Vec<u32>>,
+    /// Colours of the same lines in the version shown before.
+    seed: Option<Seed>,
+}
+
+/// Colours of an earlier stream of the same file, for the lines of this one
+/// that it has too (same line number, same text).
+struct Seed {
+    style: Arc<HunkStyle>,
+    /// The earlier stream's line for every line of this one ([`NONE`]: none).
+    map: Vec<u32>,
 }
 
 /// Read access to one hunk's styling while its rows are painted.
 pub struct HunkView<'a> {
     syntax: RwLockReadGuard<'a, Lines>,
     emphasis: &'a [Stretch],
+    stream: Option<StreamView<'a>>,
+}
+
+/// One hunk's part of a [`StreamLink`], while it is painted.
+struct StreamView<'a> {
+    lines: RwLockReadGuard<'a, Lines>,
+    /// The hunk's first line in the stream, or its lines' places there.
+    start: usize,
+    map: Option<&'a [u32]>,
+    seed: Option<(RwLockReadGuard<'a, Lines>, &'a [u32])>,
+}
+
+/// A read lock that a worker dying mid-append does not spoil: what is in
+/// there is still a consistent prefix.
+fn read(lines: &RwLock<Lines>) -> RwLockReadGuard<'_, Lines> {
+    lines.read().unwrap_or_else(|e| e.into_inner())
 }
 
 impl DiffStyle {
     pub fn hunk(&self, index: usize) -> Option<HunkView<'_>> {
         let hunk = self.hunks.get(index)?;
-        Some(HunkView {
-            // A poisoned lock only means the worker died mid-append; what is
-            // in there is still a consistent prefix.
-            syntax: hunk.syntax.read().unwrap_or_else(|e| e.into_inner()),
-            emphasis: hunk.emphasis.get().map_or(&[], Vec::as_slice),
+        let stream = self.stream.as_ref().and_then(|link| {
+            let start = *link.starts.get(index)?;
+            let end = link.starts.get(index + 1).copied().unwrap_or(start);
+            Some(StreamView {
+                lines: read(&link.style.syntax),
+                start,
+                map: link.map.as_ref().and_then(|map| map.get(start..end)),
+                seed: link.seed.as_ref().map(|seed| (read(&seed.style.syntax), seed.map.as_slice())),
+            })
+        });
+        Some(HunkView { syntax: read(&hunk.syntax), emphasis: hunk.emphasis.get().map_or(&[], Vec::as_slice), stream })
+    }
+}
+
+impl StreamView<'_> {
+    /// The runs of the hunk's line `line` from the whole file's colours, or
+    /// until those got there, from the earlier version's.
+    fn spans(&self, line: usize) -> Option<&[Span]> {
+        let at = match self.map {
+            Some(map) => map.get(line).copied().filter(|at| *at != NONE)? as usize,
+            None => self.start + line,
+        };
+        self.lines.get(at).or_else(|| {
+            let (seed, map) = self.seed.as_ref()?;
+            seed.get(*map.get(at).filter(|at| **at != NONE)? as usize)
         })
     }
 }
@@ -352,9 +525,10 @@ impl DiffStyle {
 impl HunkView<'_> {
     /// Coloured runs of a line; empty while (or if) it is not highlighted.
     pub fn spans(&self, line: usize) -> &[Span] {
-        let Some(end) = self.syntax.ends.get(line) else { return &[] };
-        let start = if line == 0 { 0 } else { self.syntax.ends[line - 1] };
-        self.syntax.spans.get(start as usize..*end as usize).unwrap_or(&[])
+        if let Some(spans) = self.stream.as_ref().and_then(|stream| stream.spans(line)) {
+            return spans;
+        }
+        self.syntax.get(line).unwrap_or(&[])
     }
 
     /// Character ranges of a line that differ from the line it is paired with.
@@ -409,12 +583,21 @@ pub fn layout_part(text: &str, part: Range<usize>, spans: &[Span], font: &FontId
 
 // ---- requesting styles (UI thread) -------------------------------------------
 
+/// What a job colours.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Part {
+    /// One hunk of the diff, on its own.
+    Hunk(usize),
+    /// Every line of the file from the top ([`stream_of`]).
+    Stream,
+}
+
 struct Job {
     /// Kept alive so the work stays valid if the view moves on to a reloaded
     /// copy of the same diff, which shares the output below.
     diff: Arc<FileDiff>,
-    hunk: usize,
-    /// How many of the hunk's lines to parse (0: emphasis only).
+    part: Part,
+    /// How many of the lines to parse (0: emphasis only).
     limit: usize,
     file_name: Arc<str>,
     /// Dead once no diff shows this hunk any more; the job is then skipped.
@@ -443,9 +626,161 @@ struct State {
     queue: Option<Arc<Queue>>,
     /// Number of requests that had work for the worker so far.
     requests: u64,
+    /// The stream last coloured for each of the files shown lately, by
+    /// path, newest first: what the next version of the file is seeded from.
+    streams: VecDeque<(Arc<str>, Arc<FileDiff>, Arc<HunkStyle>)>,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(Mutex::default);
+
+/// The lines the file's colours are worked out on: every line of both
+/// versions of the file, in file order. They are the diff's `whole` hunk
+/// when it has one, or else the lines shown, which must then be the whole
+/// file (see [`in_file_order`]).
+fn stream_of(diff: &FileDiff) -> Vec<&DiffLine> {
+    match &diff.whole {
+        Some(whole) => whole.lines.iter().collect(),
+        None => diff.hunks.iter().flat_map(|hunk| &hunk.lines).collect(),
+    }
+}
+
+/// Whether `lines` are those of a file from its first line on, both
+/// versions, in order: what a whole-file diff shows.
+fn in_file_order(lines: &[&DiffLine]) -> bool {
+    let (mut old, mut new) = (1u32, 1u32);
+    for line in lines {
+        let (on_old, on_new) = match line.origin {
+            ' ' => (true, true),
+            '-' => (true, false),
+            '+' => (false, true),
+            _ => return false,
+        };
+        if on_old {
+            if line.old_no != Some(old) {
+                return false;
+            }
+            old += 1;
+        }
+        if on_new {
+            if line.new_no != Some(new) {
+                return false;
+            }
+            new += 1;
+        }
+    }
+    !lines.is_empty()
+}
+
+/// Every line of a stream by its number in the old and in the new version.
+fn by_number(stream: &[&DiffLine]) -> (Vec<u32>, Vec<u32>) {
+    let size = stream.len() + 2;
+    let (mut old, mut new) = (vec![NONE; size], vec![NONE; size]);
+    for (k, line) in stream.iter().enumerate() {
+        if line.origin != '+'
+            && let Some(slot) = line.old_no.and_then(|n| old.get_mut(n as usize))
+        {
+            *slot = k as u32;
+        }
+        if line.origin != '-'
+            && let Some(slot) = line.new_no.and_then(|n| new.get_mut(n as usize))
+        {
+            *slot = k as u32;
+        }
+    }
+    (old, new)
+}
+
+/// Where every shown line of `diff` is in `stream`, by its line number: a
+/// removed line by its old one, the others by their new one. `None` if one
+/// is not there, or differs (a mix-up: the stream is then not used).
+fn map_shown(diff: &FileDiff, stream: &[&DiffLine]) -> Option<Vec<u32>> {
+    let (old, new) = by_number(stream);
+    diff.hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .map(|line| {
+            let at = match line.origin {
+                '-' => *old.get(line.old_no? as usize)?,
+                _ => *new.get(line.new_no? as usize)?,
+            };
+            let found = stream.get(at as usize)?;
+            (found.origin == line.origin && found.text == line.text).then_some(at)
+        })
+        .collect()
+}
+
+/// For every line of `stream`, the line of `earlier` (an earlier stream of
+/// the same file) with the same number on the same side and the same text.
+fn seed_map(stream: &[&DiffLine], earlier: &[&DiffLine]) -> Vec<u32> {
+    let (old, new) = by_number(earlier);
+    stream
+        .iter()
+        .map(|line| {
+            let at = |table: &[u32], number: Option<u32>| {
+                let at = *table.get(number? as usize)?;
+                (at != NONE && earlier[at as usize].text == line.text).then_some(at)
+            };
+            match line.origin {
+                '-' => at(&old, line.old_no),
+                '+' => at(&new, line.new_no),
+                _ => at(&new, line.new_no).or_else(|| at(&old, line.old_no)),
+            }
+            .unwrap_or(NONE)
+        })
+        .collect()
+}
+
+/// The stream of `diff` and how its shown lines map onto it, if it has one
+/// small enough. A stream not coloured yet gets a job in `jobs`, and the
+/// colours of the version of the file at `path` shown before as its seed.
+fn link_stream(
+    state: &mut State,
+    diff: &Arc<FileDiff>,
+    path: &str,
+    file_name: &Arc<str>,
+    mut job: impl FnMut(Part, usize, &Arc<HunkStyle>),
+) -> Option<StreamLink> {
+    let lines = stream_of(diff);
+    let bytes: usize = lines.iter().map(|line| line.text.len()).sum();
+    if lines.len() > STREAM_MAX_LINES || bytes > STREAM_MAX_BYTES || !in_file_order(&lines) {
+        return None;
+    }
+    let map = match diff.whole {
+        Some(_) => Some(map_shown(diff, &lines)?),
+        None => None,
+    };
+    let mut starts = Vec::with_capacity(diff.hunks.len() + 1);
+    let mut total = 0;
+    for hunk in &diff.hunks {
+        starts.push(total);
+        total += hunk.lines.len();
+    }
+    starts.push(total);
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    ("stream", &**file_name).hash(&mut hasher);
+    for line in &lines {
+        (line.origin, line.text.as_str()).hash(&mut hasher);
+    }
+    let key = hasher.finish();
+    let path: Arc<str> = path.into();
+    let earlier = state.streams.iter().position(|(known, ..)| *known == path).and_then(|i| state.streams.remove(i));
+    let (style, seed) = match state.hunks.get(&key).and_then(Weak::upgrade) {
+        Some(style) => (style, None),
+        None => {
+            let style = Arc::new(HunkStyle::default());
+            state.hunks.insert(key, Arc::downgrade(&style));
+            job(Part::Stream, lines.len(), &style);
+            let seed = earlier
+                .as_ref()
+                .map(|(_, diff, style)| Seed { style: style.clone(), map: seed_map(&lines, &stream_of(diff)) });
+            (style, seed)
+        }
+    };
+    state.streams.push_front((path, diff.clone(), style.clone()));
+    state.streams.truncate(RECENT_DIFFS);
+    Some(StreamLink { style, starts, map, seed })
+}
 
 /// The styling for `diff`, a file called `path`: syntax colours when
 /// `syntax` (Preferences > Editor), and the changed words either way.
@@ -464,11 +799,32 @@ pub fn style_for(ctx: &egui::Context, diff: &Arc<FileDiff>, path: &str, syntax: 
     }
 
     let file_name: Arc<str> = path.rsplit(['/', '\\']).next().unwrap_or(path).to_lowercase().into();
-    // Without syntax colours nothing is parsed: every hunk gets the word
-    // emphasis only.
-    let (mut lines_left, mut bytes_left) = if syntax { (MAX_LINES, MAX_BYTES) } else { (0, 0) };
     let request = state.requests + 1;
     let mut jobs = Vec::new();
+    let new_job = |part: Part, limit: usize, style: &Arc<HunkStyle>| Job {
+        diff: diff.clone(),
+        part,
+        limit,
+        file_name: file_name.clone(),
+        out: Arc::downgrade(style),
+        ctx: ctx.clone(),
+        request,
+        progress: None,
+    };
+
+    // The whole file, when the diff has it all; its job goes after those of
+    // the hunks, which are quick.
+    let mut stream_job = None;
+    let stream = if syntax {
+        link_stream(&mut state, diff, path, &file_name, |part, limit, style| stream_job = Some(new_job(part, limit, style)))
+    } else {
+        None
+    };
+    // Without syntax colours nothing is parsed: every hunk gets the word
+    // emphasis only. Neither are the hunks of a whole-file diff coloured
+    // from the stream: they are the stream.
+    let shown_is_stream = stream.as_ref().is_some_and(|link| link.map.is_none());
+    let (mut lines_left, mut bytes_left) = if syntax && !shown_is_stream { (MAX_LINES, MAX_BYTES) } else { (0, 0) };
     let mut hunks = Vec::with_capacity(diff.hunks.len());
     for (index, hunk) in diff.hunks.iter().enumerate() {
         let mut limit = 0;
@@ -494,23 +850,15 @@ pub fn style_for(ctx: &egui::Context, diff: &Arc<FileDiff>, path: &str, syntax: 
             None => {
                 let style = Arc::new(HunkStyle::default());
                 state.hunks.insert(key, Arc::downgrade(&style));
-                jobs.push(Job {
-                    diff: diff.clone(),
-                    hunk: index,
-                    limit,
-                    file_name: file_name.clone(),
-                    out: Arc::downgrade(&style),
-                    ctx: ctx.clone(),
-                    request,
-                    progress: None,
-                });
+                jobs.push(new_job(Part::Hunk(index), limit, &style));
                 style
             }
         };
         hunks.push(style);
     }
+    jobs.extend(stream_job);
 
-    let style = Arc::new(DiffStyle { hunks });
+    let style = Arc::new(DiffStyle { hunks, stream });
     state.recent.push_front((Arc::downgrade(diff), syntax, style.clone()));
     state.recent.truncate(RECENT_DIFFS);
     if state.hunks.len() > 4096 {
@@ -563,7 +911,17 @@ fn worker(queue: &Queue) {
         };
         let Some(out) = job.out.upgrade() else { continue };
         let diff = job.diff.clone();
-        let Some(hunk) = diff.hunks.get(job.hunk) else { continue };
+        let hunk = match job.part {
+            Part::Hunk(index) => match diff.hunks.get(index) {
+                Some(hunk) => Some(hunk),
+                None => continue,
+            },
+            Part::Stream => None,
+        };
+        let lines: Vec<&DiffLine> = match hunk {
+            Some(hunk) => hunk.lines.iter().collect(),
+            None => stream_of(&diff),
+        };
         let ctx = job.ctx.clone();
 
         let mut repaint = |force: bool| {
@@ -575,7 +933,7 @@ fn worker(queue: &Queue) {
             }
         };
         if job.progress.is_none() {
-            let _ = out.emphasis.set(emphasize_hunk(hunk));
+            let _ = out.emphasis.set(hunk.map(emphasize_hunk).unwrap_or_default());
             repaint(false);
         }
 
@@ -596,7 +954,7 @@ fn worker(queue: &Queue) {
                     job.progress = engine.start(syntax).map(Box::new);
                 }
                 let Some(progress) = job.progress.as_deref_mut() else { return true };
-                engine.colour_hunk(progress, hunk, job.limit, &out, &mut || {
+                engine.colour_lines(progress, &lines, job.limit, &out, &mut || {
                     repaint(false);
                     !overtaken()
                 })
@@ -622,25 +980,38 @@ fn worker(queue: &Queue) {
 
 /// The loaded grammars plus what is needed to turn scopes into classes.
 struct Engine {
-    set: SyntaxSet,
+    /// Our own grammars (TOML, PowerShell), which win for the file names
+    /// they share with the others, then bat's (syntect's own among them).
+    /// Two sets, not one: adding ours to bat's would have syntect link all
+    /// two hundred grammars again, which takes half a second.
+    sets: [SyntaxSet; 2],
     selectors: Vec<(Scope, Class)>,
     /// Class of a single scope, as resolved so far.
     classes: HashMap<Scope, Option<Class>>,
     comment: Option<Scope>,
     /// Scopes that mark the key of a key/value pair.
     key_scopes: Vec<Scope>,
-    /// Syntax index per lower-case file name.
-    by_name: HashMap<String, Option<usize>>,
+    /// Syntax per lower-case file name.
+    by_name: HashMap<String, Option<Grammar>>,
+}
+
+/// A syntax of the [`Engine`]: the set it is in, and where.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Grammar {
+    set: usize,
+    index: usize,
 }
 
 impl Engine {
     fn new() -> Self {
-        let mut builder = SyntaxSet::load_defaults_newlines().into_builder();
-        if let Ok(toml) = SyntaxDefinition::load_from_str(TOML_SYNTAX, true, None) {
-            builder.add(toml);
+        let mut own = SyntaxSetBuilder::new();
+        for source in [TOML_SYNTAX, POWERSHELL_SYNTAX] {
+            if let Ok(syntax) = SyntaxDefinition::load_from_str(source, true, None) {
+                own.add(syntax);
+            }
         }
         Engine {
-            set: builder.build(),
+            sets: [own.build(), two_face::syntax::extra_newlines()],
             selectors: SELECTORS
                 .iter()
                 .filter_map(|(prefix, class)| Some((Scope::new(prefix).ok()?, *class)))
@@ -655,9 +1026,9 @@ impl Engine {
         }
     }
 
-    /// Index of the syntax for a (lower-case) file name, if there is one
-    /// worth parsing with.
-    fn syntax_for(&mut self, file_name: &str) -> Option<usize> {
+    /// The syntax for a (lower-case) file name, if there is one worth
+    /// parsing with.
+    fn syntax_for(&mut self, file_name: &str) -> Option<Grammar> {
         if let Some(known) = self.by_name.get(file_name) {
             return *known;
         }
@@ -668,11 +1039,22 @@ impl Engine {
             .into_iter()
             .flatten()
             .filter(|token| !token.is_empty())
-            .find_map(|token| self.set.find_syntax_by_extension(token))
-            .filter(|syntax| syntax.name != "Plain Text")
-            .and_then(|syntax| self.set.syntaxes().iter().position(|s| std::ptr::eq(s, syntax)));
+            .find_map(|token| {
+                self.sets.iter().enumerate().find_map(|(set, syntaxes)| {
+                    let syntax = syntaxes.find_syntax_by_extension(token)?;
+                    let index = syntaxes.syntaxes().iter().position(|s| std::ptr::eq(s, syntax))?;
+                    Some((syntax.name != "Plain Text").then_some(Grammar { set, index }))
+                })
+            })
+            .flatten();
         self.by_name.insert(file_name.to_owned(), found);
         found
+    }
+
+    /// The name of a syntax.
+    #[cfg(test)]
+    fn name(&self, grammar: Grammar) -> &str {
+        &self.sets[grammar.set].syntaxes()[grammar.index].name
     }
 
     fn class_of_scope(&mut self, scope: Scope) -> Option<Class> {
@@ -705,20 +1087,19 @@ impl Engine {
     }
 
     /// The parser state for the start of a hunk.
-    fn start(&self, syntax: usize) -> Option<Progress> {
-        let syntax = self.set.syntaxes().get(syntax)?;
+    fn start(&self, grammar: Grammar) -> Option<Progress> {
+        let syntax = self.sets.get(grammar.set)?.syntaxes().get(grammar.index)?;
         let names_tell = syntax.name == "Rust";
         Some(Progress {
-            old: Stream::new(ParseState::new(syntax), names_tell),
-            new: Stream::new(ParseState::new(syntax), names_tell),
+            old: Stream::new(ParseState::new(syntax), grammar.set, names_tell),
+            new: Stream::new(ParseState::new(syntax), grammar.set, names_tell),
             next: 0,
+            joined: true,
         })
     }
 
-    /// Parses the first `limit` lines of a hunk from where `progress` says,
-    /// appending their coloured runs to `out` a batch at a time. `go_on` is
-    /// asked after every batch; when it says no, the rest is left for a
-    /// later call and the result is `false`.
+    /// [`Engine::colour_lines`] for the lines of a hunk.
+    #[cfg(test)]
     fn colour_hunk(
         &mut self,
         progress: &mut Progress,
@@ -727,12 +1108,30 @@ impl Engine {
         out: &HunkStyle,
         go_on: &mut dyn FnMut() -> bool,
     ) -> bool {
-        let lines = &hunk.lines[..limit.min(hunk.lines.len())];
-        let Progress { old, new, next } = progress;
+        let lines: Vec<&DiffLine> = hunk.lines.iter().collect();
+        self.colour_lines(progress, &lines, limit, out, go_on)
+    }
+
+    /// Parses the first `limit` of `lines` (a hunk's, or a whole file's)
+    /// from where `progress` says, appending their coloured runs to `out` a
+    /// batch at a time. `go_on` is asked after every batch; when it says no,
+    /// the rest is left for a later call and the result is `false`.
+    fn colour_lines(
+        &mut self,
+        progress: &mut Progress,
+        lines: &[&DiffLine],
+        limit: usize,
+        out: &HunkStyle,
+        go_on: &mut dyn FnMut() -> bool,
+    ) -> bool {
+        let lines = &lines[..limit.min(lines.len())];
+        let Progress { old, new, next, joined } = progress;
 
         // Context lines belong to both sides. They are coloured from the new
         // side, and fed to the old side only while it still has removed
-        // lines coming that depend on them.
+        // lines coming that depend on them. While both sides are in the
+        // same state (`joined`), only the new side is parsed, and the old
+        // one takes over its state when the two part.
         let last_removed = lines.iter().rposition(|l| l.origin == '-');
         let any_added = lines.iter().any(|l| l.origin == '+');
 
@@ -744,13 +1143,19 @@ impl Engine {
             syntax.ends.extend(batch.ends.drain(..).map(|end| base + end));
         };
         while let Some(line) = lines.get(*next) {
+            if *joined && line.origin != ' ' {
+                old.take_state(new);
+                *joined = false;
+            }
             match line.origin {
                 '-' => old.line(self, &line.text, Some(&mut batch.spans)),
                 '+' => new.line(self, &line.text, Some(&mut batch.spans)),
+                _ if *joined => new.line(self, &line.text, Some(&mut batch.spans)),
                 _ if any_added => {
                     new.line(self, &line.text, Some(&mut batch.spans));
                     if last_removed.is_some_and(|last| *next < last) {
                         old.line(self, &line.text, None);
+                        *joined = old.same_state(new);
                     }
                 }
                 _ => old.line(self, &line.text, Some(&mut batch.spans)),
@@ -775,11 +1180,15 @@ struct Progress {
     new: Stream,
     /// The first line that is not done yet.
     next: usize,
+    /// The two sides are in the same state, kept by `new` alone.
+    joined: bool,
 }
 
 /// One side of a hunk being parsed line by line.
 struct Stream {
     state: ParseState,
+    /// Which of the engine's sets the syntax is in.
+    set: usize,
     stack: ScopeStack,
     /// The parser gave up; the remaining lines of this side stay plain.
     failed: bool,
@@ -828,8 +1237,20 @@ fn class_of_name(name: &str) -> Option<Class> {
 }
 
 impl Stream {
-    fn new(state: ParseState, names_tell: bool) -> Self {
-        Stream { state, stack: ScopeStack::new(), failed: false, names_tell, buffer: String::new() }
+    fn new(state: ParseState, set: usize, names_tell: bool) -> Self {
+        Stream { state, set, stack: ScopeStack::new(), failed: false, names_tell, buffer: String::new() }
+    }
+
+    /// Carries on from where `other` is.
+    fn take_state(&mut self, other: &Stream) {
+        self.state.clone_from(&other.state);
+        self.stack.clone_from(&other.stack);
+        self.failed = other.failed;
+    }
+
+    /// Whether the next line would come out the same on both.
+    fn same_state(&self, other: &Stream) -> bool {
+        self.failed == other.failed && self.stack == other.stack && self.state == other.state
     }
 
     /// Advances the parser over one line, appending the line's coloured runs
@@ -841,7 +1262,7 @@ impl Stream {
         self.buffer.clear();
         self.buffer.push_str(text);
         self.buffer.push('\n');
-        let Ok(ops) = self.state.parse_line(&self.buffer, &engine.set) else {
+        let Ok(ops) = self.state.parse_line(&self.buffer, &engine.sets[self.set]) else {
             self.failed = true;
             return;
         };
@@ -1185,7 +1606,7 @@ mod tests {
         if let Some(mut progress) = engine.syntax_for(file_name).and_then(|syntax| engine.start(syntax)) {
             assert!(engine.colour_hunk(&mut progress, &hunk, hunk.lines.len(), &style, &mut || true));
         }
-        let diff = DiffStyle { hunks: vec![Arc::new(style)] };
+        let diff = DiffStyle { hunks: vec![Arc::new(style)], stream: None };
         let view = diff.hunk(0).unwrap();
         hunk.lines
             .iter()
@@ -1292,14 +1713,201 @@ mod tests {
     #[test]
     fn file_names_extensions_and_aliases_pick_a_syntax() {
         let mut engine = ENGINE.lock().unwrap_or_else(|e| e.into_inner());
-        let mut name = |file: &str| engine.syntax_for(file).map(|i| engine.set.syntaxes()[i].name.clone());
-        assert_eq!(name("main.rs").as_deref(), Some("Rust"));
-        assert_eq!(name("makefile").as_deref(), Some("Makefile"));
-        assert_eq!(name("app.tsx").as_deref(), Some("JavaScript"));
-        assert_eq!(name("cargo.toml").as_deref(), Some("TOML"));
-        assert_eq!(name("cargo.lock").as_deref(), Some("TOML"));
-        assert_eq!(name("style.scss").as_deref(), Some("CSS"));
+        let mut name = |file: &str| engine.syntax_for(file).map(|grammar| engine.name(grammar).to_owned());
+        for (file, syntax) in [
+            ("main.rs", "Rust"),
+            ("makefile", "Makefile"),
+            ("app.ts", "TypeScript"),
+            ("lib.mts", "TypeScript"),
+            ("app.tsx", "TypeScriptReact"),
+            // JSX goes with TSX, which knows its tags.
+            ("app.jsx", "TypeScriptReact"),
+            ("main.kt", "Kotlin"),
+            ("build.gradle.kts", "Kotlin"),
+            ("view.swift", "Swift"),
+            ("main.dart", "Dart"),
+            ("build.ps1", "PowerShell"),
+            ("module.psm1", "PowerShell"),
+            ("cargo.toml", "TOML"),
+            ("cargo.lock", "TOML"),
+            ("style.scss", "SCSS"),
+            ("dockerfile", "Dockerfile"),
+            ("app.vue", "Vue Component"),
+            ("setup.cfg", "INI"),
+            ("app.csproj", "XML"),
+        ] {
+            assert_eq!(name(file).as_deref(), Some(syntax), "{file}");
+        }
         assert_eq!(name("archive.tar.gz"), None);
+    }
+
+    #[test]
+    fn newer_languages_are_coloured() {
+        let ts = colour("app.ts", &[('+', "interface Point { x: number; label?: string }"), ('+', "const p: Point = { x: 1 };")]);
+        assert_eq!(class_of(&ts[0], "interface"), Class::Keyword);
+        assert_eq!(class_of(&ts[0], "number"), Class::Type);
+        assert_eq!(class_of(&ts[1], "1"), Class::Number);
+        let tsx = colour("app.tsx", &[('+', "const view = <div className=\"a\">{n}</div>;")]);
+        assert_eq!(class_of(&tsx[0], "div"), Class::Tag);
+        let kotlin = colour("main.kt", &[('+', "fun main() { val s = \"hi\" }")]);
+        assert_eq!(class_of(&kotlin[0], "fun"), Class::Keyword);
+        assert_eq!(class_of(&kotlin[0], "\"hi\""), Class::String);
+        let swift = colour("view.swift", &[('+', "func greet() -> String { return \"hi\" }")]);
+        assert_eq!(class_of(&swift[0], "func"), Class::Keyword);
+        let dart = colour("main.dart", &[('+', "void main() { var n = 42; } // done")]);
+        assert_eq!(class_of(&dart[0], "42"), Class::Number);
+        assert_eq!(class_of(&dart[0], "// done"), Class::Comment);
+    }
+
+    #[test]
+    fn powershell_is_coloured() {
+        let lines = colour(
+            "build.ps1",
+            &[
+                ('+', "<# Builds it"),
+                ('+', "   all #>"),
+                ('+', "function Invoke-Build([string]$Path) {"),
+                ('+', "    if ($Path -eq $null) { Write-Host \"no $Path here\" -ForegroundColor Red } # check"),
+                ('+', "    $n = 0x1F; @'"),
+                ('+', "raw $text"),
+                ('+', "'@"),
+                ('+', "}"),
+            ],
+        );
+        assert_eq!(class_of(&lines[0], "<# Builds it"), Class::Comment);
+        assert_eq!(class_of(&lines[1], "all #>"), Class::Comment);
+        assert_eq!(class_of(&lines[2], "function"), Class::Keyword);
+        assert_eq!(class_of(&lines[2], "Invoke-Build"), Class::Function);
+        assert_eq!(class_of(&lines[2], "string"), Class::Type);
+        assert_eq!(class_of(&lines[3], "if"), Class::Keyword);
+        assert_eq!(class_of(&lines[3], "-eq"), Class::Keyword);
+        assert_eq!(class_of(&lines[3], "$null"), Class::Number);
+        assert_eq!(class_of(&lines[3], "Write-Host"), Class::Function);
+        // A variable outside a string is plain; inside one, it stands out.
+        assert_eq!(class_of(&lines[3], "$Path"), Class::Plain);
+        assert!(lines[3].iter().any(|(piece, class)| piece == "$Path" && *class == Class::Escape), "{:?}", lines[3]);
+        assert_eq!(class_of(&lines[3], "-ForegroundColor"), Class::Property);
+        assert_eq!(class_of(&lines[3], "# check"), Class::Comment);
+        assert_eq!(class_of(&lines[4], "0x1F"), Class::Number);
+        assert_eq!(class_of(&lines[5], "raw $text"), Class::String);
+    }
+
+    /// A line of a file, as the whole-file diff shows it.
+    fn numbered(origin: char, old: Option<u32>, new: Option<u32>, text: &str) -> DiffLine {
+        DiffLine { origin, old_no: old, new_no: new, text: text.to_owned() }
+    }
+
+    /// The classes of a stream's line `line` once the worker has done it.
+    fn stream_classes(style: &DiffStyle, hunk: usize, line: usize, text: &str) -> Vec<(String, Class)> {
+        wait_for("the stream", || !style.hunk(hunk).unwrap().spans(line).is_empty());
+        let view = style.hunk(hunk).unwrap();
+        let mut start = 0;
+        view.spans(line)
+            .iter()
+            .map(|span| {
+                let piece = text[start..span.end as usize].to_owned();
+                start = span.end as usize;
+                (piece, span.class)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_hunk_inside_a_block_comment_is_coloured_as_comment() {
+        let ctx = egui::Context::default();
+        // The whole file shown: a gap opens a comment, the hunk after it is
+        // still inside.
+        let gap = Hunk {
+            lines: vec![
+                numbered(' ', Some(1), Some(1), "fn stream_test_whole() {}"),
+                numbered(' ', Some(2), Some(2), "/* a comment"),
+                numbered(' ', Some(3), Some(3), "   that goes on"),
+            ],
+            gap: true,
+            ..Hunk::default()
+        };
+        let hunk = Hunk {
+            lines: vec![
+                numbered('-', Some(4), None, "   let old = 1;"),
+                numbered('+', None, Some(4), "   let new = 2;"),
+                numbered(' ', Some(5), Some(5), "*/ let after = 3;"),
+            ],
+            ..Hunk::default()
+        };
+        let whole = Arc::new(FileDiff { hunks: vec![gap, hunk.clone()], ..Default::default() });
+        let style = style_for(&ctx, &whole, "src/stream_test_whole.rs", true);
+        assert!(style.stream.as_ref().is_some_and(|link| link.map.is_none()));
+        for (line, text) in [(0, "   let old = 1;"), (1, "   let new = 2;")] {
+            let classes = stream_classes(&style, 1, line, text);
+            assert!(classes.iter().all(|(_, class)| *class == Class::Comment), "{text}: {classes:?}");
+        }
+        let after = stream_classes(&style, 1, 2, "*/ let after = 3;");
+        assert_eq!(class_of(&after, "let"), Class::Keyword);
+
+        // The hunks only, with the whole file beside them: the same colours.
+        let mut all = whole.hunks[0].clone();
+        all.lines.extend(hunk.lines.iter().cloned());
+        let hunks = Arc::new(FileDiff { hunks: vec![hunk], whole: Some(Arc::new(all)), ..Default::default() });
+        let style = style_for(&ctx, &hunks, "src/stream_test_hunks.rs", true);
+        assert!(style.stream.as_ref().is_some_and(|link| link.map.is_some()));
+        wait_for("the stream", || style.stream.as_ref().unwrap().style.syntax.read().unwrap().ends.len() == 6);
+        let new = stream_classes(&style, 0, 1, "   let new = 2;");
+        assert!(new.iter().all(|(_, class)| *class == Class::Comment), "{new:?}");
+    }
+
+    #[test]
+    fn shown_lines_are_found_in_the_stream_by_number() {
+        let stream = [
+            numbered(' ', Some(1), Some(1), "a"),
+            numbered('-', Some(2), None, "b"),
+            numbered('+', None, Some(2), "B"),
+            numbered(' ', Some(3), Some(3), "c"),
+            numbered('+', None, Some(4), "d"),
+        ];
+        let refs: Vec<&DiffLine> = stream.iter().collect();
+        assert!(in_file_order(&refs));
+        assert!(!in_file_order(&refs[1..]), "a stream starts at the first line");
+        let hunk = Hunk { lines: vec![stream[1].clone(), stream[2].clone(), stream[3].clone()], ..Hunk::default() };
+        let diff = FileDiff { hunks: vec![hunk.clone()], ..Default::default() };
+        assert_eq!(map_shown(&diff, &refs), Some(vec![1, 2, 3]));
+        // A shown line the stream has otherwise: no stream at all.
+        let mut odd = hunk;
+        odd.lines[1].text = "other".to_owned();
+        assert_eq!(map_shown(&FileDiff { hunks: vec![odd], ..Default::default() }, &refs), None);
+
+        // An earlier version: "B" was not there, the rest one line up.
+        let earlier = [
+            numbered(' ', Some(1), Some(1), "a"),
+            numbered('-', Some(2), None, "b"),
+            numbered(' ', Some(3), Some(2), "c"),
+            numbered('+', None, Some(3), "d"),
+        ];
+        let earlier: Vec<&DiffLine> = earlier.iter().collect();
+        // "a" and "b" match by number and text, "c" by its old number, "d"
+        // has moved and "B" is new.
+        assert_eq!(seed_map(&refs, &earlier), [0, 1, NONE, 2, NONE]);
+    }
+
+    #[test]
+    fn joined_sides_colour_like_separate_ones() {
+        // Removed lines open a comment that the added ones do not: the
+        // context after them belongs to the new side, which is not in one.
+        let lines = colour(
+            "lib.rs",
+            &[
+                (' ', "fn a() {}"),
+                ('-', "/* opened"),
+                ('+', "let x = 1;"),
+                (' ', "let y = 2;"),
+                ('-', "still in the old comment */"),
+                (' ', "let z = 3;"),
+                ('+', "let w = 4;"),
+            ],
+        );
+        assert_eq!(class_of(&lines[3], "let"), Class::Keyword);
+        assert_eq!(class_of(&lines[4], "still in the old comment */"), Class::Comment);
+        assert_eq!(class_of(&lines[5], "let"), Class::Keyword);
+        assert_eq!(class_of(&lines[6], "let"), Class::Keyword);
     }
 
     #[test]

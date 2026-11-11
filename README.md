@@ -150,7 +150,12 @@ be installed.
 **Working tree**
 - Unstaged / staged lists as paths or a folder tree
 - Stage, unstage and discard files, folders, hunks or individual lines
-- Syntax-highlighted diffs with word-level emphasis of what changed
+- Syntax-highlighted diffs with word-level emphasis of what changed, in
+  some two hundred languages (bat's grammars: TypeScript and TSX, Kotlin,
+  Swift, Dart, PowerShell, Dockerfile, Vue, Svelte, TOML, Zig, Terraform
+  and the like). Colours follow the whole file, in the inline and side by
+  side layouts and the whole-file view alike: a hunk that starts inside a
+  block comment or a multi-line string is coloured as one
 - Diffs inline or side by side (the old version on the left, the new one on
   the right, unchanged lines level), as the changed hunks or the whole file,
   and with or without whitespace changes (`git diff -w`): switches in the
@@ -163,7 +168,10 @@ be installed.
   first), with or without line numbers, syntax colours and word wrap
 - Image previews for PNG, JPEG, GIF, BMP, WebP and ICO: before and after
   side by side, a swipe between them, or an onion skin, with sizes and
-  dimensions; tiny icons are enlarged with sharp pixels
+  dimensions; tiny icons are enlarged with sharp pixels. SVG changes are
+  drawn the same way, with **Show Text** to see (and stage parts of) their
+  text diff and **Show Picture** back, also in the command palette; an SVG
+  that does not parse is shown as text
 - Select and copy text in diffs, blame and the conflict resolver as in an
   editor: drag, double-click a word, triple-click a line, Shift+click to
   extend. Copies leave out line numbers and +/- markers and keep tabs as
@@ -241,6 +249,11 @@ be installed.
   and UTF-16 files with a byte order mark are shown, diffed and resolved as
   text; a resolved file is written back in its own encoding, with the line
   endings set in Preferences > Editor
+- UTF-16 files, LE or BE, with a byte order mark or without one (when the
+  repository is set to UTF-16, or the file plainly is), are diffed and
+  blamed as text, and their hunks and lines staged, unstaged and discarded
+  like any other file's: GitKrill writes the result in the file's own
+  encoding, byte order mark and line endings kept
 
 **History**
 - Checkout (branch, remote branch, commit, tag), create / rename / delete branch
@@ -581,7 +594,8 @@ src/
     lfs_lock.rs  Git LFS file locks
     blame.rs     file history and blame
     versions.rs  a commit's file tree, files as they were in a commit
-    picture.rs   decoding images for the image preview
+    utf16.rs     staging parts of UTF-16 files, blaming them
+    picture.rs   decoding images (and drawing SVGs) for the image preview
     prompt/      git's, ssh's and gpg's questions answered in the app: the
                  askpass helper, the gpg wrapper, the loopback bridge
     cli.rs       running git
@@ -640,16 +654,15 @@ build.rs         the Windows executable's icon and version details
   a merge brought in are replayed as they are, not edited one by one, a
   merge cannot be squashed into another commit, and a base on a merged-in
   branch is refused (with the nearest base that works offered instead)
-- UTF-16 files cannot be blamed, and their diffs are for reading only (no
-  staging of hunks or lines)
-- Syntax colours start afresh at every hunk, which shows most in the
-  whole-file view: a block comment or string that runs across the start of
-  a hunk is coloured as if it did not
-- Syntax grammars are syntect's bundled set: TypeScript is coloured as
-  JavaScript, and Kotlin, Swift, Dart and PowerShell stay plain
+- Hunks and lines of a file whose two versions are in different encodings
+  (UTF-16 in one, UTF-8 in the other) can only be staged as a whole file;
+  UTF-16 without a byte order mark and with no Latin text in it is only
+  read as such when the repository is set to UTF-16
+- In files over 1 MB or 20,000 lines, syntax colours start afresh at every
+  hunk: a block comment or string that runs across the start of a hunk is
+  coloured as if it did not
 - X.509 (gpgsm) signing keys with a passphrase still need gpg-agent's own
   pinentry: GitKrill asks only for OpenPGP and SSH keys
-- SVG changes show as text
 - Autosquash only folds fixups whose commit comes after the last merge
   commit on the branch
 - On macOS, system notifications are shown through `osascript`, so

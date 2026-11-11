@@ -27,6 +27,7 @@
 //! Its output also names, for every commit, the parent and path to blame to
 //! look past it, which is what "Blame before this commit" follows.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap, HashMap, HashSet};
 use std::io::Read;
@@ -426,9 +427,12 @@ pub fn blame(
         .and_then(|entry| repo.find_blob(entry.id()).ok());
 
     let mut rev = at;
+    let format = text::format_for(workdir);
+    // A UTF-16 file is blamed as bytes and read back as text.
+    let utf16;
     if at.is_some() {
         let blob = committed.as_ref().ok_or(BlameError::Missing)?;
-        check_text(blob.content(), blob.size() as u64)?;
+        utf16 = check_text(blob.content(), blob.size() as u64, format.encoding)?;
     } else {
         let staged = repo.index().ok().is_some_and(|index| index.get_path(Path::new(path), 0).is_some());
         match std::fs::File::open(workdir.join(path)) {
@@ -439,13 +443,13 @@ pub fn blame(
                 let size = file.metadata().map(|meta| meta.len()).unwrap_or(0);
                 let mut head = vec![0u8; BINARY_SNIFF_BYTES.min(size as usize)];
                 let read = file.read(&mut head).unwrap_or(0);
-                check_text(&head[..read], size)?;
+                utf16 = check_text(&head[..read], size, format.encoding)?;
             }
             // Deleted from the working tree: the committed version is all
             // there is to show.
             Err(_) => {
                 let blob = committed.as_ref().ok_or(BlameError::Missing)?;
-                check_text(blob.content(), blob.size() as u64)?;
+                utf16 = check_text(blob.content(), blob.size() as u64, format.encoding)?;
                 rev = Some(commit.id());
             }
         }
@@ -510,19 +514,38 @@ pub fn blame(
         }
     }
 
-    let mut blame = parse_porcelain(&out, &text::format_for(workdir)).map_err(BlameError::Git)?;
+    let mut blame = match utf16 {
+        Some(found) => porcelain_rows(&out).map(|(commits, rows)| {
+            // Commits with the same time: the one that has the other in its
+            // history came later.
+            let newer = |a: usize, b: usize| {
+                let (a, b) = (&commits[a], &commits[b]);
+                super::utf16::newer_by_time(a, b)
+                    .unwrap_or_else(|| repo.graph_descendant_of(b.oid, a.oid).unwrap_or(false))
+            };
+            let lines = super::utf16::blame_lines(&rows, newer, found);
+            assemble(commits, lines, &format)
+        }),
+        None => parse_porcelain(&out, &format),
+    }
+    .map_err(BlameError::Git)?;
     blame.rev = rev;
     Ok(blame)
 }
 
-fn check_text(start: &[u8], size: u64) -> Result<(), BlameError> {
+/// Whether a file of `size` bytes that starts with `start` can be blamed,
+/// and if it is UTF-16, how to read it (`text::utf16_encoding`; `default` is
+/// the repository's encoding).
+fn check_text(start: &[u8], size: u64, default: text::Encoding) -> Result<Option<text::FileEncoding>, BlameError> {
     if size > MAX_BLAME_BYTES {
         return Err(BlameError::TooLarge);
     }
-    if start.iter().take(BINARY_SNIFF_BYTES).any(|byte| *byte == 0) {
-        return Err(BlameError::Binary);
+    let start = &start[..start.len().min(BINARY_SNIFF_BYTES)];
+    let marked = text::sniff_bom(start).is_some_and(|(encoding, _)| encoding.is_utf16());
+    if marked || start.contains(&0) {
+        return text::utf16_encoding(start, default).map(Some).ok_or(BlameError::Binary);
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Parses the output of `git blame --porcelain`.
@@ -531,8 +554,18 @@ fn check_text(start: &[u8], size: u64) -> Result<(), BlameError> {
 /// [<count>]`, then (the first time a commit appears) `key value` lines
 /// describing the commit, then the line itself behind a tab.
 fn parse_porcelain(out: &[u8], format: &Format) -> Result<Blame, String> {
+    let (commits, rows) = porcelain_rows(out)?;
+    let lines = rows.into_iter().map(|(commit, content)| (commit, source_text_in(content, format.encoding)));
+    Ok(assemble(commits, lines, format))
+}
+
+/// The commits of `git blame --porcelain` output, and the commit (an index
+/// into them) and bytes of every line, in order.
+#[allow(clippy::type_complexity)]
+fn porcelain_rows(out: &[u8]) -> Result<(Vec<BlameCommit>, Vec<(usize, &[u8])>), String> {
     let bad = || "Could not understand the output of git blame".to_owned();
-    let mut blame = Blame { format: *format, ..Blame::default() };
+    let mut commits: Vec<BlameCommit> = Vec::new();
+    let mut lines = Vec::new();
     let mut index: HashMap<Oid, usize> = HashMap::new();
 
     let mut rows = out.split(|byte| *byte == b'\n');
@@ -548,7 +581,7 @@ fn parse_porcelain(out: &[u8], format: &Format) -> Result<Blame, String> {
             .and_then(|hex| Oid::from_str(hex).ok())
             .ok_or_else(bad)?;
         let commit = *index.entry(oid).or_insert_with(|| {
-            blame.commits.push(BlameCommit {
+            commits.push(BlameCommit {
                 oid,
                 summary: String::new(),
                 author: String::new(),
@@ -557,7 +590,7 @@ fn parse_porcelain(out: &[u8], format: &Format) -> Result<Blame, String> {
                 path: String::new(),
                 previous: None,
             });
-            blame.commits.len() - 1
+            commits.len() - 1
         });
 
         let content = loop {
@@ -567,7 +600,7 @@ fn parse_porcelain(out: &[u8], format: &Format) -> Result<Blame, String> {
             }
             let split = row.iter().position(|byte| *byte == b' ').unwrap_or(row.len());
             let (key, value) = (&row[..split], row.get(split + 1..).unwrap_or_default());
-            let info = &mut blame.commits[commit];
+            let info = &mut commits[commit];
             match key {
                 b"author" => info.author = lossy(value),
                 b"author-mail" => {
@@ -592,12 +625,21 @@ fn parse_porcelain(out: &[u8], format: &Format) -> Result<Blame, String> {
             }
         };
 
+        lines.push((commit, content));
+    }
+    Ok((commits, lines))
+}
+
+/// A blame of `lines`, the file's own text of each line and the commit it
+/// comes from (an index into `commits`), prepared for display in `format`.
+fn assemble<'a>(commits: Vec<BlameCommit>, lines: impl IntoIterator<Item = (usize, Cow<'a, str>)>, format: &Format) -> Blame {
+    let mut blame = Blame { commits, format: *format, ..Blame::default() };
+    for (commit, source) in lines {
         let line = blame.lines.len();
         match blame.blocks.last_mut() {
             Some(block) if block.commit == commit => block.len += 1,
             _ => blame.blocks.push(BlameBlock { start: line, len: 1, commit }),
         }
-        let source = source_text_in(content, format.encoding);
         let text = shown_with(&source, format.tab_width);
         if text != source {
             blame.originals.insert(line, source.into_owned());
@@ -605,7 +647,7 @@ fn parse_porcelain(out: &[u8], format: &Format) -> Result<Blame, String> {
         blame.max_chars = blame.max_chars.max(text.chars().count());
         blame.lines.push(text);
     }
-    Ok(blame)
+    blame
 }
 
 /// Undoes git's C-style quoting of unusual file names (`"a\tb\303\251"`).

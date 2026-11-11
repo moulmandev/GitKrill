@@ -38,6 +38,7 @@ pub mod submodule;
 pub mod tags;
 pub mod text;
 pub mod trailers;
+pub mod utf16;
 pub mod versions;
 pub mod worktree;
 
@@ -381,6 +382,16 @@ pub struct FileDiff {
     /// The path is a submodule: the commits it moved between, instead of
     /// lines (`git::submodule::Change`).
     pub submodule: Option<submodule::Change>,
+    /// Both versions of a file diffed as decoded text (UTF-16), for applying
+    /// its hunks and lines: see `FileDiff::apply_part`. `None` for every
+    /// other diff, and for one whose parts cannot be written back exactly.
+    pub transcoded: Option<Arc<utf16::Sides>>,
+    /// Every line of both versions of the file as one hunk (context, removed
+    /// and added lines in file order), for syntax colours that follow the
+    /// whole file. Only in a diff of the hunks, of a file small enough
+    /// (`diff::WHOLE_FOR_COLOURS_BYTES`); a whole-file diff has them all
+    /// already.
+    pub whole: Option<Arc<Hunk>>,
 }
 
 impl FileDiff {

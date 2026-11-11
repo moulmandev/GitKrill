@@ -281,8 +281,64 @@ pub fn detect(bytes: &[u8], default: Encoding) -> FileEncoding {
 /// A whole file as text, read as [`detect`] says, without its byte order mark.
 pub fn decode_file(bytes: &[u8], default: Encoding) -> (String, FileEncoding) {
     let found = detect(bytes, default);
-    let body = if found.bom { &bytes[sniff_bom(bytes).map_or(0, |(_, len)| len)..] } else { bytes };
-    (found.encoding.decode(body).into_owned(), found)
+    (decode_as(bytes, found), found)
+}
+
+/// A whole file as text, read the way `found` says, without its byte order
+/// mark.
+pub fn decode_as(bytes: &[u8], found: FileEncoding) -> String {
+    let body = if found.bom { bytes.strip_prefix(found.encoding.bom()).unwrap_or(bytes) } else { bytes };
+    found.encoding.decode(body).into_owned()
+}
+
+/// How much of a file [`looks_like_utf16`] looks at.
+const UTF16_SNIFF_BYTES: usize = 4096;
+
+/// Whether a file is to be read as UTF-16, and how: it starts with a UTF-16
+/// byte order mark, or the repository is set to UTF-16 (`default`), or it
+/// plainly is UTF-16 without saying so ([`looks_like_utf16`]). Git takes
+/// such files for binary (they are full of zero bytes); the diff and blame
+/// views read them as text.
+pub fn utf16_encoding(bytes: &[u8], default: Encoding) -> Option<FileEncoding> {
+    match sniff_bom(bytes) {
+        Some((encoding, _)) => return encoding.is_utf16().then_some(FileEncoding { encoding, bom: true }),
+        None if default.is_utf16() => return Some(FileEncoding { encoding: default, bom: false }),
+        None => {}
+    }
+    looks_like_utf16(bytes).map(|encoding| FileEncoding { encoding, bom: false })
+}
+
+/// UTF-16 without a byte order mark, told from other data by its zero
+/// bytes: text in a Latin script has one in every other place (the high
+/// byte of each character), in the same place throughout. In the first
+/// 4 KiB, at least three code units in ten must be such a character, none
+/// may be zero, and the whole must read as text: no stray surrogates, no
+/// control characters but tabs, line ends and form feeds. Binary files fail
+/// that within a few bytes.
+pub fn looks_like_utf16(bytes: &[u8]) -> Option<Encoding> {
+    if bytes.len() < 2 || !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let sample = &bytes[..bytes.len().min(UTF16_SNIFF_BYTES)];
+    let pairs = sample.as_chunks::<2>().0;
+    let latin = |high: usize| pairs.iter().filter(|pair| pair[high] == 0 && pair[1 - high] != 0).count();
+    let (le, be) = (latin(1), latin(0));
+    let units = sample.len() / 2;
+    if le.max(be) * 10 < units * 3 {
+        return None;
+    }
+    let (encoding, unit): (Encoding, fn([u8; 2]) -> u16) =
+        if le >= be { (Encoding::Utf16Le, u16::from_le_bytes) } else { (Encoding::Utf16Be, u16::from_be_bytes) };
+    let mut units: Vec<u16> = pairs.iter().map(|pair| unit(*pair)).collect();
+    // A sample cut between the two halves of a surrogate pair.
+    if sample.len() < bytes.len() && units.last().is_some_and(|u| (0xD800..0xDC00).contains(u)) {
+        units.pop();
+    }
+    let text_like = char::decode_utf16(units).all(|c| match c {
+        Ok(c) => c != '\0' && (!c.is_control() || matches!(c, '\t' | '\n' | '\r' | '\x0c')),
+        Err(_) => false,
+    });
+    text_like.then_some(encoding)
 }
 
 // ---- line endings -------------------------------------------------------------
@@ -774,6 +830,32 @@ mod tests {
         assert_eq!(FileEncoding { encoding: Encoding::Utf8, bom: false }.encode("x"), b"x");
         // A UTF-8 mark at the start of a line read on its own is not shown.
         assert_eq!(source_text(b"\xEF\xBB\xBFfirst\n"), "first");
+    }
+
+    #[test]
+    fn utf16_without_a_byte_order_mark_is_told_from_other_data() {
+        let le = Encoding::Utf16Le.encode("name=Ünïcode value\r\nnext 中文 line\r\n").into_owned();
+        let be = Encoding::Utf16Be.encode("[Section]\nkey=1\n").into_owned();
+        assert_eq!(looks_like_utf16(&le), Some(Encoding::Utf16Le));
+        assert_eq!(looks_like_utf16(&be), Some(Encoding::Utf16Be));
+        assert_eq!(utf16_encoding(&le, Encoding::Utf8), Some(FileEncoding { encoding: Encoding::Utf16Le, bom: false }));
+        // Marked: the mark says which. Set to UTF-16: the setting does.
+        let marked = FileEncoding { encoding: Encoding::Utf16Be, bom: true }.encode("x");
+        assert_eq!(utf16_encoding(&marked, Encoding::Utf8), Some(FileEncoding { encoding: Encoding::Utf16Be, bom: true }));
+        assert_eq!(utf16_encoding(b"\xEF\xBB\xBFtext", Encoding::Utf16Le), None);
+        assert_eq!(utf16_encoding(b"ab", Encoding::Utf16Be), Some(FileEncoding { encoding: Encoding::Utf16Be, bom: false }));
+        // Not UTF-16: plain text, odd lengths, binary data, NUL characters,
+        // control characters, a lone surrogate.
+        assert_eq!(looks_like_utf16(b"plain ascii text\n"), None);
+        assert_eq!(looks_like_utf16(&le[..le.len() - 1]), None);
+        assert_eq!(looks_like_utf16(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01"), None);
+        assert_eq!(looks_like_utf16(b"a\0\0\0b\0"), None);
+        assert_eq!(looks_like_utf16(b"a\0\x01\0b\0"), None);
+        assert_eq!(looks_like_utf16(b"a\0\x00\xD8b\0"), None);
+        // A long file is judged by its start, even when that start ends half
+        // way through a surrogate pair.
+        let long = Encoding::Utf16Le.encode(&format!("{}𝄞 and more", "x".repeat(UTF16_SNIFF_BYTES / 2 - 1))).into_owned();
+        assert_eq!(looks_like_utf16(&long), Some(Encoding::Utf16Le));
     }
 
     #[test]
