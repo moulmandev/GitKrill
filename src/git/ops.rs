@@ -47,6 +47,11 @@ pub enum UndoKind {
     /// where each of these refs pointed before and after, and undo puts
     /// every one of them back, HEAD included.
     Refs(Vec<RefMove>),
+    /// The inverse is known when the command is built (removing a remote
+    /// adds it back, see `git::remotes`) and does not depend on HEAD: undo
+    /// runs this command, labelled `Undo <label>`; redo runs the command's
+    /// own steps again.
+    Inverse(Box<GitCmd>),
 }
 
 /// One ref of [`UndoKind::Refs`].
@@ -643,6 +648,14 @@ pub fn build_undo(
                 plain(format!("Undo {label}"), &["branch", name, &at]),
                 plain(format!("Redo {label}"), &["branch", "-D", name]),
             )
+        }
+
+        UndoKind::Inverse(inverse) => {
+            let mut undo = (**inverse).clone();
+            undo.label = format!("Undo {label}");
+            let mut redo = GitCmd::empty(format!("Redo {label}"));
+            redo.steps = cmd.steps.clone();
+            detached(undo, redo)
         }
 
         UndoKind::Refs(moves) => {

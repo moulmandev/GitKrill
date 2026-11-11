@@ -25,7 +25,7 @@ pub fn show(ctx: &egui::Context, shared: &mut Shared, mut tab: Option<&mut RepoT
     let fresh = std::mem::take(&mut shared.dialog_fresh);
     let width = match dialog {
         Dialog::NewPull(_) => 520.0,
-        Dialog::Update(_) | Dialog::GitSetup | Dialog::DeleteFolder(_) => 460.0,
+        Dialog::Update(_) | Dialog::GitSetup | Dialog::DeleteFolder(_) | Dialog::Remote(_) => 460.0,
         _ => 400.0,
     };
 
@@ -70,7 +70,9 @@ fn field(ui: &mut Ui, value: &mut String, hint: &str, focus: bool) -> egui::Resp
 pub(crate) fn buttons(ui: &mut Ui, confirm: &str, enabled: bool, danger: bool) -> Option<bool> {
     let mut result = None;
     ui.add_space(6.0);
-    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+    // One row high: a right-to-left layout otherwise takes all the height
+    // left, which the modal remembers from the dialog shown before.
+    ui.allocate_ui_with_layout(vec2(ui.available_width(), 28.0), Layout::right_to_left(Align::Center), |ui| {
         let fill = if danger { theme::solid(theme::red(), 0.7) } else { theme::solid(theme::accent(), 0.8) };
         let primary = Button::new(RichText::new(confirm).color(theme::on_accent()))
             .fill(if enabled { fill } else { theme::bg_raised() })
@@ -293,6 +295,10 @@ fn body(
         Dialog::DeleteFolder(form) => match crate::ui::branch_folder::dialog(ui, form, tab) {
             crate::ui::branch_folder::Next::Keep => Outcome::Keep,
             crate::ui::branch_folder::Next::Close => Outcome::Close,
+        },
+        Dialog::Remote(form) => match crate::ui::remotes::dialog(ui, form, tab, fresh) {
+            crate::ui::remotes::Next::Keep => Outcome::Keep,
+            crate::ui::remotes::Next::Close => Outcome::Close,
         },
 
         Dialog::Update(release) => {

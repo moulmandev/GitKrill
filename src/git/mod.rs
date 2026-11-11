@@ -17,6 +17,7 @@ pub mod lfs;
 pub mod ops;
 pub mod picture;
 pub mod rebase;
+pub mod remotes;
 pub mod repo;
 pub mod text;
 

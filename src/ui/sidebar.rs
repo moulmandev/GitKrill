@@ -65,7 +65,11 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
         let remote_shown = snap.remote_branches.iter().filter(|b| matches(&b.full)).count();
         let (open, header) = section_header(ui, tab, "REMOTE", icons::CLOUD, remote_shown, remote_total);
         show_all_menu(&header, tab, shared, REMOTES, "Show all remote branches in graph");
+        crate::ui::remotes::header_button(ui, tab, shared, &header, (remote_shown, remote_total));
         if open {
+            if snap.remotes.is_empty() {
+                crate::ui::remotes::add_row(ui, tab, shared);
+            }
             for remote in &snap.remotes {
                 let key = format!("remote:{}", remote.name);
                 let collapsed = tab.collapsed.contains(&key);
@@ -88,20 +92,13 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
                 landing(ui, tab, &snap, session, &response, || Target::Remote(remote.name.clone()));
                 let response = response.on_hover_text(&remote.url);
                 response.context_menu(|ui| {
-                    if menu_item(ui, icons::ARROWS_CLOCKWISE, &format!("Fetch {}", remote.name)) {
-                        tab.run(ops::GitCmd::new(
-                            format!("Fetch {}", remote.name),
-                            &ops::fetch(&[remote.name.as_str()]),
-                        ));
-                    }
-                    if menu_item(ui, icons::COPY, "Copy URL") {
-                        ui.ctx().copy_text(remote.url.clone());
-                    }
+                    crate::ui::remotes::menu(ui, tab, shared, remote);
                     crate::ui::hosting::remote_menu(ui, shared, remote);
                     ui.separator();
                     if hide_item(ui, is_hidden, &format!("{} in graph", remote.name)) {
                         tab.set_hidden(&mut shared.settings, &path, !is_hidden);
                     }
+                    crate::ui::remotes::remove_item(ui, tab, shared, remote);
                 });
                 if collapsed && filter.is_empty() {
                     continue;

@@ -18,6 +18,7 @@ pub mod new_pull;
 pub mod panel;
 pub mod prefs;
 pub mod rebase;
+pub mod remotes;
 pub mod sidebar;
 pub mod textsel;
 pub mod toolbar;

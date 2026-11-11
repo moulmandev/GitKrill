@@ -3722,6 +3722,32 @@ mod tests {
     }
 
     #[test]
+    fn a_renamed_remote_keeps_its_session_and_a_removed_one_ends_it() {
+        let stub = Stub::default();
+        let mut state = HostingState::default();
+        {
+            let stub = stub.clone();
+            state.sync_with(&hosted(), &NO_SERVERS, true, true, move |_| Box::new(stub), || {});
+        }
+        let before = settle(&mut state, &hosted());
+
+        // Renamed (`git remote rename origin upstream`): the same repository,
+        // so the lists stay and nothing is asked again; the name follows.
+        let renamed = [remote("upstream", "git@github.com:octo/app.git")];
+        let shown = settle(&mut state, &renamed);
+        assert_eq!(shown.remote, "upstream");
+        assert!(shown.view.pulls.loaded);
+        assert_eq!(shown.view.pulls.items.len(), before.view.pulls.items.len());
+        assert_eq!(stub.rounds.load(Ordering::SeqCst), 1);
+        assert_eq!(state.connected().map(|shown| shown.remote).as_deref(), Some("upstream"));
+
+        // Removed: no lists, no session.
+        let never = |_: &RepoId| -> Box<dyn Backend> { panic!("must not connect") };
+        assert!(state.sync_with(&[], &NO_SERVERS, true, true, never, || {}).is_none());
+        assert!(state.session.is_none() && state.connected().is_none());
+    }
+
+    #[test]
     fn a_dead_worker_is_reported_instead_of_spinning_forever() {
         struct Broken;
         impl Backend for Broken {

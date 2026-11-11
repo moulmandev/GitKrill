@@ -167,10 +167,17 @@ be installed.
   fast-forward, tags releases and hotfixes, and can be undone; one that stops
   on a conflict carries on from there when run again
 - Undo / redo for commits, checkouts, merges, resets, rebases, branch create
-  and delete
+  and delete, and adding, editing and removing remotes
 
 **Remotes**
 - Fetch, pull (default / ff-only / rebase), push, force push with lease
+- Add a remote with the + on the sidebar's REMOTE header (or the command
+  palette): a name (`origin` for the first), a fetch URL, an optional push
+  URL, and a first fetch. Right-click a remote to fetch or prune it alone,
+  rename it or change its URLs (its remote-tracking branches and the
+  branches tracking it follow a rename), or remove it. Removing can be
+  undone: the remote comes back with its settings and the upstreams of its
+  branches, and its remote-tracking branches with the next fetch
 - Automatic fetch, every five minutes unless you pick another interval
   (0 to 60, **File > Preferences > General**), pruning remote branches
   deleted on the remote unless Auto-Prune is off

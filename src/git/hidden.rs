@@ -79,6 +79,17 @@ impl Hidden {
         self.0.iter().any(|(path, hidden)| *hidden && path.starts_with(prefix))
     }
 
+    /// The rules on `prefix` and on everything under it, each folder before
+    /// what is in it: applied in this order with [`Hidden::set`], they come
+    /// out the same.
+    pub fn rules_under(&self, prefix: &str) -> Vec<(String, bool)> {
+        self.0
+            .range(prefix.to_owned()..)
+            .take_while(|(path, _)| path.starts_with(prefix))
+            .map(|(path, hidden)| (path.clone(), *hidden))
+            .collect()
+    }
+
     fn rule(&self, path: &str) -> Option<bool> {
         match self.0.get(path) {
             Some(hidden) => Some(*hidden),
@@ -116,6 +127,22 @@ mod tests {
         assert!(!hidden.hides_local("t30/x"));
         assert!(!hidden.hides_local("main"));
         assert!(!hidden.hides_remote("origin/t3/one"), "remote branches are separate");
+    }
+
+    #[test]
+    fn the_rules_under_a_folder_carry_over_to_another() {
+        let mut hidden = Hidden::default();
+        hidden.set(&folder(REMOTES, "origin"), true);
+        hidden.set(&remote("origin/keep"), false);
+        hidden.set(&remote("originals/main"), true);
+        let from = folder(REMOTES, "origin");
+        let rules = hidden.rules_under(&from);
+        assert_eq!(rules, [(from.clone(), true), (remote("origin/keep"), false)]);
+        for (path, hide) in rules {
+            hidden.set(&format!("refs/remotes/upstream/{}", &path[from.len()..]), hide);
+        }
+        assert!(hidden.hides_remote("upstream/main") && !hidden.hides_remote("upstream/keep"));
+        assert!(hidden.hides_remote("origin/main"), "the old name keeps its rules");
     }
 
     #[test]

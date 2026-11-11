@@ -95,6 +95,8 @@ pub enum Dialog {
     GitflowFinish(Box<crate::ui::gitflow::FinishForm>),
     /// Delete every local branch in a folder; see `ui::branch_folder`.
     DeleteFolder(Box<crate::ui::branch_folder::DeleteForm>),
+    /// Add, edit or remove a remote; see `ui::remotes`.
+    Remote(Box<crate::ui::remotes::Form>),
     /// Git is missing: the offer to get it; see `ui::git_setup`.
     GitSetup,
 }
