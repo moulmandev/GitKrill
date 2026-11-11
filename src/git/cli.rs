@@ -117,6 +117,16 @@ fn installed_locations() -> Vec<PathBuf> {
     ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"].into_iter().map(PathBuf::from).collect()
 }
 
+/// The last answer [`version`] got, kept so that UI code can ask what the
+/// installed git supports without running it.
+static KNOWN_VERSION: RwLock<Option<String>> = RwLock::new(None);
+
+/// What [`version`] last answered ("git version 2.51.2.windows.1"); `None`
+/// before git was found.
+pub fn known_version() -> Option<String> {
+    KNOWN_VERSION.read().ok().and_then(|known| known.clone())
+}
+
 /// `git --version`'s answer ("git version 2.51.2.windows.1"), or why there
 /// is none.
 pub fn version() -> Result<String, String> {
@@ -129,6 +139,9 @@ pub fn version() -> Result<String, String> {
     })?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
     if out.status.success() && text.starts_with("git version") {
+        if let Ok(mut known) = KNOWN_VERSION.write() {
+            *known = Some(text.clone());
+        }
         Ok(text)
     } else {
         // A Mac without the developer tools answers with an error (and

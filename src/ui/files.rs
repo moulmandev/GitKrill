@@ -133,11 +133,13 @@ pub fn file_list(
                                 if menu_item(ui, icons::PLUS, "Stage folder") {
                                     run = Some(ops::stage(&inside()));
                                 }
+                                folder_extras(ui, shared, tab.snap.as_deref(), path, files);
                             }
                             DiffSource::Staged => {
                                 if menu_item(ui, icons::MINUS, "Unstage folder") {
                                     run = Some(ops::unstage(&inside(), unborn));
                                 }
+                                folder_extras(ui, shared, tab.snap.as_deref(), path, files);
                             }
                             DiffSource::Commit(_) | DiffSource::Compare { .. } => {
                                 if menu_item(ui, icons::COPY, "Copy folder path") {
@@ -284,6 +286,11 @@ pub fn file_list(
                                     run = Some(crate::git::lfs::track(&pattern));
                                 }
                             }
+                            if !source.is_committed() && file.kind != ChangeKind::Conflicted {
+                                ui.separator();
+                                crate::ui::stash::file_item(ui, shared, file, source);
+                                crate::ui::ignore::file_items(ui, shared, file);
+                            }
                         });
                     }
                 }
@@ -303,6 +310,15 @@ pub fn file_list(
     if let Some(overlay) = overlay {
         tab.overlay = Some(overlay);
     }
+}
+
+/// "Stash folder…" and "Ignore folder…" for a folder of a working-tree list.
+fn folder_extras(ui: &mut Ui, shared: &mut Shared, snap: Option<&crate::git::RepoSnapshot>, dir: &str, files: &[FileChange]) {
+    let prefix = format!("{dir}/");
+    let inside: Vec<&FileChange> = files.iter().filter(|f| f.path.starts_with(&prefix)).collect();
+    ui.separator();
+    crate::ui::stash::folder_item(ui, shared, snap, dir);
+    crate::ui::ignore::folder_items(ui, shared, dir, &inside);
 }
 
 /// What "Open in diff tool" compares for the files of `source`: a commit

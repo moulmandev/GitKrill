@@ -979,7 +979,7 @@ fn row_menu(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<Repo
     match commit.kind {
         RowKind::Wip => {
             if menu_item(ui, icons::TRAY_ARROW_DOWN, "Stash all changes") {
-                shared.show(Dialog::Stash { message: String::new() });
+                crate::ui::stash::open(shared);
             }
             if menu_item(ui, icons::PLUS, "Stage all changes") {
                 tab.run(ops::stage_all());

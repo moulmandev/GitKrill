@@ -228,6 +228,7 @@ fn operator(
                         _ => None,
                     };
                     note_refs(&repo, &mut cmd.undo, false);
+                    crate::git::internal::note_files(&mut cmd.undo, false);
                     (Some(read_head(&repo)), deleted_at)
                 }
                 Err(_) => (None, None),
@@ -250,16 +251,20 @@ fn operator(
             if result.is_err() {
                 break;
             }
-            match cli::run(
-                workdir,
-                &step.args,
-                cli::Options {
-                    stdin: step.stdin.as_deref(),
-                    literal_paths: step.literal_paths,
-                    background: cmd.background,
-                    env: &step.env,
-                },
-            ) {
+            let ran = match &step.internal {
+                Some(internal) => internal.run(workdir),
+                None => cli::run(
+                    workdir,
+                    &step.args,
+                    cli::Options {
+                        stdin: step.stdin.as_deref(),
+                        literal_paths: step.literal_paths,
+                        background: cmd.background,
+                        env: &step.env,
+                    },
+                ),
+            };
+            match ran {
                 Ok(text) => {
                     if !text.is_empty() {
                         if !output.is_empty() {
@@ -278,6 +283,7 @@ fn operator(
         let undo = match (&result, before) {
             (Ok(()), Some(before)) => git2::Repository::open(workdir).ok().and_then(|repo| {
                 note_refs(&repo, &mut cmd.undo, true);
+                crate::git::internal::note_files(&mut cmd.undo, true);
                 build_undo(&cmd, &before, &read_head(&repo), deleted_at)
             }),
             _ => None,

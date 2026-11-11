@@ -10,16 +10,24 @@ pub struct Step {
     pub literal_paths: bool,
     /// Extra environment variables for this step only.
     pub env: Vec<(String, String)>,
+    /// GitKrill's own code to run instead of git; see [`Step::internal`].
+    pub internal: Option<super::internal::Internal>,
 }
 
 impl Step {
     pub fn new(args: Vec<String>, stdin: Option<Vec<u8>>) -> Self {
-        Step { args, stdin, literal_paths: false, env: Vec::new() }
+        Step { args, stdin, literal_paths: false, env: Vec::new(), internal: None }
     }
 
     /// A step whose path arguments must be taken literally.
     pub fn with_paths(args: Vec<String>, stdin: Option<Vec<u8>>) -> Self {
-        Step { args, stdin, literal_paths: true, env: Vec::new() }
+        Step { args, stdin, literal_paths: true, env: Vec::new(), internal: None }
+    }
+
+    /// A step that is not a git invocation (`args` stays empty): see
+    /// `git::internal`.
+    pub fn internal(internal: super::internal::Internal) -> Self {
+        Step { internal: Some(internal), ..Step::new(Vec::new(), None) }
     }
 
     pub fn env(mut self, key: &str, value: impl Into<String>) -> Self {
@@ -52,6 +60,10 @@ pub enum UndoKind {
     /// runs this command, labelled `Undo <label>`; redo runs the command's
     /// own steps again.
     Inverse(Box<GitCmd>),
+    /// Files written by internal steps (`.gitignore`): the operation thread
+    /// notes what each held before and after; undo writes back what was
+    /// there before; see `git::internal`.
+    Files(super::internal::FileUndo),
 }
 
 /// One ref of [`UndoKind::Refs`].
@@ -671,6 +683,8 @@ pub fn build_undo(
                 restore_refs(format!("Redo {label}"), &forth, before, after)?,
             )
         }
+
+        UndoKind::Files(edit) => super::internal::undo_entry(&label, edit, cmd),
     }
 }
 

@@ -25,7 +25,7 @@ pub fn show(ctx: &egui::Context, shared: &mut Shared, mut tab: Option<&mut RepoT
     let fresh = std::mem::take(&mut shared.dialog_fresh);
     let width = match dialog {
         Dialog::NewPull(_) => 520.0,
-        Dialog::Update(_) | Dialog::GitSetup | Dialog::DeleteFolder(_) | Dialog::Remote(_) => 460.0,
+        Dialog::Update(_) | Dialog::GitSetup | Dialog::DeleteFolder(_) | Dialog::Remote(_) | Dialog::Ignore(_) => 460.0,
         _ => 400.0,
     };
 
@@ -34,7 +34,11 @@ pub fn show(ctx: &egui::Context, shared: &mut Shared, mut tab: Option<&mut RepoT
         .stroke(Stroke::new(1.0, theme::border_light()))
         .corner_radius(8.0)
         .inner_margin(Margin::same(20));
-    let modal = Modal::new(Id::new("gitkrill-dialog")).frame(frame).show(ctx, |ui| {
+    // A dialog that follows another in the next frame (a confirmation)
+    // gets a new modal: the old one's remembered size would stretch it.
+    let generation_id = Id::new("gitkrill-dialog-generation");
+    let generation: u64 = ctx.data(|d| d.get_temp(generation_id)).unwrap_or(0);
+    let modal = Modal::new(Id::new("gitkrill-dialog").with(generation)).frame(frame).show(ctx, |ui| {
         ui.set_width(width);
         ui.spacing_mut().item_spacing.y = 8.0;
         body(ui, &mut dialog, shared, tab.as_deref_mut(), fresh)
@@ -46,10 +50,16 @@ pub fn show(ctx: &egui::Context, shared: &mut Shared, mut tab: Option<&mut RepoT
         Outcome::Keep => modal.should_close(),
     };
     // A dialog may have queued a follow-up; never overwrite that.
-    if !close && shared.dialog.is_none() {
+    let replaced = shared.dialog.is_some();
+    if !close && !replaced {
         shared.dialog = Some(dialog);
-    } else if let Dialog::NewPull(form) = &dialog {
-        crate::ui::new_pull::dropped(form, tab);
+    } else {
+        if replaced {
+            ctx.data_mut(|d| d.insert_temp(generation_id, generation + 1));
+        }
+        if let Dialog::NewPull(form) = &dialog {
+            crate::ui::new_pull::dropped(form, tab);
+        }
     }
 }
 
@@ -177,24 +187,14 @@ fn body(
             }
         }
 
-        Dialog::Stash { message } => {
-            title(ui, "Stash changes");
-            ui.label(
-                RichText::new("All changes, including untracked files, are saved and removed from the working tree.")
-                    .color(theme::text_dim()),
-            );
-            field(ui, message, "Message (optional)", fresh);
-            match buttons(ui, "Stash", true, false) {
-                Some(true) => {
-                    if let Some(tab) = tab {
-                        tab.run(ops::stash_push(message));
-                    }
-                    Outcome::Close
-                }
-                Some(false) => Outcome::Close,
-                None => Outcome::Keep,
-            }
-        }
+        Dialog::Stash(form) => match crate::ui::stash::dialog(ui, form, tab, fresh) {
+            crate::ui::stash::Next::Keep => Outcome::Keep,
+            crate::ui::stash::Next::Close => Outcome::Close,
+        },
+        Dialog::Ignore(form) => match crate::ui::ignore::dialog(ui, form, shared, tab, fresh) {
+            crate::ui::ignore::Next::Keep => Outcome::Keep,
+            crate::ui::ignore::Next::Close => Outcome::Close,
+        },
 
         Dialog::Confirm { title: heading, body, button, danger, cmd } => {
             title(ui, heading);
