@@ -492,7 +492,7 @@ impl Gnupg {
     /// `passphrase`, made, imported and trusted in this home (without CRL
     /// checks, so no dirmngr is started); its id.
     fn certificate(&self, gpgsm: &Path, passphrase: &str) -> Option<String> {
-        std::fs::write(self.dir.join("gpgsm.conf"), "disable-crl-checks\ndisable-dirmngr\n").ok()?;
+        std::fs::write(self.dir.join("gpgsm.conf"), "disable-crl-checks\n").ok()?;
         let params = self.dir.join("certificate.txt");
         std::fs::write(
             &params,
@@ -533,6 +533,8 @@ impl Gnupg {
 impl Drop for Gnupg {
     fn drop(&mut self) {
         self.gpgconf(&["--kill", "gpg-agent"]);
+        // Started only if gpgsm needed it, which the X.509 test avoids.
+        self.gpgconf(&["--kill", "dirmngr"]);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -618,7 +620,10 @@ fn signing_asks_for_the_passphrase_the_agent_does_not_hold() {
 
 #[test]
 fn x509_signing_asks_for_the_certificate_passphrase() {
-    let Some(gnupg) = Gnupg::new("gpgsm") else {
+    // A short name: gpg-agent's sockets are in the home, and their paths
+    // must stay under about 100 characters (macOS's temporary folder is a
+    // long one).
+    let Some(gnupg) = Gnupg::new("sm") else {
         eprintln!("gpg not found; skipped");
         return;
     };
