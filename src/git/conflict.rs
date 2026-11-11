@@ -8,6 +8,9 @@
 //! than from the markers in the working file means the resolver still knows
 //! both sides after the file has been edited.
 //!
+//! Each conflicting region also carries what the common ancestor had there
+//! (see [`fill_ancestors`]), for the resolver's ancestor pane.
+//!
 //! A [`Draft`] holds what the user decided for each region. [`render`] turns
 //! the segments plus a draft into the bytes of the resolved file, copying
 //! every untouched line byte for byte (line endings, a missing final
@@ -16,6 +19,7 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 
 use git2::{BranchType, ObjectType, Repository, RepositoryState};
@@ -129,8 +133,10 @@ fn split_lines(bytes: &[u8]) -> Vec<&[u8]> {
 pub enum Segment {
     /// Lines that merge without help: unchanged, or changed on one side only.
     Stable(Chunk),
-    /// Lines both sides changed differently.
-    Conflict { ours: Chunk, theirs: Chunk },
+    /// Lines both sides changed differently, and the lines of the common
+    /// ancestor (stage 1) they both replaced. `base` is empty when the
+    /// ancestor had no lines there, or there is no ancestor at all.
+    Conflict { ours: Chunk, theirs: Chunk, base: Chunk },
 }
 
 /// A three-way merge of one text file, split where it conflicts.
@@ -147,7 +153,15 @@ impl TextMerge {
     /// Both sides of conflict number `index`.
     pub fn conflict(&self, index: usize) -> Option<(&Chunk, &Chunk)> {
         match self.segments.get(*self.conflicts.get(index)?)? {
-            Segment::Conflict { ours, theirs } => Some((ours, theirs)),
+            Segment::Conflict { ours, theirs, .. } => Some((ours, theirs)),
+            Segment::Stable(_) => None,
+        }
+    }
+
+    /// What the common ancestor had in place of conflict number `index`.
+    pub fn ancestor(&self, index: usize) -> Option<&Chunk> {
+        match self.segments.get(*self.conflicts.get(index)?)? {
+            Segment::Conflict { base, .. } => Some(base),
             Segment::Stable(_) => None,
         }
     }
@@ -251,6 +265,7 @@ pub fn merge_text(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<TextMerge, 
                 segments.push(Segment::Conflict {
                     ours: Chunk::new(std::mem::take(&mut mine)),
                     theirs: Chunk::new(std::mem::take(&mut yours)),
+                    base: Chunk::default(),
                 });
                 state = In::Stable;
                 ends_in_conflict = true;
@@ -268,7 +283,7 @@ pub fn merge_text(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<TextMerge, 
     // A conflict that runs to the end of the file gets a newline added before
     // its closing marker when a side has none. Take those lines from the
     // side itself so a missing final newline stays missing.
-    if ends_in_conflict && let Some(Segment::Conflict { ours: left, theirs: right }) = segments.last_mut() {
+    if ends_in_conflict && let Some(Segment::Conflict { ours: left, theirs: right, .. }) = segments.last_mut() {
         for (chunk, side) in [(left, ours), (right, theirs)] {
             let lines = split_lines(side);
             if chunk.is_empty() || chunk.len() > lines.len() {
@@ -281,6 +296,7 @@ pub fn merge_text(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<TextMerge, 
         }
     }
 
+    fill_ancestors(&mut segments, base);
     let conflicts = segments
         .iter()
         .enumerate()
@@ -291,6 +307,138 @@ pub fn merge_text(base: &[u8], ours: &[u8], theirs: &[u8]) -> Result<TextMerge, 
     let newlines = sample.iter().filter(|b| **b == b'\n').count();
     let crlf = sample.windows(2).filter(|w| w == b"\r\n").count() * 2 > newlines;
     Ok(TextMerge { segments, conflicts, crlf })
+}
+
+/// A run of lines that differs between two versions of a file: lines `old`
+/// of the first stand where lines `new` of the second are.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Change {
+    old: Range<usize>,
+    new: Range<usize>,
+}
+
+/// Where `old` and `new` differ, line by line and in order, as git's diff
+/// finds it. Without context, so changes a line apart stay apart.
+fn changes(old: &[u8], new: &[u8]) -> Result<Vec<Change>, git2::Error> {
+    let mut options = git2::DiffOptions::new();
+    options.context_lines(0).interhunk_lines(0).force_text(true);
+    let patch = git2::Patch::from_buffers(old, None, new, None, Some(&mut options))?;
+    // Hunk headers count from 1, and name the line before when a side has
+    // no lines (`@@ -3,0 +4,2 @@` inserts after line 3).
+    let range = |start: u32, lines: u32| {
+        let start = (start as usize).saturating_sub(usize::from(lines > 0));
+        start..start + lines as usize
+    };
+    (0..patch.num_hunks())
+        .map(|i| {
+            let (hunk, _) = patch.hunk(i)?;
+            Ok(Change { old: range(hunk.old_start(), hunk.old_lines()), new: range(hunk.new_start(), hunk.new_lines()) })
+        })
+        .collect()
+}
+
+/// Takes line numbers of the newer version of a diff back to the older one.
+struct LineMap<'a> {
+    changes: &'a [Change],
+    /// Lines the older version has more than the newer one before each
+    /// change (and, last, in all).
+    shift: Vec<isize>,
+}
+
+impl<'a> LineMap<'a> {
+    fn new(changes: &'a [Change]) -> Self {
+        let mut shift = Vec::with_capacity(changes.len() + 1);
+        let mut total = 0isize;
+        shift.push(0);
+        for change in changes {
+            total += change.old.len() as isize - change.new.len() as isize;
+            shift.push(total);
+        }
+        LineMap { changes, shift }
+    }
+
+    /// The lines of the older version that lines `range` of the newer one
+    /// take the place of. A change that reaches into `range` counts whole:
+    /// lines rewritten together cannot be told apart.
+    fn old_range(&self, range: Range<usize>) -> Range<usize> {
+        let changes = self.changes;
+        let touches = |c: &Change| {
+            if range.is_empty() || c.new.is_empty() {
+                c.new.start <= range.end && range.start <= c.new.end
+            } else {
+                c.new.start < range.end && range.start < c.new.end
+            }
+        };
+        // Where a line no change touches sits in the older version.
+        let unchanged = |line: usize| {
+            let before = changes.partition_point(|c| c.new.end <= line);
+            (line as isize + self.shift[before]).max(0) as usize
+        };
+        let from = changes.partition_point(|c| c.new.end < range.start);
+        let mut touching = changes[from..].iter().take_while(|c| c.new.start <= range.end).filter(|c| touches(c));
+        let first = touching.next();
+        let last = touching.last().or(first);
+        let start = match first {
+            Some(c) if c.new.start <= range.start => c.old.start,
+            _ => unchanged(range.start),
+        };
+        let end = match last {
+            Some(c) if c.new.end >= range.end => c.old.end,
+            _ => unchanged(range.end),
+        };
+        start..end.max(start)
+    }
+}
+
+/// Fills in what the common ancestor had in place of every conflict.
+///
+/// The merge tells where each side's lines of a conflict are, not which
+/// lines of the ancestor they replaced. Each side as the resolver shows it
+/// (the merged lines, with that side's version of every conflict) is
+/// compared with the ancestor, and the ancestor lines either side's version
+/// stands for are the ones shown. Where git's merge split one rewritten
+/// stretch into several conflicts, each of them shows the whole stretch.
+fn fill_ancestors(segments: &mut [Segment], base: &[u8]) {
+    if base.is_empty() {
+        return;
+    }
+    let mut views = [Vec::new(), Vec::new()];
+    let mut lines = [0usize; 2];
+    let mut ranges = Vec::new();
+    for segment in segments.iter() {
+        match segment {
+            Segment::Stable(chunk) => {
+                for (view, count) in views.iter_mut().zip(&mut lines) {
+                    push(view, chunk.bytes(), b"\n");
+                    *count += chunk.len();
+                }
+            }
+            Segment::Conflict { ours, theirs, .. } => {
+                let mut pair = [0..0, 0..0];
+                for (k, chunk) in [ours, theirs].into_iter().enumerate() {
+                    pair[k] = lines[k]..lines[k] + chunk.len();
+                    push(&mut views[k], chunk.bytes(), b"\n");
+                    lines[k] += chunk.len();
+                }
+                ranges.push(pair);
+            }
+        }
+    }
+    // Only for showing: without the comparison the ancestor stays blank.
+    let (Ok(ours), Ok(theirs)) = (changes(base, &views[0]), changes(base, &views[1])) else { return };
+    let maps = [LineMap::new(&ours), LineMap::new(&theirs)];
+    let ancestor = Chunk::new(base.to_vec());
+    let mut ranges = ranges.into_iter();
+    for segment in segments.iter_mut() {
+        if let Segment::Conflict { base: slot, .. } = segment
+            && let Some([ours, theirs]) = ranges.next()
+        {
+            let (a, b) = (maps[0].old_range(ours), maps[1].old_range(theirs));
+            let end = a.end.max(b.end).min(ancestor.len());
+            let start = a.start.min(b.start).min(end);
+            *slot = Chunk::new(ancestor.raw(start, end).to_vec());
+        }
+    }
 }
 
 /// Appends `bytes`, first finishing a line that was left without a newline.
@@ -346,7 +494,7 @@ pub fn render(merge: &TextMerge, draft: &Draft, labels: (&str, &str)) -> Vec<u8>
                 }
                 push(&mut out, chunk.raw(from, chunk.len()), eol);
             }
-            Segment::Conflict { ours, theirs } => {
+            Segment::Conflict { ours, theirs, .. } => {
                 match draft.choices.get(conflict).unwrap_or(&Resolution::Unresolved) {
                     Resolution::Unresolved => {
                         let marker = |mark: u8, label: &str| {
@@ -423,7 +571,7 @@ fn find_lines(file: &[u8], from: usize, needle: &[u8]) -> Option<usize> {
 pub fn adopt(merge: &TextMerge, worktree: &[u8]) -> Option<Draft> {
     let stored_crlf = merge.segments.iter().any(|segment| match segment {
         Segment::Stable(chunk) => has_crlf(chunk.bytes()),
-        Segment::Conflict { ours, theirs } => has_crlf(ours.bytes()) || has_crlf(theirs.bytes()),
+        Segment::Conflict { ours, theirs, .. } => has_crlf(ours.bytes()) || has_crlf(theirs.bytes()),
     });
     // With core.autocrlf the working file has CRLF where the index has LF.
     let normalised: Cow<'_, [u8]> = if !stored_crlf && has_crlf(worktree) {
@@ -446,7 +594,7 @@ pub fn adopt(merge: &TextMerge, worktree: &[u8]) -> Option<Draft> {
     let last = merge.segments.len().saturating_sub(1);
     for (index, segment) in merge.segments.iter().enumerate() {
         match segment {
-            Segment::Conflict { ours, theirs } => pending = Some((ours, theirs)),
+            Segment::Conflict { ours, theirs, .. } => pending = Some((ours, theirs)),
             Segment::Stable(chunk) => {
                 let stable = chunk.bytes();
                 let start = match pending {
@@ -565,6 +713,9 @@ pub struct ConflictFile {
     pub theirs: Option<Stage>,
     pub ours_info: SideInfo,
     pub theirs_info: SideInfo,
+    /// The common ancestor (stage 1): the commit both sides started from,
+    /// or that there is none.
+    pub base_info: SideInfo,
     pub content: Content,
     /// The repository's git directory, home of the scratch index that
     /// [`save`] uses to write a file without staging it.
@@ -735,7 +886,11 @@ pub fn load(repo: &Repository, path: &str, default: Encoding) -> Result<Conflict
         }
     };
 
-    let (ours_info, theirs_info) = describe(repo);
+    let (ours_info, theirs_info, mut base_info) = describe(repo);
+    if base.is_none() {
+        base_info.name = "no common ancestor".to_owned();
+        base_info.detail = "both sides added this file".to_owned();
+    }
     Ok(ConflictFile {
         path: path.to_owned(),
         base,
@@ -743,6 +898,7 @@ pub fn load(repo: &Repository, path: &str, default: Encoding) -> Result<Conflict
         theirs,
         ours_info,
         theirs_info,
+        base_info,
         content,
         git_dir: repo.path().to_path_buf(),
         encoding,
@@ -799,13 +955,17 @@ fn merged_name(message: &str) -> Option<String> {
     }
 }
 
-/// Says what stage 2 and stage 3 stand for in the operation under way.
+/// Says what stage 2 and stage 3 stand for in the operation under way, and
+/// stage 1, the ancestor.
 ///
-/// In a merge they are the current branch and the branch being merged. In a
-/// rebase the roles are swapped relative to intuition: "ours" is the branch
-/// being rebased onto (plus what was replayed so far), "theirs" is the
-/// commit of your own branch that is being replayed.
-fn describe(repo: &Repository) -> (SideInfo, SideInfo) {
+/// In a merge they are the current branch and the branch being merged, and
+/// the ancestor is where they forked. In a rebase the roles are swapped
+/// relative to intuition: "ours" is the branch being rebased onto (plus what
+/// was replayed so far), "theirs" is the commit of your own branch that is
+/// being replayed, and the ancestor is that commit's parent; likewise for a
+/// cherry-pick. A revert applies the parent of the commit it undoes, from
+/// the commit itself.
+fn describe(repo: &Repository) -> (SideInfo, SideInfo, SideInfo) {
     let head = read_head(repo);
     let mut ours = SideInfo {
         role: "Current",
@@ -823,6 +983,9 @@ fn describe(repo: &Repository) -> (SideInfo, SideInfo) {
         detail: String::new(),
         marker: "incoming".to_owned(),
     };
+    let mut base =
+        SideInfo { role: "Ancestor", name: "common ancestor".to_owned(), detail: String::new(), marker: String::new() };
+    let parent = |oid: Oid| repo.find_commit(oid).ok().and_then(|commit| commit.parent_id(0).ok());
 
     let git_dir = repo.path();
     let read = |name: &str| {
@@ -845,6 +1008,10 @@ fn describe(repo: &Repository) -> (SideInfo, SideInfo) {
                 theirs.marker = name.clone();
                 theirs.name = name;
                 theirs.detail = commit_line(repo, oid);
+                if let Some(fork) = head.oid.and_then(|ours| repo.merge_base(ours, oid).ok()) {
+                    base.name = "merge base".to_owned();
+                    base.detail = commit_line(repo, fork);
+                }
             }
         }
         RepositoryState::Rebase | RepositoryState::RebaseInteractive | RepositoryState::RebaseMerge => {
@@ -868,6 +1035,9 @@ fn describe(repo: &Repository) -> (SideInfo, SideInfo) {
                 theirs.name = branch.unwrap_or_else(|| format!("commit {}", short(oid)));
                 theirs.detail = format!("replaying {}", commit_line(repo, oid));
                 theirs.marker = marker_for(repo, oid);
+                if let Some(before) = parent(oid) {
+                    base.detail = commit_line(repo, before);
+                }
             }
         }
         RepositoryState::CherryPick | RepositoryState::CherryPickSequence => {
@@ -875,6 +1045,9 @@ fn describe(repo: &Repository) -> (SideInfo, SideInfo) {
                 theirs.name = format!("commit {}", short(oid));
                 theirs.detail = format!("cherry-picking {}", commit_line(repo, oid));
                 theirs.marker = marker_for(repo, oid);
+                if let Some(before) = parent(oid) {
+                    base.detail = commit_line(repo, before);
+                }
             }
         }
         RepositoryState::Revert | RepositoryState::RevertSequence => {
@@ -882,11 +1055,12 @@ fn describe(repo: &Repository) -> (SideInfo, SideInfo) {
                 theirs.name = format!("revert of {}", short(oid));
                 theirs.detail = format!("undoing {}", commit_line(repo, oid));
                 theirs.marker = format!("parent of {}", marker_for(repo, oid));
+                base.detail = commit_line(repo, oid);
             }
         }
         _ => {}
     }
-    (ours, theirs)
+    (ours, theirs, base)
 }
 
 fn args(list: &[&str]) -> Vec<String> {
@@ -1347,6 +1521,7 @@ mod tests {
         assert_eq!(first.line(0), "café");
         let (ours, theirs) = merge.conflict(0).unwrap();
         assert_eq!((ours.line(0), theirs.line(0)), ("ours “x”".into(), "theirs €".into()));
+        assert_eq!(merge.ancestor(0).unwrap().line(0), "middle");
 
         // Typed text goes back in the file's encoding, line endings too.
         let typed = draft(&[Custom("both € and “quotes”".to_owned())]);
@@ -1552,6 +1727,9 @@ mod tests {
         assert_eq!(file.theirs_info.name, format!("commit {}", &picked[..7]));
         assert!(file.theirs_info.detail.ends_with("their change"));
         assert_eq!(file.theirs_info.marker, format!("{} (their change)", &picked[..7]));
+        // The ancestor of a cherry-pick is the picked commit's parent.
+        assert_eq!(file.base_info.role, "Ancestor");
+        assert!(file.base_info.detail.ends_with(" base"), "{}", file.base_info.detail);
 
         // Revert: the incoming side undoes a commit.
         let fx = Fixture::new("conflict-names-revert");
@@ -1567,6 +1745,9 @@ mod tests {
         assert_eq!(file.theirs_info.name, format!("revert of {}", &second[..7]));
         let (merge, _) = text(&file);
         assert_eq!(merge.conflict(0).unwrap().1.text(), "two");
+        // A revert merges from the commit it undoes.
+        assert!(file.base_info.detail.ends_with(" second"), "{}", file.base_info.detail);
+        assert_eq!(merge.ancestor(0).unwrap().text(), "second");
 
         // Rebase: "ours" is the branch rebased onto, "theirs" our own commit.
         let fx = Fixture::new("conflict-names-rebase");
@@ -1577,14 +1758,116 @@ mod tests {
         assert_eq!((file.ours_info.role, file.ours_info.name.as_str()), ("Current", "main"));
         assert_eq!((file.theirs_info.role, file.theirs_info.name.as_str()), ("Incoming", "feature"));
         assert!(file.theirs_info.detail.ends_with("their change"), "{}", file.theirs_info.detail);
+        assert!(file.base_info.detail.ends_with(" base"), "{}", file.base_info.detail);
         let (merge, _) = text(&file);
         let (ours, theirs) = merge.conflict(0).unwrap();
         assert_eq!((ours.text().as_str(), theirs.text().as_str()), ("ours", "theirs"));
+        assert_eq!(merge.ancestor(0).unwrap().text(), "two");
         // Resolving and continuing completes the rebase.
         resolve(&fx, &file, &draft(&[Resolution::OursTheirs]), b"one\nours\ntheirs\n");
         let done = fx.run(ops::continue_op(RepoState::Rebase).unwrap());
         assert_eq!(done.snap.state, RepoState::Clean);
         assert_eq!(done.snap.head.branch.as_deref(), Some("feature"));
     }
-}
 
+    /// The ancestor's lines of every conflict, as text.
+    fn ancestors(merge: &TextMerge) -> Vec<String> {
+        (0..merge.conflicts.len()).map(|i| merge.ancestor(i).unwrap().text()).collect()
+    }
+
+    #[test]
+    fn each_conflict_knows_what_the_ancestor_had_there() {
+        let (_fx, file) = three_regions("conflict-ancestor");
+        let (merge, _) = text(&file);
+        assert_eq!(ancestors(merge), ["line 3", "line 15", "line 27"]);
+        assert!(file.base.is_some());
+        assert_eq!((file.base_info.role, file.base_info.name.as_str()), ("Ancestor", "merge base"));
+        assert!(file.base_info.detail.ends_with(" base"), "{}", file.base_info.detail);
+
+        // Lines one side deleted and the other rewrote, and lines both
+        // inserted at the same place: the ancestor had the deleted lines,
+        // and nothing where both inserted. (Git joins conflicts that are
+        // up to three lines apart, hence four.)
+        let base = b"keep 1\nold a\nold b\nkeep 2\nkeep 3\nkeep 4\nkeep 5\nkeep 6\nkeep 7\n";
+        let ours = b"keep 1\nkeep 2\nkeep 3\nkeep 4\nkeep 5\nours added\nkeep 6\nkeep 7\n";
+        let theirs = b"keep 1\nnew a\nnew b\nnew c\nkeep 2\nkeep 3\nkeep 4\nkeep 5\ntheirs added\nkeep 6\nkeep 7\n";
+        let fx = merging("conflict-ancestor-shapes", Some(base), Some(ours), Some(theirs));
+        let file = load_file(&fx, FILE);
+        let (merge, _) = text(&file);
+        assert_eq!(merge.conflicts.len(), 2);
+        let (deleted, rewritten) = merge.conflict(0).unwrap();
+        assert!(deleted.is_empty());
+        assert_eq!(rewritten.text(), "new a\nnew b\nnew c");
+        assert_eq!(ancestors(merge), ["old a\nold b", ""]);
+        assert!(merge.ancestor(1).unwrap().is_empty());
+
+        // Resolving is unaffected by the ancestor being known.
+        let expected =
+            b"keep 1\nnew a\nnew b\nnew c\nkeep 2\nkeep 3\nkeep 4\nkeep 5\nours added\ntheirs added\nkeep 6\nkeep 7\n";
+        resolve(&fx, &file, &draft(&[Resolution::Theirs, Resolution::OursTheirs]), expected);
+    }
+
+    #[test]
+    fn a_file_both_sides_added_has_no_ancestor() {
+        let fx = merging("conflict-no-ancestor", None, Some(b"same\nours\nend\n"), Some(b"same\ntheirs\nend\n"));
+        let file = load_file(&fx, FILE);
+        assert!(file.base.is_none());
+        assert_eq!(file.base_info.name, "no common ancestor");
+        assert_eq!(file.base_info.detail, "both sides added this file");
+        let (merge, _) = text(&file);
+        assert_eq!(merge.conflicts.len(), 1);
+        assert_eq!(merge.conflict(0).unwrap().0.text(), "ours");
+        assert_eq!(ancestors(merge), [""]);
+        resolve(&fx, &file, &draft(&[Resolution::Ours]), b"same\nours\nend\n");
+    }
+
+    #[test]
+    fn the_ancestor_keeps_crlf_and_tabs() {
+        let base = b"fn main() {\r\n\tlet x = 1;\r\n\tcall(x);\r\n}\r\n";
+        let ours = b"fn main() {\r\n\tlet x = 2;\r\n\tcall(x);\r\n}\r\n";
+        let theirs = b"fn main() {\r\n\tlet x = 3;\r\n\tcall(x);\r\n}\r\n";
+        let fx = merging("conflict-ancestor-crlf-tabs", Some(base), Some(ours), Some(theirs));
+        let file = load_file(&fx, FILE);
+        let (merge, _) = text(&file);
+        assert!(merge.crlf);
+        let ancestor = merge.ancestor(0).unwrap();
+        // Byte for byte as stored, shown without its line ending.
+        assert_eq!(ancestor.bytes(), b"\tlet x = 1;\r\n");
+        assert_eq!(ancestor.line(0), "\tlet x = 1;");
+        assert_eq!(merge.conflict(0).unwrap().0.line(0), "\tlet x = 2;");
+        resolve(&fx, &file, &draft(&[Resolution::Theirs]), theirs);
+    }
+
+    #[test]
+    fn line_numbers_map_back_through_a_diff() {
+        // Lines 2..4 of the older version became line 2; a line was
+        // inserted as line 5; line 8 of the older version was deleted.
+        let known = [
+            Change { old: 2..4, new: 2..3 },
+            Change { old: 5..5, new: 4..5 },
+            Change { old: 7..8, new: 7..7 },
+        ];
+        let map = LineMap::new(&known);
+        assert_eq!(map.old_range(0..1), 0..1); // before any change
+        assert_eq!(map.old_range(2..3), 2..4); // the rewritten line
+        assert_eq!(map.old_range(1..3), 1..4); // reaching into it counts it whole
+        assert_eq!(map.old_range(4..5), 5..5); // inserted: the older one had nothing
+        assert_eq!(map.old_range(5..6), 5..6); // after the insertion, shifted back
+        assert_eq!(map.old_range(7..7), 7..8); // where a line was deleted
+        assert_eq!(map.old_range(8..9), 9..10); // after everything
+        assert_eq!(map.old_range(6..6), 6..6); // an empty range no change touches
+        assert_eq!(map.old_range(3..3), 2..4); // one right after a change takes it in
+
+        // Found by git's own diff in real text.
+        let old = b"a\nb\nc\nd\ne\nf\n";
+        let new = b"a\nB\nc\ne\nf\ng\n";
+        assert_eq!(
+            changes(old, new).unwrap(),
+            [
+                Change { old: 1..2, new: 1..2 },
+                Change { old: 3..4, new: 3..3 },
+                Change { old: 6..6, new: 5..6 },
+            ]
+        );
+    }
+}

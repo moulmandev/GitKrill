@@ -666,7 +666,7 @@ impl Plan {
                         push(&mut plan, Kind::Stable { seg, from, to: chunk.len() }, n, 0.0, [n, n, n]);
                     }
                 }
-                Segment::Conflict { ours, theirs } => {
+                Segment::Conflict { ours, theirs, .. } => {
                     plan.longest = plan.longest.max(ours.longest_line()).max(theirs.longest_line());
                     let choice = draft.choices.get(conflict).unwrap_or(&Resolution::Unresolved);
                     let result = match editing {
