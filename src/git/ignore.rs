@@ -467,6 +467,28 @@ mod tests {
         assert!(append(b"/a/\n", "/a").is_some());
     }
 
+    /// Where `path` really is, for comparing paths spelt differently: git
+    /// reports the temporary folder in its long form on Windows
+    /// (`runneradmin`, not `RUNNER~1`) and through `/private` on macOS.
+    /// The file itself may not exist yet, so its nearest existing folder
+    /// is resolved and the rest appended.
+    fn resolved(path: &std::path::Path) -> std::path::PathBuf {
+        let mut rest = Vec::new();
+        let mut at = path;
+        loop {
+            if let Ok(real) = std::fs::canonicalize(at) {
+                return rest.iter().rev().fold(real, |out, part| out.join(part));
+            }
+            match (at.parent(), at.file_name()) {
+                (Some(parent), Some(name)) => {
+                    rest.push(name.to_owned());
+                    at = parent;
+                }
+                _ => return path.to_owned(),
+            }
+        }
+    }
+
     fn untracked(fx: &Fixture) -> Vec<String> {
         fx.snapshot().status.unstaged.iter().filter(|f| f.kind == ChangeKind::Untracked).map(|f| f.path.clone()).collect()
     }
@@ -486,7 +508,8 @@ mod tests {
         let matches = fx.job(move |loader| check(loader, &p, &changed)).unwrap();
         assert_eq!(matches.untracked, ["logs/run 1.log"]);
         assert!(matches.tracked.is_empty());
-        assert_eq!(matches.file(Target::GitIgnore), &(fx.dir.join(".gitignore"), false));
+        let (file, present) = matches.file(Target::GitIgnore);
+        assert_eq!((resolved(file), *present), (resolved(&fx.dir.join(".gitignore")), false));
 
         let file = matches.file(Target::GitIgnore).0.clone();
         let done = fx.run(ignore(&pattern, &file, Target::GitIgnore, &[]));
@@ -546,7 +569,7 @@ mod tests {
         let changed = untracked(&fx);
         let matches = fx.job(move |loader| check(loader, "/local/", &changed)).unwrap();
         assert_eq!(matches.untracked, ["local/scratch.txt"]);
-        assert_eq!(matches.file(Target::Exclude).0, exclude);
+        assert_eq!(resolved(&matches.file(Target::Exclude).0), resolved(&exclude));
 
         let done = fx.run(ignore("/local/", &exclude, Target::Exclude, &[]));
         assert_eq!(std::fs::read_to_string(&exclude).unwrap(), "/local/\n");
