@@ -5,6 +5,8 @@ pub mod commit_button;
 pub mod conflict;
 pub mod dialogs;
 pub mod diff;
+pub mod diff_mode;
+pub mod diff_split;
 pub mod files;
 pub mod git_setup;
 pub mod gitflow;

@@ -1,6 +1,8 @@
 //! Single-file diffs, parsed into hunks for display and kept as raw patch
 //! bytes so individual hunks can be staged, unstaged or discarded.
 
+use std::sync::atomic::{AtomicU8, Ordering};
+
 use git2::{DiffFindOptions, DiffFormat, DiffOptions};
 
 use super::repo::{Loader, delta_kind, lossy};
@@ -12,14 +14,119 @@ use super::{DiffLine, DiffSource, DiffTarget, FileDiff, Hunk};
 const MAX_LINES: usize = 50_000;
 /// Binary files larger than this are not looked at as UTF-16 text.
 const MAX_TRANSCODED_BYTES: usize = 16 * 1024 * 1024;
+/// Lines of context around each change, as `git diff` has.
+const CONTEXT: u32 = 3;
+/// Context that takes in every line of a file. Not `u32::MAX`: xdiff adds
+/// it to line numbers in a C `long`, which has 32 bits on Windows.
+const WHOLE_FILE_CONTEXT: u32 = 1 << 24;
+
+// ---- how a diff is worked out ---------------------------------------------------
+
+/// How a diff is worked out, besides what it is a diff of. Picked in the
+/// diff view's header and kept in Preferences > Editor. A request for a diff
+/// carries the mode it was made with, and so does the answer
+/// (`FileDiff::mode`), so an answer for another mode is never taken for one
+/// of this.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Mode {
+    /// Every line of the file with the changes in place, not only the hunks.
+    /// The hunks stay those of three lines of context, so each can still be
+    /// staged on its own; the unchanged lines between them come as
+    /// `Hunk::gap` hunks.
+    pub whole_file: bool,
+    /// Lines that differ only in whitespace count as the same: `git diff -w`
+    /// (`--ignore-all-space`), libgit2's `ignore_whitespace`. Such a diff
+    /// does not match the files byte for byte, so its hunks and lines must
+    /// not be handed to `git apply`.
+    pub ignore_whitespace: bool,
+}
+
+impl Mode {
+    fn pack(self) -> u8 {
+        u8::from(self.whole_file) | u8::from(self.ignore_whitespace) << 1
+    }
+
+    fn unpack(bits: u8) -> Self {
+        Mode { whole_file: bits & 1 != 0, ignore_whitespace: bits & 2 != 0 }
+    }
+}
+
+static MODE: AtomicU8 = AtomicU8::new(0);
+
+/// The mode set in Preferences > Editor (put there by `prefs::editor::apply`).
+pub fn mode() -> Mode {
+    Mode::unpack(MODE.load(Ordering::Relaxed))
+}
+
+pub fn set_mode(mode: Mode) {
+    MODE.store(mode.pack(), Ordering::Relaxed);
+}
 
 impl Loader {
+    /// The diff of one file, hunks with three lines of context, whitespace
+    /// counted: what can be staged in part, whatever the diff view shows.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn diff(&self, target: &DiffTarget) -> Result<FileDiff, String> {
+        self.diff_with(target, Mode::default())
+    }
+
+    /// The diff of one file, worked out as `mode` says.
+    pub fn diff_with(&self, target: &DiffTarget, mode: Mode) -> Result<FileDiff, String> {
+        let repo = &self.repo;
+        // How lines become text: the repository's encoding, the tab width.
+        let format = text::format_for(repo.workdir().unwrap_or(repo.path()));
+        let (mut out, blobs) = self.collect(target, mode, CONTEXT, format)?;
+        out.mode = mode;
+
+        let is_image = picture::is_image_path(&target.path)
+            || target.old_path.as_deref().is_some_and(picture::is_image_path);
+        if out.binary && is_image && let Some((old, new)) = blobs {
+            // An unstaged file has no blob yet: it is read from disk, unless
+            // it is the deletion being shown.
+            let on_disk = (target.source == DiffSource::Unstaged && out.kind != Some(super::ChangeKind::Deleted))
+                .then(|| repo.workdir().map(|dir| dir.join(&target.path)))
+                .flatten();
+            let images = picture::load(repo, Some(old), Some(new), on_disk.as_deref());
+            if images.old.is_some() || images.new.is_some() {
+                out.images = Some(std::sync::Arc::new(images));
+            }
+        } else if out.binary && let Some((old, new)) = blobs {
+            let _ = self.utf16_diff(target, old, new, mode, &mut out);
+        } else if mode.whole_file && !out.binary && !out.hunks.is_empty() {
+            let (whole, _) = self.collect(target, mode, WHOLE_FILE_CONTEXT, format)?;
+            fill_gaps(&mut out, whole);
+        }
+
+        // Nothing left once whitespace is ignored: say whether that is
+        // because only whitespace changed. (libgit2 may then leave the file
+        // out altogether, so its kind comes from the full diff too.)
+        if mode.ignore_whitespace && out.hunks.is_empty() && !out.binary {
+            let full = self.diff_with(target, Mode::default())?;
+            out.only_whitespace = !full.hunks.is_empty();
+            if out.kind.is_none() {
+                (out.kind, out.old_path) = (full.kind, full.old_path);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Runs the diff for `target` with `context` lines of context and reads
+    /// its lines, with the blob ids of both sides of the file.
+    fn collect(
+        &self,
+        target: &DiffTarget,
+        mode: Mode,
+        context: u32,
+        format: text::Format,
+    ) -> Result<(FileDiff, Option<(git2::Oid, git2::Oid)>), String> {
         let repo = &self.repo;
         let err = |e: git2::Error| e.message().to_owned();
 
         let mut opts = DiffOptions::new();
-        opts.context_lines(3).disable_pathspec_match(true).pathspec(target.path.as_str());
+        opts.context_lines(context)
+            .ignore_whitespace(mode.ignore_whitespace)
+            .disable_pathspec_match(true)
+            .pathspec(target.path.as_str());
         if let Some(old) = &target.old_path {
             opts.pathspec(old.as_str());
         }
@@ -58,8 +165,6 @@ impl Loader {
             let _ = diff.find_similar(Some(&mut find));
         }
 
-        // How lines become text: the repository's encoding, the tab width.
-        let format = text::format_for(repo.workdir().unwrap_or(repo.path()));
         let mut out = FileDiff { format, ..FileDiff::default() };
         // Blob ids of both sides of the file shown, for the image preview.
         let mut blobs = None;
@@ -99,6 +204,7 @@ impl Loader {
                         header: lossy(content).trim_end().to_owned(),
                         lines: Vec::new(),
                         raw: content.to_vec(),
+                        gap: false,
                     });
                 }
                 ' ' | '+' | '-' => {
@@ -144,23 +250,7 @@ impl Loader {
         if out.hunks.is_empty() {
             out.file_header.clear();
         }
-
-        let is_image = picture::is_image_path(&target.path)
-            || target.old_path.as_deref().is_some_and(picture::is_image_path);
-        if out.binary && is_image && let Some((old, new)) = blobs {
-            // An unstaged file has no blob yet: it is read from disk, unless
-            // it is the deletion being shown.
-            let on_disk = (target.source == DiffSource::Unstaged && out.kind != Some(super::ChangeKind::Deleted))
-                .then(|| repo.workdir().map(|dir| dir.join(&target.path)))
-                .flatten();
-            let images = picture::load(repo, Some(old), Some(new), on_disk.as_deref());
-            if images.old.is_some() || images.new.is_some() {
-                out.images = Some(std::sync::Arc::new(images));
-            }
-        } else if out.binary && let Some((old, new)) = blobs {
-            let _ = self.utf16_diff(target, old, new, &mut out);
-        }
-        Ok(out)
+        Ok((out, blobs))
     }
 
     /// UTF-16 is binary to git: it is full of zero bytes. When a version of
@@ -168,7 +258,14 @@ impl Loader {
     /// set to UTF-16), both are turned into UTF-8 and diffed as text. Such a
     /// diff is for reading: it has no patch header, so nothing in it can be
     /// staged by hunk or line.
-    fn utf16_diff(&self, target: &DiffTarget, old: git2::Oid, new: git2::Oid, out: &mut FileDiff) -> Option<()> {
+    fn utf16_diff(
+        &self,
+        target: &DiffTarget,
+        old: git2::Oid,
+        new: git2::Oid,
+        mode: Mode,
+        out: &mut FileDiff,
+    ) -> Option<()> {
         let repo = &self.repo;
         // Every binary file comes through here: big ones are not read at all.
         let blob = |id: git2::Oid| {
@@ -198,51 +295,156 @@ impl Loader {
             return None;
         }
 
-        let mut opts = DiffOptions::new();
-        opts.context_lines(3);
-        let path = std::path::Path::new(&target.path);
-        let patch =
-            git2::Patch::from_buffers(old_text.as_bytes(), Some(path), new_text.as_bytes(), Some(path), Some(&mut opts))
-                .ok()?;
         // The lines are UTF-8 now, whatever the file is in.
         let format = text::Format { encoding: Encoding::Utf8, ..out.format };
-        let mut hunks = Vec::new();
-        let (mut additions, mut deletions, mut max_chars, mut shown) = (0, 0, 0, 0usize);
-        for h in 0..patch.num_hunks() {
-            let (hunk, count) = patch.hunk(h).ok()?;
-            let mut made = Hunk { header: lossy(hunk.header()).trim_end().to_owned(), lines: Vec::new(), raw: hunk.header().to_vec() };
-            for l in 0..count {
-                let line = patch.line_in_hunk(h, l).ok()?;
-                let origin = line.origin();
-                match origin {
-                    ' ' | '+' | '-' => {
-                        made.raw.push(origin as u8);
-                        made.raw.extend_from_slice(line.content());
-                        match origin {
-                            '+' => additions += 1,
-                            '-' => deletions += 1,
-                            _ => {}
-                        }
-                        if shown < MAX_LINES {
-                            shown += 1;
-                            let text = display_text_in(line.content(), &format);
-                            max_chars = max_chars.max(text.chars().count());
-                            made.lines.push(DiffLine { origin, old_no: line.old_lineno(), new_no: line.new_lineno(), text });
-                        }
-                    }
-                    _ => made.raw.extend_from_slice(line.content()),
-                }
-            }
-            hunks.push(made);
-        }
-        out.hunks = hunks;
+        let path = std::path::Path::new(&target.path);
+        let patch = |context: u32| {
+            let mut opts = DiffOptions::new();
+            opts.context_lines(context).ignore_whitespace(mode.ignore_whitespace);
+            let patch = git2::Patch::from_buffers(
+                old_text.as_bytes(),
+                Some(path),
+                new_text.as_bytes(),
+                Some(path),
+                Some(&mut opts),
+            )
+            .ok()?;
+            patch_lines(&patch, &format)
+        };
+        let lines = patch(CONTEXT)?;
+        out.hunks = lines.hunks;
         out.binary = false;
-        out.truncated = shown >= MAX_LINES && additions + deletions > MAX_LINES;
-        (out.additions, out.deletions, out.max_chars) = (additions, deletions, max_chars);
+        out.truncated = lines.truncated;
+        (out.additions, out.deletions, out.max_chars) = (lines.additions, lines.deletions, lines.max_chars);
         out.format = format;
         out.file_header.clear();
+        if mode.whole_file && !out.hunks.is_empty() {
+            let whole = patch(WHOLE_FILE_CONTEXT)?;
+            let whole = FileDiff { hunks: whole.hunks, truncated: whole.truncated, max_chars: whole.max_chars, ..FileDiff::default() };
+            fill_gaps(out, whole);
+        }
         Some(())
     }
+}
+
+/// The lines of a patch made from two buffers, as the diff view takes them.
+struct PatchLines {
+    hunks: Vec<Hunk>,
+    additions: usize,
+    deletions: usize,
+    max_chars: usize,
+    truncated: bool,
+}
+
+fn patch_lines(patch: &git2::Patch, format: &text::Format) -> Option<PatchLines> {
+    let mut hunks = Vec::new();
+    let (mut additions, mut deletions, mut max_chars, mut shown) = (0, 0, 0, 0usize);
+    for h in 0..patch.num_hunks() {
+        let (hunk, count) = patch.hunk(h).ok()?;
+        let mut made =
+            Hunk { header: lossy(hunk.header()).trim_end().to_owned(), lines: Vec::new(), raw: hunk.header().to_vec(), gap: false };
+        for l in 0..count {
+            let line = patch.line_in_hunk(h, l).ok()?;
+            let origin = line.origin();
+            match origin {
+                ' ' | '+' | '-' => {
+                    made.raw.push(origin as u8);
+                    made.raw.extend_from_slice(line.content());
+                    match origin {
+                        '+' => additions += 1,
+                        '-' => deletions += 1,
+                        _ => {}
+                    }
+                    if shown < MAX_LINES {
+                        shown += 1;
+                        let text = display_text_in(line.content(), format);
+                        max_chars = max_chars.max(text.chars().count());
+                        made.lines.push(DiffLine { origin, old_no: line.old_lineno(), new_no: line.new_lineno(), text });
+                    }
+                }
+                _ => made.raw.extend_from_slice(line.content()),
+            }
+        }
+        hunks.push(made);
+    }
+    let lines: usize = hunks.iter().map(|hunk| split_hunk(&hunk.raw).map_or(0, |(_, lines)| lines.len())).sum();
+    Some(PatchLines { hunks, additions, deletions, max_chars, truncated: lines > shown })
+}
+
+// ---- the whole file -----------------------------------------------------------------
+
+/// Puts the unchanged lines between the hunks of `out` back, from `whole`:
+/// the same diff worked out with a context that takes in the whole file.
+/// When the file is too long to show whole, `out` keeps only its hunks and
+/// says so; if the two diffs do not line up (they should), it keeps them
+/// without a word.
+fn fill_gaps(out: &mut FileDiff, whole: FileDiff) {
+    if whole.truncated {
+        out.too_long_for_whole_file = true;
+        return;
+    }
+    let [all] = whole.hunks.as_slice() else { return };
+    if with_gaps(&mut out.hunks, all) {
+        out.max_chars = out.max_chars.max(whole.max_chars);
+    }
+}
+
+/// Interleaves `hunks` with `gap` hunks holding the lines of `all` (one
+/// hunk with every line of the file) that are in none of them. The lines of
+/// each hunk are a run of the lines of `all`, found by their numbers; false,
+/// with `hunks` as they were, if one is not there.
+fn with_gaps(hunks: &mut Vec<Hunk>, all: &Hunk) -> bool {
+    let Some((_, raw)) = split_hunk(&all.raw) else { return false };
+    if raw.len() != all.lines.len() {
+        return false;
+    }
+    let same = |a: &DiffLine, b: &DiffLine| {
+        (a.origin, a.old_no, a.new_no) == (b.origin, b.old_no, b.new_no) && a.text == b.text
+    };
+
+    // Where each hunk starts among all the lines, checked before anything
+    // is changed.
+    let mut starts = Vec::with_capacity(hunks.len());
+    let mut at = 0;
+    for hunk in hunks.iter() {
+        let Some(first) = hunk.lines.first() else { return false };
+        let Some(start) = all.lines[at..].iter().position(|line| same(line, first)) else { return false };
+        let start = at + start;
+        let end = start + hunk.lines.len();
+        if end > all.lines.len() || !all.lines[start..end].iter().zip(&hunk.lines).all(|(a, b)| same(a, b)) {
+            return false;
+        }
+        starts.push(start);
+        at = end;
+    }
+
+    let gap = |from: usize, to: usize| {
+        // The lines as context, without a header, for copying.
+        let mut bytes = b"\n".to_vec();
+        for line in &raw[from..to] {
+            bytes.push(b' ');
+            bytes.extend_from_slice(line.body);
+            bytes.push(b'\n');
+            if !line.eol {
+                bytes.extend_from_slice(NO_EOL_MARKER);
+            }
+        }
+        Hunk { header: String::new(), lines: all.lines[from..to].to_vec(), raw: bytes, gap: true }
+    };
+    let mut out = Vec::with_capacity(hunks.len() * 2 + 1);
+    let mut at = 0;
+    for (hunk, start) in std::mem::take(hunks).into_iter().zip(starts) {
+        if start > at {
+            out.push(gap(at, start));
+        }
+        at = start + hunk.lines.len();
+        out.push(hunk);
+    }
+    if at < all.lines.len() {
+        out.push(gap(at, all.lines.len()));
+    }
+    *hunks = out;
+    true
 }
 
 // ---- line-level patches -----------------------------------------------------
@@ -415,6 +617,10 @@ impl FileDiff {
             rest = tail;
 
             let hunk = self.hunks.get(h)?;
+            // The unchanged lines of a whole-file view have nothing to apply.
+            if hunk.gap {
+                continue;
+            }
             let (header, lines) = split_hunk(&hunk.raw)?;
             let (old_start, new_start) = hunk_starts(header)?;
             let is_picked = |i: usize| picked.binary_search(&(h, i)).is_ok();
@@ -1084,5 +1290,224 @@ mod tests {
             git(&fx.dir, &["add", "f.txt"]);
             fx.commit_all("next");
         }
+    }
+
+    // ---- modes ------------------------------------------------------------------
+
+    use super::Mode;
+
+    const WHOLE: Mode = Mode { whole_file: true, ignore_whitespace: false };
+    const NO_SPACE: Mode = Mode { whole_file: false, ignore_whitespace: true };
+
+    fn diff_in(fx: &Fixture, source: crate::git::DiffSource, path: &str, mode: Mode) -> FileDiff {
+        let target = DiffTarget { source, path: path.to_owned(), old_path: None };
+        fx.job(move |loader| loader.diff_with(&target, mode)).expect("diff ok")
+    }
+
+    /// One side of a diff as text: the old file (`'-'`) or the new (`'+'`).
+    fn side(diff: &FileDiff, keep: char) -> String {
+        diff.hunks
+            .iter()
+            .flat_map(|h| h.lines.iter())
+            .filter(|l| l.origin == ' ' || l.origin == keep)
+            .map(|l| format!("{}\n", l.text))
+            .collect()
+    }
+
+    fn numbered(lines: std::ops::RangeInclusive<usize>) -> String {
+        lines.map(|i| format!("line {i}\n")).collect()
+    }
+
+    fn head(fx: &Fixture) -> crate::git::Oid {
+        crate::git::Oid::from_str(&git(&fx.dir, &["rev-parse", "HEAD"])).unwrap()
+    }
+
+    #[test]
+    fn the_whole_file_comes_with_its_hunks_unchanged_between_the_gaps() {
+        let fx = Fixture::new("diff-whole-file");
+        let original = numbered(1..=40);
+        fx.write("f.txt", &original);
+        fx.commit_all("base");
+        let edited = original.replace("line 6\n", "line six\n").replace("line 30\n", "line 30\nadded\n");
+        fx.write("f.txt", &edited);
+
+        let hunks = diff_in(&fx, Unstaged, "f.txt", Mode::default());
+        let whole = diff_in(&fx, Unstaged, "f.txt", WHOLE);
+        assert_eq!(hunks.hunks.len(), 2);
+        assert_eq!((whole.mode, whole.too_long_for_whole_file), (WHOLE, false));
+        // Gap, hunk, gap, hunk, gap: every line of both versions, in order.
+        let gaps: Vec<bool> = whole.hunks.iter().map(|h| h.gap).collect();
+        assert_eq!(gaps, [true, false, true, false, true]);
+        assert_eq!(side(&whole, '-'), original);
+        assert_eq!(side(&whole, '+'), edited);
+        assert_eq!(changes(&whole), changes(&hunks));
+        assert_eq!((whole.additions, whole.deletions), (2, 1));
+        // Line numbers run on through the gaps, shifted after an insertion.
+        let last = whole.hunks.last().unwrap().lines.last().unwrap();
+        assert_eq!((last.old_no, last.new_no, last.text.as_str()), (Some(40), Some(41), "line 40"));
+
+        // The hunks are those of the usual diff, byte for byte, so either can
+        // be staged on its own; the gaps have nothing to stage.
+        let real: Vec<&Vec<u8>> = whole.hunks.iter().filter(|h| !h.gap).map(|h| &h.raw).collect();
+        assert_eq!(real, hunks.hunks.iter().map(|h| &h.raw).collect::<Vec<_>>());
+        assert!(whole.hunk_patch(0).is_none() && whole.hunk_patch(2).is_none());
+        assert!(whole.lines_patch(&[(0, 0), (2, 1)], Forward).is_none());
+        fx.run(ops::apply_patch("Stage hunk", whole.hunk_patch(3).unwrap(), true, false));
+        assert_eq!(index(&fx, "f.txt"), original.replace("line 30\n", "line 30\nadded\n"));
+        // Lines picked in the whole file stage as they do in the hunks.
+        let whole = diff_in(&fx, Unstaged, "f.txt", WHOLE);
+        let picked = pick(&whole, &[('+', "line six")]);
+        fx.run(ops::apply_patch("Stage lines", whole.lines_patch(&picked, Forward).unwrap(), true, false));
+        assert_eq!(
+            index(&fx, "f.txt"),
+            original.replace("line 6\n", "line 6\nline six\n").replace("line 30\n", "line 30\nadded\n")
+        );
+
+        // A gap's lines copy as they are in the file, the last one without
+        // the newline it lacks.
+        fx.write("tail.txt", "a\n\tb\nc\nd\ne\nf\ng\nh");
+        fx.commit_all("tail");
+        fx.write("tail.txt", "A\n\tb\nc\nd\ne\nf\ng\nh");
+        let whole = diff_in(&fx, Unstaged, "tail.txt", WHOLE);
+        let gap = whole.hunks.last().unwrap();
+        assert!(gap.gap);
+        assert_eq!(gap.sources(Encoding::Utf8).unwrap(), ["e", "f", "g", "h"]);
+        assert_eq!(whole.hunks[0].sources(Encoding::Utf8).unwrap()[2], "\tb");
+
+        // Committed diffs and new files: a new file is one hunk already.
+        fx.commit_all("more");
+        let committed = diff_in(&fx, Commit(head(&fx)), "tail.txt", WHOLE);
+        assert_eq!(side(&committed, '+'), "A\n    b\nc\nd\ne\nf\ng\nh\n");
+        fx.write("new.txt", "x\ny\n");
+        let new = diff_in(&fx, Unstaged, "new.txt", WHOLE);
+        assert_eq!((new.hunks.len(), new.hunks[0].gap), (1, false));
+        // A file whose hunk takes in every line has no gaps.
+        fx.write("small.txt", "1\n2\n3\n");
+        fx.commit_all("small");
+        fx.write("small.txt", "1\nTWO\n3\n");
+        assert_eq!(diff_in(&fx, Unstaged, "small.txt", WHOLE).hunks.len(), 1);
+    }
+
+    #[test]
+    fn a_file_too_long_to_show_whole_keeps_its_hunks() {
+        let fx = Fixture::new("diff-whole-too-long");
+        let original = numbered(1..=super::MAX_LINES + 10);
+        fx.write("big.txt", &original);
+        fx.commit_all("base");
+        fx.write("big.txt", &original.replace("line 20\n", "line twenty\n"));
+        let diff = diff_in(&fx, Unstaged, "big.txt", WHOLE);
+        assert!(diff.too_long_for_whole_file && !diff.truncated);
+        assert_eq!(diff.hunks.len(), 1);
+        assert!(!diff.hunks[0].gap);
+        assert_eq!(changes(&diff), owned(&[('-', "line 20"), ('+', "line twenty")]));
+    }
+
+    #[test]
+    fn utf16_files_can_be_shown_whole() {
+        let fx = Fixture::new("diff-whole-utf16");
+        let utf16 = |text: &str| FileEncoding { encoding: Encoding::Utf16Le, bom: true }.encode(text);
+        let original = numbered(1..=12);
+        std::fs::write(fx.dir.join("notes.txt"), utf16(&original)).unwrap();
+        fx.commit_all("notes");
+        std::fs::write(fx.dir.join("notes.txt"), utf16(&original.replace("line 9\n", "line nine\n"))).unwrap();
+        let diff = diff_in(&fx, Unstaged, "notes.txt", WHOLE);
+        assert!(!diff.binary);
+        assert_eq!(diff.hunks.iter().map(|h| h.gap).collect::<Vec<_>>(), [true, false]);
+        assert_eq!(side(&diff, '-'), original);
+    }
+
+    #[test]
+    fn ignoring_whitespace_hides_indentation_and_shows_real_changes() {
+        let fx = Fixture::new("diff-ignore-space");
+        let original = "fn main() {\nfoo();\nbar();\n}\n".to_owned() + &numbered(1..=20);
+        fx.write("src file.rs", &original);
+        fx.write("eol.txt", "a\r\nb\r\n");
+        fx.commit_all("base");
+        // Indented, and one real change far enough away for a hunk of its own.
+        let edited = original
+            .replace("foo();\nbar();\n", "    foo();\n\tbar();  \n")
+            .replace("line 18\n", "line eighteen\n");
+        fx.write("src file.rs", &edited);
+        fx.write("eol.txt", "a\nb\n");
+
+        let all = diff_in(&fx, Unstaged, "src file.rs", Mode::default());
+        assert_eq!(all.hunks.len(), 2);
+        let ignored = diff_in(&fx, Unstaged, "src file.rs", NO_SPACE);
+        assert_eq!(ignored.mode, NO_SPACE);
+        assert_eq!(changes(&ignored), owned(&[('-', "line 18"), ('+', "line eighteen")]));
+        assert_eq!((ignored.additions, ignored.deletions, ignored.only_whitespace), (1, 1, false));
+
+        // With the whole file: the indented lines are context now.
+        let whole = diff_in(&fx, Unstaged, "src file.rs", Mode { whole_file: true, ignore_whitespace: true });
+        assert_eq!(changes(&whole), changes(&ignored));
+        assert_eq!(whole.hunks.iter().flat_map(|h| &h.lines).count(), 25);
+
+        // Only whitespace changed: nothing to show, and the diff says why.
+        let eol = diff_in(&fx, Unstaged, "eol.txt", NO_SPACE);
+        assert!(eol.hunks.is_empty() && eol.only_whitespace);
+        assert_eq!(eol.kind, Some(ChangeKind::Modified));
+        assert!(!diff_in(&fx, Unstaged, "eol.txt", Mode::default()).only_whitespace);
+
+        // Staged and committed diffs ignore it the same way.
+        git(&fx.dir, &["add", "-A"]);
+        assert_eq!(changes(&diff_in(&fx, Staged, "src file.rs", NO_SPACE)), changes(&ignored));
+        fx.commit_all("indent");
+        assert_eq!(changes(&diff_in(&fx, Commit(head(&fx)), "src file.rs", NO_SPACE)), changes(&ignored));
+        assert!(diff_in(&fx, Commit(head(&fx)), "eol.txt", NO_SPACE).only_whitespace);
+    }
+
+    #[test]
+    fn the_answer_carries_the_mode_it_was_asked_for() {
+        let fx = Fixture::new("diff-mode-request");
+        fx.write("f.txt", "one\ntwo\n");
+        fx.commit_all("base");
+        fx.write("f.txt", "one\n  two\n");
+        let target = DiffTarget { source: Unstaged, path: "f.txt".to_owned(), old_path: None };
+        for mode in [NO_SPACE, Mode::default(), WHOLE] {
+            fx.handle.diff_with(target.clone(), mode);
+            let diff = loop {
+                match fx.handle.rx.recv_timeout(TIMEOUT).expect("diff arrives") {
+                    Response::Diff(t, result) if t == target => break result.expect("diff ok"),
+                    _ => {}
+                }
+            };
+            assert_eq!(diff.mode, mode);
+            assert_eq!(diff.hunks.is_empty(), mode.ignore_whitespace);
+        }
+    }
+
+    #[test]
+    fn gaps_are_only_filled_when_the_hunks_line_up() {
+        use crate::git::{DiffLine, Hunk};
+        let line = |origin: char, old: u32, new: u32, text: &str| DiffLine {
+            origin,
+            old_no: (origin != '+').then_some(old),
+            new_no: (origin != '-').then_some(new),
+            text: text.to_owned(),
+        };
+        let raw = |lines: &[DiffLine]| {
+            let mut raw = b"@@ -1 +1 @@\n".to_vec();
+            for l in lines {
+                raw.push(l.origin as u8);
+                raw.extend_from_slice(l.text.as_bytes());
+                raw.push(b'\n');
+            }
+            raw
+        };
+        let lines = vec![line(' ', 1, 1, "a"), line('-', 2, 0, "b"), line('+', 0, 2, "B"), line(' ', 3, 3, "c")];
+        let all = Hunk { raw: raw(&lines), lines: lines.clone(), ..Hunk::default() };
+        let hunk = |lines: &[DiffLine]| Hunk { header: "@@".to_owned(), raw: raw(lines), lines: lines.to_vec(), gap: false };
+
+        let mut hunks = vec![hunk(&lines[1..3])];
+        assert!(super::with_gaps(&mut hunks, &all));
+        let shape: Vec<(bool, usize)> = hunks.iter().map(|h| (h.gap, h.lines.len())).collect();
+        assert_eq!(shape, [(true, 1), (false, 2), (true, 1)]);
+        assert_eq!(hunks[2].sources(Encoding::Utf8).unwrap(), ["c"]);
+
+        // A hunk whose lines are not among them leaves the hunks alone.
+        let mut stray = vec![hunk(&[line('+', 0, 2, "X")])];
+        assert!(!super::with_gaps(&mut stray, &all));
+        assert_eq!(stray.len(), 1);
+        assert!(!stray[0].gap);
     }
 }

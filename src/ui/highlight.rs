@@ -10,7 +10,8 @@
 //!
 //! A hunk is all the parser gets to see, so it starts every hunk in the
 //! syntax's initial state: a hunk that begins inside a block comment or a
-//! multi-line string is coloured as if it did not. The old side (context and
+//! multi-line string is coloured as if it did not. (The unchanged stretches
+//! of a whole-file diff are hunks of their own, `Hunk::gap`.) The old side (context and
 //! removed lines) and the new side (context and added lines) are parsed as
 //! two separate streams, so a string opened on a removed line cannot leak
 //! into the added lines after it.
@@ -939,6 +940,32 @@ fn emphasize_hunk(hunk: &Hunk) -> Vec<Stretch> {
     out
 }
 
+/// Which of the removed lines `old` and the added lines `new` that follow
+/// them are versions of each other, when their numbers differ: the pairs
+/// that word emphasis compares, in order on both sides. `None` when the
+/// block is too large to compare every line with every other.
+///
+/// Lines that read the same (they differ in their line ending, or in the
+/// newline at the end of the file) pair best of all, where emphasis leaves
+/// them out for having nothing to mark.
+pub fn similar_pairs(old: &[DiffLine], new: &[DiffLine]) -> Option<Vec<(usize, usize)>> {
+    if old.len() * new.len() > MAX_PAIRING_CELLS {
+        return None;
+    }
+    let m = new.len();
+    let mut gains: Vec<Option<f32>> = Vec::with_capacity(old.len() * m);
+    for removed in old {
+        for added in new {
+            gains.push(if removed.text == added.text {
+                Some(1.0)
+            } else {
+                emphasize(&removed.text, &added.text).map(|c| c.similarity).filter(|s| *s >= 0.5)
+            });
+        }
+    }
+    Some(best_pairs(old.len(), m, |i, j| gains[i * m + j]))
+}
+
 /// Pairs removed with added lines when their numbers differ (one line became
 /// two, a line was edited and another added after it): the pairing that
 /// keeps the order of both sides and has the most in common overall, using
@@ -952,7 +979,13 @@ fn pair_by_similarity(old: &[DiffLine], new: &[DiffLine]) -> Vec<(usize, usize, 
         }
     }
     let gain = |i: usize, j: usize| changes[i * m + j].as_ref().map(|c| c.similarity);
+    let picked = best_pairs(n, m, gain);
+    picked.into_iter().filter_map(|(i, j)| Some((i, j, changes[i * m + j].take()?))).collect()
+}
 
+/// The pairs `(i, j)` of `n` old and `m` new lines, ascending in both, with
+/// the most `gain` in total; `gain` is `None` for lines that must not pair.
+fn best_pairs(n: usize, m: usize, gain: impl Fn(usize, usize) -> Option<f32>) -> Vec<(usize, usize)> {
     // best[i][j]: the most that pairing old[i..] with new[j..] can gain.
     let width = m + 1;
     let mut best = vec![0f32; (n + 1) * width];
@@ -977,7 +1010,7 @@ fn pair_by_similarity(old: &[DiffLine], new: &[DiffLine]) -> Vec<(usize, usize, 
             j += 1;
         }
     }
-    picked.into_iter().filter_map(|(i, j)| Some((i, j, changes[i * m + j].take()?))).collect()
+    picked
 }
 
 /// What differs between a removed line and the added line that replaces it.
@@ -1139,6 +1172,7 @@ mod tests {
                 .iter()
                 .map(|(origin, text)| DiffLine { origin: *origin, old_no: None, new_no: None, text: (*text).to_owned() })
                 .collect(),
+            gap: false,
         }
     }
 

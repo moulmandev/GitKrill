@@ -471,9 +471,23 @@ impl HistoryView {
             && slot.reloaded_for != generation
         {
             slot.reloaded_for = generation;
+            let (token, target, mode) = (next_token(), target.clone(), crate::git::diff::mode());
+            slot.token = token;
+            tab.spawn_job(DIFF_KEY, move |loader| DiffLoaded { token, result: loader.diff_with(&target, mode) });
+        }
+
+        // Worked out in another mode than the one now set (whole file,
+        // whitespace): read again, and show none of it meanwhile.
+        let mode = crate::git::diff::mode();
+        if let (Some(Ok(diff)), Some(target)) = (&slot.data, &slot.target)
+            && diff.mode != mode
+        {
             let (token, target) = (next_token(), target.clone());
             slot.token = token;
-            tab.spawn_job(DIFF_KEY, move |loader| DiffLoaded { token, result: loader.diff(&target) });
+            slot.data = None;
+            slot.previous = None;
+            slot.requested = Some(Instant::now());
+            tab.spawn_job(DIFF_KEY, move |loader| DiffLoaded { token, result: loader.diff_with(&target, mode) });
         }
     }
 
@@ -511,7 +525,8 @@ impl HistoryView {
         slot.target = Some(target.clone());
         slot.data = None;
         slot.requested = Some(Instant::now());
-        tab.spawn_job(DIFF_KEY, move |loader| DiffLoaded { token, result: loader.diff(&target) });
+        let mode = crate::git::diff::mode();
+        tab.spawn_job(DIFF_KEY, move |loader| DiffLoaded { token, result: loader.diff_with(&target, mode) });
     }
 }
 
@@ -856,6 +871,9 @@ fn history_detail(
             {
                 *action = Some(Action::BlameAt(commit.oid, commit.path.clone()));
             }
+            // How the diff is shown, as in the diff view's title bar.
+            ui.add_space(4.0);
+            crate::ui::diff_mode::controls(ui, &mut shared.settings.editor, true);
             buttons_left = ui.min_rect().left();
         },
     );
@@ -910,7 +928,7 @@ fn history_detail(
             Some(images) => crate::ui::image_diff::show(ui, images),
             None => widgets::placeholder(ui, "Binary file - no text diff to show"),
         },
-        Some((_, diff)) if diff.hunks.is_empty() => {
+        Some((_, diff)) if diff.hunks.is_empty() && !diff.only_whitespace => {
             widgets::placeholder(ui, "No content changes (the file mode or name changed)")
         }
         Some((target, diff)) => {

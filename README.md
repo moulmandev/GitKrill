@@ -126,6 +126,13 @@ be installed.
 - Unstaged / staged lists as paths or a folder tree
 - Stage, unstage and discard files, folders, hunks or individual lines
 - Syntax-highlighted diffs with word-level emphasis of what changed
+- Diffs inline or side by side (the old version on the left, the new one on
+  the right, unchanged lines level), as the changed hunks or the whole file,
+  and with or without whitespace changes (`git diff -w`): switches in the
+  diff's title bar, the file history, the command palette and **Preferences >
+  Editor**, remembered across restarts. Hunks and lines stage from either
+  side and from the whole file; while whitespace is ignored only whole files
+  do, since such a diff does not match the files byte for byte
 - Diffs, blame and the conflict resolver in the font, size and tab width you
   pick (**Preferences > Editor**: any installed font, monospace ones listed
   first), with or without line numbers, syntax colours and word wrap
@@ -402,6 +409,9 @@ build.rs         the Windows executable's icon and version details
   width instead of the tab size set in Preferences > Editor
 - UTF-16 files cannot be blamed, and their diffs are for reading only (no
   staging of hunks or lines)
+- Syntax colours start afresh at every hunk, which shows most in the
+  whole-file view: a block comment or string that runs across the start of
+  a hunk is coloured as if it did not
 - Syntax grammars are syntect's bundled set: TypeScript is coloured as
   JavaScript, and Kotlin, Swift, Dart and PowerShell stay plain
 - SSH and GPG keys with a passphrase need an agent that already holds them

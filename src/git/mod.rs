@@ -300,13 +300,18 @@ pub struct DiffLine {
     pub text: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Hunk {
     pub header: String,
     pub lines: Vec<DiffLine>,
     /// The exact patch bytes of this hunk (header included), so a single hunk
     /// can be fed back to `git apply`.
     pub raw: Vec<u8>,
+    /// Not a hunk of the patch but the unchanged lines between two of them,
+    /// shown when the whole file is (`diff::Mode::whole_file`). It has no
+    /// header, and nothing in it can be staged; `raw` holds its lines as
+    /// context, for copying.
+    pub gap: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -326,13 +331,21 @@ pub struct FileDiff {
     pub images: Option<std::sync::Arc<picture::ImageDiff>>,
     /// The encoding and tab width the lines were prepared with.
     pub format: text::Format,
+    /// How the diff was asked to be worked out.
+    pub mode: diff::Mode,
+    /// With whitespace ignored nothing is left, though the file's whitespace
+    /// changed.
+    pub only_whitespace: bool,
+    /// The whole file was asked for, but it is too long to show: only the
+    /// hunks are there.
+    pub too_long_for_whole_file: bool,
 }
 
 impl FileDiff {
     /// A standalone patch containing only hunk `i`.
     pub fn hunk_patch(&self, i: usize) -> Option<Vec<u8>> {
         let hunk = self.hunks.get(i)?;
-        if self.file_header.is_empty() {
+        if self.file_header.is_empty() || hunk.gap {
             return None;
         }
         let mut out = self.file_header.clone();

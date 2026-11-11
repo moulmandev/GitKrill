@@ -28,7 +28,7 @@ type Job = Box<dyn FnOnce(&Loader) -> Box<dyn Any + Send> + Send>;
 enum Request {
     Refresh,
     Job { key: String, job: Job },
-    Diff(DiffTarget),
+    Diff(DiffTarget, crate::git::diff::Mode),
     Details { oid: Oid, is_stash: bool },
 }
 
@@ -117,8 +117,14 @@ impl RepoHandle {
         *self.hidden.lock().unwrap_or_else(|e| e.into_inner()) = hidden;
     }
 
+    /// Loads a diff as the diff view shows it now: in the mode set in
+    /// Preferences > Editor, which the answer carries (`FileDiff::mode`).
     pub fn diff(&self, target: DiffTarget) {
-        let _ = self.req_tx.send(Request::Diff(target));
+        self.diff_with(target, crate::git::diff::mode());
+    }
+
+    pub fn diff_with(&self, target: DiffTarget, mode: crate::git::diff::Mode) {
+        let _ = self.req_tx.send(Request::Diff(target, mode));
     }
 
     pub fn details(&self, oid: Oid, is_stash: bool) {
@@ -173,7 +179,7 @@ fn reader(
         while let Some(req) = next {
             match req {
                 Request::Refresh => refresh = true,
-                Request::Diff(target) => diff = Some(target),
+                Request::Diff(target, mode) => diff = Some((target, mode)),
                 Request::Details { oid, is_stash } => details = Some((oid, is_stash)),
                 Request::Job { key, job } => jobs.push((key, job)),
             }
@@ -181,8 +187,8 @@ fn reader(
         }
 
         // Cheap, user-visible answers first.
-        if let Some(target) = diff {
-            let result = loader.diff(&target).map(Arc::new);
+        if let Some((target, mode)) = diff {
+            let result = loader.diff_with(&target, mode).map(Arc::new);
             let _ = res_tx.send(Response::Diff(target, result));
             ctx.request_repaint();
         }
