@@ -511,6 +511,35 @@ pub fn shown_with(source: &str, tab_width: usize) -> String {
     out
 }
 
+/// One character of a source line and where it is in [`shown_with`]'s text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShownChar {
+    /// Its bytes in the source; for the `…` of a cut line, everything left.
+    pub source: Range<usize>,
+    /// Its bytes in the shown text: the spaces of a tab, the `·` of a
+    /// control character.
+    pub shown: Range<usize>,
+    pub columns: Range<usize>,
+}
+
+/// Where each character of `source` lands in the shown text, in order, with
+/// tab stops every `tab_width` columns: the way between the file's text and
+/// what is shown, for an editor working on the former laid out as the latter.
+pub fn shown_chars(source: &str, tab_width: usize) -> impl Iterator<Item = ShownChar> + '_ {
+    let mut at = 0;
+    pieces(source, tab_width).map(move |piece| {
+        let len = match piece.look {
+            Look::Plain(c) => c.len_utf8(),
+            Look::Tab => piece.columns.len(),
+            Look::Dot => '·'.len_utf8(),
+            Look::Cut => '…'.len_utf8(),
+        };
+        let shown = at..at + len;
+        at += len;
+        ShownChar { source: piece.bytes, shown, columns: piece.columns }
+    })
+}
+
 /// The part of `source` that shows in `columns`, with the tab width in
 /// effect. A character is included when any of its columns is (a tab spans
 /// several); the `…` of a cut line stands for the rest of it.
@@ -603,6 +632,23 @@ mod tests {
         assert_eq!(source_range_with("a\tbc", 7..9, 8), "\tb");
         let format = Format { encoding: Encoding::Utf8, tab_width: 8, generation: 0 };
         assert_eq!(display_text_in(b"\tx\n", &format), "        x");
+    }
+
+    #[test]
+    fn each_character_knows_where_it_is_shown() {
+        let source = "a\t\u{e9}\u{7}b";
+        let shown = shown_with(source, 4);
+        assert_eq!(shown, "a   \u{e9}·b");
+        let chars: Vec<ShownChar> = shown_chars(source, 4).collect();
+        let at = |source: Range<usize>, shown: Range<usize>, columns: Range<usize>| ShownChar { source, shown, columns };
+        assert_eq!(
+            chars,
+            [at(0..1, 0..1, 0..1), at(1..2, 1..4, 1..4), at(2..4, 4..6, 4..5), at(4..5, 6..8, 5..6), at(5..6, 8..9, 6..7)]
+        );
+        // The shown bytes line up with the shown text.
+        assert!(chars.iter().all(|c| shown.is_char_boundary(c.shown.start) && shown.is_char_boundary(c.shown.end)));
+        assert_eq!(&shown[chars[2].shown.clone()], "\u{e9}");
+        assert_eq!(shown_chars("", 4).count(), 0);
     }
 
     #[test]

@@ -1,5 +1,5 @@
 //! Selecting and copying text in the views that paint code themselves: the
-//! diff and blame.
+//! diff, blame and the conflict resolver.
 //!
 //! egui selects text only inside its own labels, and these views lay out
 //! only the rows in view, so they do it here instead, the way a code
@@ -312,6 +312,24 @@ impl Selection {
         lines: &dyn Lines,
         hit: impl Fn(Pos2) -> Pos,
     ) -> Response {
+        let scroll = |by: Vec2| ui.scroll_with_delta_animation(-by, ScrollAnimation::none());
+        self.interact_scrolling(ui, id, rect, view, lines, hit, scroll)
+    }
+
+    /// [`Selection::interact`] for a view that scrolls itself rather than
+    /// sit in a `ScrollArea`: `scroll` is told how far to move the view's
+    /// offset when a drag goes past the edge of the text.
+    #[allow(clippy::too_many_arguments)]
+    pub fn interact_scrolling(
+        &mut self,
+        ui: &Ui,
+        id: Id,
+        rect: Rect,
+        view: Rect,
+        lines: &dyn Lines,
+        hit: impl Fn(Pos2) -> Pos,
+        mut scroll: impl FnMut(Vec2),
+    ) -> Response {
         let ctx = ui.ctx().clone();
         let response = ui.interact(rect, id, Sense::click_and_drag()).on_hover_cursor(CursorIcon::Text);
 
@@ -373,7 +391,7 @@ impl Selection {
                 let out = Vec2::new(past(at.x, rect.left(), rect.right()), past(at.y, rect.top(), rect.bottom()));
                 if out != Vec2::ZERO {
                     let dt = ui.input(|i| i.stable_dt).min(0.05);
-                    ui.scroll_with_delta_animation(-out * AUTO_SCROLL * dt, ScrollAnimation::none());
+                    scroll(out * AUTO_SCROLL * dt);
                     ctx.request_repaint();
                 }
                 self.drag_to(hit(at), lines);

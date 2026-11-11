@@ -133,9 +133,17 @@ front, and the global and repository git configuration files.
   a `Painter` for drawing; `widgets.rs` has the shared pieces (`row_background`,
   `elided`, `tint_button`, `icon_button`, `spinner`, `menu_item`, ...).
 - Custom-painted text gets editor-style selection and copying from
-  `ui/textsel.rs` (diff and blame use it): describe the text as `Lines`, call
-  `Selection::interact` with a function from screen point to text position,
-  and `Selection::paint` behind each row's text.
+  `ui/textsel.rs` (diff, blame and the conflict resolver use it): describe the
+  text as `Lines`, call `Selection::interact` with a function from screen
+  point to text position, and `Selection::paint` behind each row's text. A
+  view that scrolls itself instead of sitting in a `ScrollArea` calls
+  `Selection::interact_scrolling` and moves its offset when a drag runs past
+  the edge.
+- A `TextEdit` over painted code (the conflict resolver's result editor)
+  lays its text out with `ui::conflict_text::editor_job`: tabs at the tab
+  stops of the shown text, colours from the highlighter's spans of the shown
+  line (`source_spans` maps them onto the file's text, `git::text::
+  shown_chars` is the way between the two).
 - Comments say what the code does or why, for a reader who was not there when
   it was written.
 - Strings from git may not be UTF-8: use the `*_bytes()` accessors with

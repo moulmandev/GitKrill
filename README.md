@@ -139,10 +139,10 @@ be installed.
 - Image previews for PNG, JPEG, GIF, BMP, WebP and ICO: before and after
   side by side, a swipe between them, or an onion skin, with sizes and
   dimensions; tiny icons are enlarged with sharp pixels
-- Select and copy text in diffs and blame as in an editor: drag, double-click
-  a word, triple-click a line, Shift+click to extend. Copies leave out line
-  numbers and +/- markers and keep tabs as tabs; picking lines to stage is
-  done in the line-number gutter
+- Select and copy text in diffs, blame and the conflict resolver as in an
+  editor: drag, double-click a word, triple-click a line, Shift+click to
+  extend. Copies leave out line numbers and +/- markers and keep tabs as
+  tabs; picking lines to stage is done in the line-number gutter
 - Commit, amend, and "stage all and commit" in one click (`Ctrl+Enter`); the
   button's menu also commits and pushes, or commits and opens a pull request,
   and Preferences > Commit picks which of these the button does
@@ -164,7 +164,18 @@ be installed.
 **Conflicts**
 - Merge, rebase, cherry-pick or revert in progress: Continue and Abort
 - A resolver for conflicted files: current and incoming side by side, take
-  either or both per conflict, edit the result by hand, save and mark resolved
+  either or both per conflict (its box, or a click on its line numbers), edit
+  the result by hand, save and mark resolved
+- The common ancestor between the two sides when you want it (**Ancestor** in
+  the resolver's toolbar or the command palette, remembered): what the file
+  had before either side changed each conflict, and which commit that is (the
+  merge base, or the parent of the commit being picked or replayed); a file
+  both sides added says it has none
+- Syntax colours in every pane of the resolver and in its editor, tabs at the
+  tab size of Preferences > Editor, and word wrap (**Wrap** in the toolbar,
+  the same switch as Preferences > Editor) that keeps the panes level line by
+  line. Text in the sides and the ancestor can be selected and copied as in
+  diffs
 - Binary and delete/modify conflicts: keep one side or delete
 - Or hand a conflicted file to an external merge tool (`git mergetool`):
   the file counts as resolved once the tool has saved it
@@ -374,6 +385,7 @@ src/
     panel.rs     staging / details   files.rs    changed-file lists
     diff.rs      diff view           highlight.rs  syntax colours
     conflict.rs  conflict resolver   rebase.rs   interactive rebase
+    conflict_text.rs  the resolver's text: tabs, colours, its editor
     history.rs   file history, blame
     toolbar.rs   toolbar             dialogs.rs  modals and toasts
     gitflow.rs   Gitflow dialogs, menus and palette entries
@@ -403,10 +415,6 @@ build.rs         the Windows executable's icon and version details
   path (`example.com/gitlab`)
 - Interactive rebase refuses ranges that contain merge commits
 - File history and blame always start from HEAD
-- No ancestor pane or syntax colours in the conflict resolver, and text in
-  its two side panes cannot be selected (the result can, in its editor)
-- Long lines do not wrap in the conflict resolver, and its tabs keep a fixed
-  width instead of the tab size set in Preferences > Editor
 - UTF-16 files cannot be blamed, and their diffs are for reading only (no
   staging of hunks or lines)
 - Syntax colours start afresh at every hunk, which shows most in the

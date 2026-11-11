@@ -3,6 +3,7 @@
 pub mod branch_folder;
 pub mod commit_button;
 pub mod conflict;
+pub mod conflict_text;
 pub mod dialogs;
 pub mod diff;
 pub mod diff_mode;

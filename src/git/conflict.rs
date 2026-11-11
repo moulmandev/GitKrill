@@ -112,11 +112,6 @@ impl Chunk {
     pub fn text(&self) -> String {
         (0..self.len()).map(|i| self.line(i)).collect::<Vec<_>>().join("\n")
     }
-
-    /// Longest line in bytes, an upper bound for its width in characters.
-    pub fn longest_line(&self) -> usize {
-        (0..self.len()).map(|i| self.offset(i + 1) - self.offset(i)).max().unwrap_or(0)
-    }
 }
 
 fn strip_eol(line: &[u8]) -> &[u8] {
@@ -159,6 +154,7 @@ impl TextMerge {
     }
 
     /// What the common ancestor had in place of conflict number `index`.
+    #[cfg(test)]
     pub fn ancestor(&self, index: usize) -> Option<&Chunk> {
         match self.segments.get(*self.conflicts.get(index)?)? {
             Segment::Conflict { base, .. } => Some(base),
