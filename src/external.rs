@@ -688,6 +688,8 @@ pub enum Compare {
     /// A commit against its first parent; `None` for a first commit, which
     /// is compared with the empty tree.
     Commit { commit: String, parent: Option<String> },
+    /// A commit against the working tree (`git difftool <commit>`).
+    WorkingTree { commit: String },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -877,6 +879,7 @@ fn diff_args(
             };
             args.extend([base, commit.clone()]);
         }
+        Compare::WorkingTree { commit } => args.push(commit.clone()),
     }
     args.push("--".to_owned());
     args.extend(paths.iter().map(|path| (*path).to_owned()));
@@ -1326,6 +1329,7 @@ mod tests {
         let with = |rest: &[&str]| [head.clone(), strings(rest)].concat();
         assert_eq!(args(Compare::Unstaged, &["a.txt"], None), with(&["--", "a.txt"]));
         assert_eq!(args(Compare::Staged, &["a.txt"], None), with(&["--cached", "--", "a.txt"]));
+        assert_eq!(args(Compare::WorkingTree { commit: "c0ffee".into() }, &["a.txt"], None), with(&["c0ffee", "--", "a.txt"]));
         let commit = Compare::Commit { commit: "c0ffee".into(), parent: Some("beef".into()) };
         assert_eq!(args(commit, &["old.txt", "new.txt"], None), with(&["beef", "c0ffee", "--", "old.txt", "new.txt"]));
         let first = Compare::Commit { commit: "c0ffee".into(), parent: None };

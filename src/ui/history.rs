@@ -6,9 +6,11 @@
 //!   and shows what the selected one did to it.
 //! * **Blame** shows the file with the commit each run of lines comes from.
 //!
-//! Both look at the file as of HEAD by default. "Blame before this commit"
-//! and "Blame at this commit" move the view to an older commit (and possibly
-//! an older name of the file); Back returns.
+//! Both look at the file as of HEAD by default, or as of the commit they were
+//! opened from (`HistoryView::starting_at`: a file of a commit's lists or of
+//! a comparison). "Blame before this commit" and "Blame at this commit" move
+//! the view to an older commit (and possibly an older name of the file);
+//! Back returns, and "Go to HEAD" looks at HEAD instead.
 //!
 //! History pages and commit diffs are read by jobs on the reader thread, in
 //! slices short enough not to hold it up. Blame runs `git blame` on a thread
@@ -103,6 +105,12 @@ impl HistoryView {
             jump: None,
             list_width: 430.0,
         }
+    }
+
+    /// Starts at commit `at` instead of HEAD (`None` leaves it at HEAD).
+    pub fn starting_at(mut self, at: Option<Oid>) -> Self {
+        self.at = at;
+        self
     }
 
     /// Looks at another version of the file, remembering the current one.
@@ -201,9 +209,10 @@ fn title_bar(ui: &mut Ui, view: &mut HistoryView) -> bool {
         Mode::History => (icons::CLOCK_COUNTER_CLOCKWISE, "File history"),
         Mode::Blame => (icons::USER_LIST, "Blame"),
     };
-    let subtitle = match view.at {
-        Some(oid) => format!("{}   as of commit {}", view.path, short(oid)),
-        None => view.path.clone(),
+    let subtitle = match (view.at, view.mode) {
+        (Some(oid), Mode::History) => format!("{}   from commit {}", view.path, short(oid)),
+        (Some(oid), Mode::Blame) => format!("{}   as of commit {}", view.path, short(oid)),
+        (None, _) => view.path.clone(),
     };
     let (close, free) = widgets::overlay_bar(ui, icon, title, &subtitle);
 
@@ -217,6 +226,7 @@ fn title_bar(ui: &mut Ui, view: &mut HistoryView) -> bool {
     let patch = ui.painter().add(Shape::Noop);
     let mut blame = view.mode == Mode::Blame;
     let mut back = false;
+    let mut to_head = false;
     let used = ui
         .scope_builder(
             UiBuilder::new().max_rect(area).layout(Layout::right_to_left(Align::Center)),
@@ -234,6 +244,12 @@ fn title_bar(ui: &mut Ui, view: &mut HistoryView) -> bool {
                         .on_hover_text("Return to the version of the file shown before")
                         .clicked();
                 }
+                if let Some(oid) = view.at {
+                    let label = format!("{}  Go to HEAD", icons::ARROW_LINE_UP);
+                    to_head = tint_button(ui, &label, theme::accent())
+                        .on_hover_text(format!("Look at the file as of HEAD instead of commit {}", short(oid)))
+                        .clicked();
+                }
                 ui.min_rect()
             },
         )
@@ -244,6 +260,9 @@ fn title_bar(ui: &mut Ui, view: &mut HistoryView) -> bool {
     view.mode = if blame { Mode::Blame } else { Mode::History };
     if back {
         view.go_back();
+    } else if to_head {
+        let path = view.path.clone();
+        view.go_to(None, path);
     }
     close
 }

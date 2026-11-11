@@ -335,6 +335,9 @@ pub struct RepoTab {
     pub multi: crate::ui::multi::Multi,
     pub details: Option<Result<Arc<CommitDetails>, String>>,
     details_for: Option<Oid>,
+    /// Every file of the selected commit, when the details list them all
+    /// instead of the changed ones: `crate::ui::browse`.
+    pub browse: crate::ui::browse::Browse,
     pub diff: Option<DiffView>,
     pub overlay: Option<Overlay>,
     /// Finished [`RepoTab::spawn_job`] results, by key, until collected.
@@ -409,6 +412,7 @@ impl RepoTab {
             multi: Default::default(),
             details: None,
             details_for: None,
+            browse: Default::default(),
             diff: None,
             overlay: None,
             results: HashMap::new(),
@@ -790,7 +794,12 @@ impl RepoTab {
                 DiffSource::Staged if in_staged => Some(DiffSource::Staged),
                 DiffSource::Staged if in_unstaged => Some(DiffSource::Unstaged),
                 DiffSource::Unstaged | DiffSource::Staged => None,
-                committed @ (DiffSource::Commit(_) | DiffSource::Compare { .. }) => Some(committed),
+                committed @ (DiffSource::Commit(_) | DiffSource::Compare { .. } | DiffSource::At(_)) => Some(committed),
+                // Compared with the working tree, which may have changed.
+                DiffSource::WorkingTree { .. } => {
+                    reload = Some(view.target.clone());
+                    Some(view.target.source)
+                }
             };
             match source {
                 Some(source) => {

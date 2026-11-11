@@ -494,10 +494,43 @@ impl Loader {
         self.changed_files(Some(&from), &to)
     }
 
+    /// What `tip` adds on its own since it forked from `other`: their merge
+    /// base, and the files that differ from it to `tip` (git's
+    /// `other...tip`), whose diffs are `DiffSource::Compare { from: base,
+    /// to: tip }`.
+    pub fn forked_files(&self, other: Oid, tip: Oid) -> Result<(Oid, Vec<FileChange>), String> {
+        let base = self.repo.merge_base(other, tip).map_err(|e| match e.code() {
+            git2::ErrorCode::NotFound => format!(
+                "{} and {} have no commit in common: their histories never met.",
+                super::short(other),
+                super::short(tip)
+            ),
+            _ => err(e),
+        })?;
+        Ok((base, self.compare_files(base, tip)?))
+    }
+
+    /// The files that differ between commit `from` and the working tree:
+    /// staged and unstaged changes and untracked files, as `git diff
+    /// <from>` with untracked files added. Their diffs are
+    /// `DiffSource::WorkingTree { from }`.
+    pub fn working_tree_files(&self, from: Oid) -> Result<Vec<FileChange>, String> {
+        let tree = self.repo.find_commit(from).and_then(|c| c.tree()).map_err(err)?;
+        let mut opts = git2::DiffOptions::new();
+        opts.include_untracked(true).recurse_untracked_dirs(true);
+        let diff = self.repo.diff_tree_to_workdir_with_index(Some(&tree), Some(&mut opts)).map_err(err)?;
+        Ok(Self::files_of(diff))
+    }
+
     /// Files changed from `old` (none: an empty tree) to `new`, renames
     /// detected, sorted by path.
     fn changed_files(&self, old: Option<&git2::Tree<'_>>, new: &git2::Tree<'_>) -> Result<Vec<FileChange>, String> {
-        let mut diff = self.repo.diff_tree_to_tree(old, Some(new), None).map_err(err)?;
+        let diff = self.repo.diff_tree_to_tree(old, Some(new), None).map_err(err)?;
+        Ok(Self::files_of(diff))
+    }
+
+    /// The files of `diff`, renames detected, sorted by path.
+    fn files_of(mut diff: git2::Diff<'_>) -> Vec<FileChange> {
         let mut find = git2::DiffFindOptions::new();
         find.renames(true);
         let _ = diff.find_similar(Some(&mut find));
@@ -517,7 +550,7 @@ impl Loader {
             })
             .collect();
         files.sort_by(|a, b| a.path.cmp(&b.path));
-        Ok(files)
+        files
     }
 }
 

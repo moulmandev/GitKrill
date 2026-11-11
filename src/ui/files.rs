@@ -26,6 +26,8 @@ fn source_key(source: DiffSource) -> &'static str {
         DiffSource::Staged => "staged",
         DiffSource::Commit(_) => "commit",
         DiffSource::Compare { .. } => "compare",
+        DiffSource::WorkingTree { .. } => "working-tree",
+        DiffSource::At(_) => "at",
     }
 }
 
@@ -95,6 +97,7 @@ pub fn file_list(
     let mut open: Option<DiffTarget> = None;
     let mut run: Option<ops::GitCmd> = None;
     let mut overlay: Option<Overlay> = None;
+    let mut version_act: Option<crate::ui::versions::Act> = None;
     let unborn = tab.snap.as_ref().is_some_and(|s| s.head.oid.is_none());
     let workdir = tab.path.clone();
 
@@ -141,7 +144,10 @@ pub fn file_list(
                                 }
                                 folder_extras(ui, shared, tab.snap.as_deref(), path, files);
                             }
-                            DiffSource::Commit(_) | DiffSource::Compare { .. } => {
+                            DiffSource::Commit(_)
+                            | DiffSource::Compare { .. }
+                            | DiffSource::WorkingTree { .. }
+                            | DiffSource::At(_) => {
                                 if menu_item(ui, icons::COPY, "Copy folder path") {
                                     ui.ctx().copy_text(path.clone());
                                 }
@@ -161,7 +167,10 @@ pub fn file_list(
                         let action = match source {
                             DiffSource::Unstaged => Some(("Stage File", theme::green())),
                             DiffSource::Staged => Some(("Unstage File", theme::red())),
-                            DiffSource::Commit(_) | DiffSource::Compare { .. } => None,
+                            DiffSource::Commit(_)
+                            | DiffSource::Compare { .. }
+                            | DiffSource::WorkingTree { .. }
+                            | DiffSource::At(_) => None,
                         };
                         let hovering = ui.rect_contains_pointer(rect);
                         let mut text_right = rect.right() - 8.0;
@@ -242,7 +251,19 @@ pub fn file_list(
                                     }
                                     ui.separator();
                                 }
-                                DiffSource::Commit(_) | DiffSource::Compare { .. } => {}
+                                DiffSource::Commit(_)
+                                | DiffSource::Compare { .. }
+                                | DiffSource::WorkingTree { .. }
+                                | DiffSource::At(_) => {}
+                            }
+                            // The file as the list shows it in a commit:
+                            // open, save or restore that version.
+                            let version = crate::ui::versions::of_file(tab, source, file);
+                            if let Some((version, which)) = &version {
+                                if let Some(act) = crate::ui::versions::menu_items(ui, shared, version, which) {
+                                    version_act = Some(act);
+                                }
+                                ui.separator();
                             }
                             let full = workdir.join(&file.path);
                             let tools = &shared.settings.tools;
@@ -267,13 +288,25 @@ pub fn file_list(
                                     platform::reveal(&full);
                                 }
                             }
+                            // From the commit the list shows, for a commit's
+                            // files and a comparison's newer side.
+                            let start = crate::ui::versions::history_start(source);
                             if menu_item(ui, icons::CLOCK_COUNTER_CLOCKWISE, "File history") {
-                                overlay = Some(Overlay::History(HistoryView::history(&file.path)));
+                                let view = HistoryView::history(&file.path).starting_at(start);
+                                overlay = Some(Overlay::History(view));
                             }
+                            // Blamed where the file is: a deleted one as it
+                            // was before.
+                            let blamed = match (start, &version) {
+                                (None, _) => Some((None, file.path.clone())),
+                                (Some(_), Some((version, _))) => Some((Some(version.commit), version.path.clone())),
+                                (Some(_), None) => None,
+                            };
                             if file.kind != ChangeKind::Untracked
+                                && let Some((at, path)) = blamed
                                 && menu_item(ui, icons::USER_LIST, "Blame")
                             {
-                                overlay = Some(Overlay::History(HistoryView::blame(&file.path)));
+                                overlay = Some(Overlay::History(HistoryView::blame(&path).starting_at(at)));
                             }
                             if menu_item(ui, icons::COPY, "Copy file path") {
                                 ui.ctx().copy_text(file.path.clone());
@@ -310,6 +343,9 @@ pub fn file_list(
     if let Some(overlay) = overlay {
         tab.overlay = Some(overlay);
     }
+    if let Some(act) = version_act {
+        crate::ui::versions::apply(tab, shared, act);
+    }
 }
 
 /// "Stash folder…" and "Ignore folder…" for a folder of a working-tree list.
@@ -338,12 +374,16 @@ fn compare_for(tab: &RepoTab, source: DiffSource) -> Compare {
         DiffSource::Compare { from, to } => {
             Compare::Commit { commit: to.to_string(), parent: Some(from.to_string()) }
         }
+        DiffSource::WorkingTree { from } => Compare::WorkingTree { commit: from.to_string() },
+        // Nothing is compared there; the commit with its parent is the
+        // nearest thing to a diff.
+        DiffSource::At(oid) => Compare::Commit { commit: oid.to_string(), parent: Some(format!("{oid}^")) },
     }
 }
 
 /// `dir/` dimmed followed by the file name. When the path does not fit, the
 /// start of the directory is cut so the file name always stays visible.
-fn paint_path(
+pub fn paint_path(
     painter: &egui::Painter,
     rect: Rect,
     left: f32,

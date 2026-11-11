@@ -123,6 +123,16 @@ be installed.
   panel lists the files that differ, older commit to newer (Swap turns it
   round), and opens their diffs. Several commits in one unbroken line show
   their combined change instead
+- Compare from where two commits forked: "From merge base" in the panel
+  (or "Compare with main from the merge base" on a branch or tag) shows
+  only what one side adds on its own since their merge base, as
+  `git diff main...feature` does, and says which commit the base is
+- Compare a commit, branch or tag with the working tree, uncommitted
+  changes included ("Compare with working tree" on its right-click menu or
+  in the command palette): the panel lists every file that differs from
+  the files on disk, staged, unstaged and untracked alike, and follows
+  edits as they are saved. Its diffs are read-only and have the same
+  inline / split, hunks / whole file and whitespace switches
 - Hide branches, whole folders of branches (say, the ones coding agents
   create for their worktrees), remotes or tags from the graph: click the eye on their
   sidebar row or right-click them, here or on their label in the graph.
@@ -225,7 +235,20 @@ be installed.
   them on the checked-out branch (the interactive rebase opens with them set
   to squash and their combined message ready to edit, and warns when the
   upstream already has some of them); copy their SHAs
-- File history (following renames) and blame, from any file's context menu
+- File history (following renames) and blame, from any file's context menu.
+  Opened from a commit's files (or a comparison's) they start at that
+  commit, say so in the title bar, and "Go to HEAD" looks at HEAD instead
+- Browse every file of a commit: "All files" beside the changed ones above
+  a commit's file list, as paths or a folder tree with a filter, quick on
+  trees of tens of thousands of files. Click a file to read it as it was
+  then, syntax-coloured, selectable and copyable
+- Older versions of a file: right-click a file of a commit (changed or
+  browsed) or of a comparison to open that version with its default
+  program or the editor from Preferences > External Tools, save it
+  somewhere ("Save this version as…"), or restore it in the working tree
+  (`git restore --source`). Restoring asks first when the file has
+  uncommitted changes, and can be undone. The same buttons sit in the title
+  bar of a file shown from a commit, and in the command palette
 - Bisect: "Start bisect: this commit is bad" (or good) on a commit's
   right-click menu, then answer from the banner above the graph (Good, Bad,
   Skip, Stop) or mark any commit from its menu. The banner names the commit
@@ -411,6 +434,7 @@ src/
     fixup.rs     fixup commits and autosquash plans
     trailers.rs  sign-off, co-author trailers, skipping hooks
     blame.rs     file history and blame
+    versions.rs  a commit's file tree, files as they were in a commit
     picture.rs   decoding images for the image preview
     cli.rs       running git
   ui/
@@ -422,6 +446,8 @@ src/
     diff.rs      diff view           highlight.rs  syntax colours
     conflict.rs  conflict resolver   rebase.rs   interactive rebase
     history.rs   file history, blame
+    browse.rs    every file of a commit   file_view.rs  one of them, whole
+    versions.rs  opening, saving and restoring a file as it was
     toolbar.rs   toolbar             dialogs.rs  modals and toasts
     gitflow.rs   Gitflow dialogs, menus and palette entries
     multi/       several selected commits: selecting (pick.rs), their
@@ -452,7 +478,6 @@ build.rs         the Windows executable's icon and version details
 - Bitbucket, Gitea, Azure DevOps and other hosts; GitLab installed under a
   path (`example.com/gitlab`)
 - Interactive rebase refuses ranges that contain merge commits
-- File history and blame always start from HEAD
 - No ancestor pane or syntax colours in the conflict resolver, and text in
   its two side panes cannot be selected (the result can, in its editor)
 - Long lines do not wrap in the conflict resolver, and its tabs keep a fixed
@@ -471,10 +496,6 @@ build.rs         the Windows executable's icon and version details
 - No reflog view
 - Autosquash only folds fixups whose commit comes after the last merge
   commit on the branch
-- Commits are compared tree to tree: not with the working tree, and not
-  from where two branches forked (what a branch adds on its own)
-- A commit's whole file tree cannot be browsed, and a file cannot be opened,
-  saved or restored as it was in an older commit
 - No creating or applying patch files, and no exporting a commit as an
   archive
 - Clone has no options: no shallow or single-branch clone, no choice of

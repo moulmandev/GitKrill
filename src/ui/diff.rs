@@ -82,8 +82,14 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
         Some(Ok(diff)) if diff.mode != wanted => widgets::placeholder(ui, "Loading diff…"),
         Some(Ok(diff)) if diff.binary => match &diff.images {
             Some(images) => crate::ui::image_diff::show(ui, images),
+            None if matches!(target.source, DiffSource::At(_)) => {
+                widgets::placeholder(ui, "Binary file - open this version to see it in another program")
+            }
             None => widgets::placeholder(ui, "Binary file - no text diff to show"),
         },
+        Some(Ok(diff)) if diff.hunks.is_empty() && matches!(target.source, DiffSource::At(_)) => {
+            widgets::placeholder(ui, "This file is empty")
+        }
         Some(Ok(diff)) if diff.hunks.is_empty() && diff.only_whitespace => only_whitespace(ui, shared),
         Some(Ok(diff)) if diff.hunks.is_empty() => {
             widgets::placeholder(ui, "No content changes (the file mode or name changed)")
@@ -155,15 +161,20 @@ fn title_bar(
                         tab.run(ops::unstage(std::slice::from_ref(&target.path), unborn));
                     }
                 }
-                DiffSource::Commit(_) | DiffSource::Compare { .. } => {}
+                DiffSource::Commit(_) | DiffSource::Compare { .. } | DiffSource::WorkingTree { .. } | DiffSource::At(_) => {}
             }
-            if let Some(diff) = diff.filter(|diff| !diff.binary) {
+            // A file of a commit: what can be done with that version.
+            if let DiffSource::At(commit) = target.source {
+                crate::ui::versions::bar_buttons(ui, tab, shared, commit, &target.path);
+            }
+            let compared = !matches!(target.source, DiffSource::At(_));
+            if let Some(diff) = diff.filter(|diff| !diff.binary && compared) {
                 ui.add_space(6.0);
                 ui.label(egui::RichText::new(format!("-{}", diff.deletions)).color(theme::red()).font(theme::mono(12.0)));
                 ui.label(egui::RichText::new(format!("+{}", diff.additions)).color(theme::green()).font(theme::mono(12.0)));
             }
             // Images have modes of their own.
-            if !diff.is_some_and(|diff| diff.binary) {
+            if !diff.is_some_and(|diff| diff.binary) && compared {
                 ui.add_space(8.0);
                 crate::ui::diff_mode::controls(ui, &mut shared.settings.editor, rect.width() < COMPACT_BELOW);
             }
@@ -189,6 +200,8 @@ fn title_bar(
         DiffSource::Staged => "staged changes".to_owned(),
         DiffSource::Commit(oid) => format!("in commit {}", short(oid)),
         DiffSource::Compare { from, to } => format!("{} → {}", short(from), short(to)),
+        DiffSource::WorkingTree { from } => format!("{} → working tree", short(from)),
+        DiffSource::At(oid) => format!("as of commit {}", short(oid)),
     };
     x += widgets::text_left(&painter, rect, x, &origin, theme::font(12.0), theme::text_dim()) + 12.0;
     if let Some(old) = diff.and_then(|d| d.old_path.as_deref()).or(target.old_path.as_deref()) {
@@ -617,7 +630,7 @@ pub(super) struct Metrics {
 }
 
 impl Metrics {
-    fn new(ui: &Ui) -> Self {
+    pub(super) fn new(ui: &Ui) -> Self {
         let look = editor::look();
         let font = look.font();
         let line_h = look.line_height();
@@ -664,6 +677,10 @@ pub fn can_apply_parts(target: &DiffTarget, diff: &FileDiff) -> bool {
 }
 
 fn body(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, target: &DiffTarget, diff: &Arc<FileDiff>) {
+    // A file of a commit, compared with nothing: `ui::file_view`.
+    if let DiffSource::At(_) = target.source {
+        return crate::ui::file_view::show(ui, target, diff);
+    }
     notices(ui, shared, target, diff);
     // Preferences > Editor: font, size, line numbers, wrapping, colours.
     let m = Metrics::new(ui);
@@ -1207,7 +1224,7 @@ fn hunk_buttons(
                     }
                 }
             }
-            DiffSource::Commit(_) | DiffSource::Compare { .. } => {}
+            DiffSource::Commit(_) | DiffSource::Compare { .. } | DiffSource::WorkingTree { .. } | DiffSource::At(_) => {}
         }
         if place(ui, "Clear selection", theme::text_dim()) {
             selection.clear();
@@ -1234,7 +1251,7 @@ fn hunk_buttons(
                 tab.run(ops::apply_patch("Unstage hunk", patch, true, true));
             }
         }
-        DiffSource::Commit(_) | DiffSource::Compare { .. } => {}
+        DiffSource::Commit(_) | DiffSource::Compare { .. } | DiffSource::WorkingTree { .. } | DiffSource::At(_) => {}
     }
 }
 

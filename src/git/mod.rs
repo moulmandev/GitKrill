@@ -29,6 +29,7 @@ pub mod search;
 pub mod stash;
 pub mod text;
 pub mod trailers;
+pub mod versions;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -275,13 +276,33 @@ pub enum DiffSource {
     /// One commit's tree -> another's, for comparing two commits or
     /// branches. `from` is the older side, shown as removed lines.
     Compare { from: Oid, to: Oid },
+    /// One commit's tree -> the working tree, staged and unstaged changes
+    /// and untracked files included (`git diff <from>`, untracked files
+    /// as well): a commit compared with what is on disk. Read-only like
+    /// `Compare`, and loaded again whenever the working tree may have
+    /// changed.
+    WorkingTree { from: Oid },
+    /// The file as it is in commit `oid`, all of it and compared with
+    /// nothing: one `Hunk::gap` holding every line (`git::versions`). For
+    /// looking at a file of a commit's tree.
+    At(Oid),
 }
 
 impl DiffSource {
-    /// Whether the diff is between commits, so nothing in it can be staged,
-    /// unstaged or discarded.
+    /// Whether the diff is of commits rather than of the working tree's
+    /// staging lists, so nothing in it can be staged, unstaged or
+    /// discarded.
     pub fn is_committed(self) -> bool {
-        matches!(self, DiffSource::Commit(_) | DiffSource::Compare { .. })
+        matches!(
+            self,
+            DiffSource::Commit(_) | DiffSource::Compare { .. } | DiffSource::WorkingTree { .. } | DiffSource::At(_)
+        )
+    }
+
+    /// Whether the new side is the file on disk, read from there rather
+    /// than from a blob.
+    pub fn reads_working_tree(self) -> bool {
+        matches!(self, DiffSource::Unstaged | DiffSource::WorkingTree { .. })
     }
 }
 

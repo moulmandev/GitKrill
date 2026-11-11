@@ -2,6 +2,7 @@
 
 pub mod bisect;
 pub mod branch_folder;
+pub mod browse;
 pub mod commit_button;
 pub mod commit_options;
 pub mod conflict;
@@ -9,6 +10,7 @@ pub mod dialogs;
 pub mod diff;
 pub mod diff_mode;
 pub mod diff_split;
+pub mod file_view;
 pub mod files;
 pub mod fixup;
 pub mod git_setup;
@@ -33,6 +35,7 @@ pub mod stash;
 pub mod textsel;
 pub mod toolbar;
 pub mod update;
+pub mod versions;
 pub mod widgets;
 pub mod workspace;
 
