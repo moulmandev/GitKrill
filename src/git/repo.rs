@@ -160,6 +160,7 @@ impl Loader {
             history,
             refs_by_oid,
             gitflow: super::gitflow::read(&self.repo),
+            squash_message: super::merge::read_squash_message(&self.repo),
         })
     }
 

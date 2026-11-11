@@ -106,6 +106,16 @@ pub fn show(ui: &mut Ui, page: &mut Page<'_>, state: &mut State) {
         }
     });
 
+    form::row(ui, "Sign off commits", |ui| {
+        form::checkbox(ui, &mut prefs.sign_off, "");
+        form::help(
+            ui,
+            "Adds a Signed-off-by line with your name and email to each commit made from the commit panel \
+             (git commit --signoff), as projects using a Developer Certificate of Origin ask. The commit \
+             options beside the Amend box can leave it out of one commit.",
+        );
+    });
+
     form::heading(ui, "Commit Template");
     ui.horizontal_wrapped(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;

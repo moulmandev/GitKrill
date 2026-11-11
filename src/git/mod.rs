@@ -10,12 +10,14 @@ pub mod branch_folder;
 pub mod cli;
 pub mod conflict;
 pub mod diff;
+pub mod fixup;
 pub mod gitflow;
 pub mod graph;
 pub mod hidden;
 pub mod ignore;
 pub mod internal;
 pub mod lfs;
+pub mod merge;
 pub mod multi;
 pub mod ops;
 pub mod picture;
@@ -24,6 +26,7 @@ pub mod remotes;
 pub mod repo;
 pub mod stash;
 pub mod text;
+pub mod trailers;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -228,6 +231,9 @@ pub struct RepoSnapshot {
     pub refs_by_oid: HashMap<Oid, Vec<RefLabel>>,
     /// The repository's Gitflow setup, when it has one.
     pub gitflow: Option<gitflow::Config>,
+    /// Git's `SQUASH_MSG` while a squash merge waits to be committed; see
+    /// `git::merge`.
+    pub squash_message: Option<String>,
 }
 
 impl RepoSnapshot {

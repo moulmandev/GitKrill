@@ -18,6 +18,7 @@ use crate::ui::widgets::{self, icon_button, segmented, tint_button};
 
 pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared) {
     commit_button::follow_up(ui.ctx(), tab, shared);
+    crate::ui::merge::follow_up(ui.ctx(), tab);
     let Some(snap) = tab.snap.clone() else { return };
     // Several commits selected: see `ui::multi`.
     if crate::ui::multi::panel(ui, tab, shared, &snap) {
@@ -79,6 +80,7 @@ fn working_tree(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<
         if let Some(label) = snap.state.label() {
             operation_banner(ui, tab, snap.state, label);
         }
+        crate::ui::merge::banner(ui, tab, shared, snap);
 
         ui.horizontal(|ui| {
             ui.add_space(8.0);
@@ -175,6 +177,7 @@ fn commit_box(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSn
             let can_amend = snap.head.oid.is_some();
             let before = tab.amend;
             ui.add_enabled(can_amend, egui::Checkbox::new(&mut tab.amend, "Amend"));
+            crate::ui::commit_options::button(ui, tab, &prefs);
             let empty = tab.summary.is_empty() && tab.description.is_empty();
             if tab.amend && !before && (empty || commit_button::untouched_template(ui.ctx(), tab)) {
                 // Start from the message being amended.
@@ -198,6 +201,7 @@ fn commit_box(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSn
             .desired_rows(4)
             .desired_width(f32::INFINITY),
     );
+    crate::ui::commit_options::chips(ui, tab, &prefs);
     crate::ui::prefs::profiles::commit_author(ui, tab, &shared.settings);
 
     let focused = summary.has_focus() || description.has_focus();

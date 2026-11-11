@@ -64,6 +64,11 @@ pub enum UndoKind {
     /// notes what each held before and after; undo writes back what was
     /// there before; see `git::internal`.
     Files(super::internal::FileUndo),
+    /// HEAD stays put and the command stages changes (`git merge --squash`):
+    /// undo puts the index and the files it changed back as HEAD has them,
+    /// keeping other local changes (`git reset --merge`); redo runs the
+    /// command again. Both expect HEAD where it was.
+    Staged,
 }
 
 /// One ref of [`UndoKind::Refs`].
@@ -685,6 +690,15 @@ pub fn build_undo(
         }
 
         UndoKind::Files(edit) => super::internal::undo_entry(&label, edit, cmd),
+
+        UndoKind::Staged => {
+            if before != after {
+                return None;
+            }
+            let mut redo = GitCmd::empty(format!("Redo {label}"));
+            redo.steps = cmd.steps.clone();
+            entry(plain(format!("Undo {label}"), &["reset", "--merge"]), redo)
+        }
     }
 }
 

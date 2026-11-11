@@ -2,18 +2,21 @@
 
 pub mod branch_folder;
 pub mod commit_button;
+pub mod commit_options;
 pub mod conflict;
 pub mod dialogs;
 pub mod diff;
 pub mod diff_mode;
 pub mod diff_split;
 pub mod files;
+pub mod fixup;
 pub mod git_setup;
 pub mod gitflow;
 pub mod graph;
 pub mod highlight;
 pub mod history;
 pub mod image_diff;
+pub mod merge;
 pub mod multi;
 pub mod hosting;
 pub mod ignore;

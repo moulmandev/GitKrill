@@ -724,6 +724,8 @@ fn menu(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, dropped: &Dropped) 
                 {
                     tab.run(cmd);
                 }
+                // A squash, or a merge commit instead of a fast-forward.
+                crate::ui::merge::drop_entries(ui, tab, &snap, &dropped.dragged.name(), action);
             }
         }
     }

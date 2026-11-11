@@ -827,7 +827,11 @@ impl RepoTab {
                             self.undo.push(entry);
                             self.redo.clear();
                         }
-                        if matches!(cmd.undo, UndoKind::Commit) {
+                        // A fixup made from the graph leaves the message
+                        // being written where it is.
+                        if matches!(cmd.undo, UndoKind::Commit)
+                            && !cmd.label.starts_with(crate::git::fixup::FIXUP_LABEL)
+                        {
                             self.summary.clear();
                             self.description.clear();
                             self.amend = false;

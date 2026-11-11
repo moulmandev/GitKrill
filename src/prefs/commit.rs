@@ -53,12 +53,15 @@ pub struct RepoCommit {
     /// Commit with `--cleanup=strip`: lines starting with git's comment
     /// character (`#`, or `core.commentChar`) are left out of the message.
     pub strip_comments: bool,
+    /// Sign off every commit from the commit panel (`--signoff`) unless its
+    /// options say otherwise for one commit; see `ui::commit_options`.
+    pub sign_off: bool,
 }
 
 impl Default for RepoCommit {
     fn default() -> Self {
         // Git itself starts every new message from the template.
-        RepoCommit { action: CommitAction::Commit, apply_template: true, strip_comments: false }
+        RepoCommit { action: CommitAction::Commit, apply_template: true, strip_comments: false, sign_off: false }
     }
 }
 

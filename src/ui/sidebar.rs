@@ -583,6 +583,7 @@ pub fn local_branch_menu(
             if menu_item(ui, icons::GIT_MERGE, &format!("Merge {} into {current}", branch.name)) {
                 tab.run(ops::merge(&branch.name));
             }
+            crate::ui::merge::options_menu(ui, tab, snap, &branch.name, current);
             if menu_item(ui, icons::GIT_FORK, &format!("Rebase {current} onto {}", branch.name)) {
                 tab.run(ops::rebase(&branch.name));
             }
@@ -682,6 +683,7 @@ pub fn remote_branch_menu(
         if menu_item(ui, icons::GIT_MERGE, &format!("Merge {} into {current}", branch.full)) {
             tab.run(ops::merge(&branch.full));
         }
+        crate::ui::merge::options_menu(ui, tab, snap, &branch.full, current);
         if menu_item(ui, icons::GIT_FORK, &format!("Rebase {current} onto {}", branch.full)) {
             tab.run(ops::rebase(&branch.full));
         }

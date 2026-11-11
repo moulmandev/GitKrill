@@ -146,6 +146,14 @@ be installed.
 - Commit, amend, and "stage all and commit" in one click (`Ctrl+Enter`); the
   button's menu also commits and pushes, or commits and opens a pull request,
   and Preferences > Commit picks which of these the button does
+- Commit options (the sliders button beside Amend): sign off (`--signoff`;
+  Preferences > Commit > Sign off commits does it for every commit), skip the
+  hooks (`--no-verify`) and co-authors (`Co-authored-by:` trailers), picked
+  from the authors in the history as you type or typed as `Name <email>`.
+  What is on shows as chips under the message, each with a × to remove it.
+  They apply to amends and to commit and push or commit and open a pull
+  request, never add a trailer the message already has, and go back to
+  their defaults after each commit
 - Commit templates: git's own `commit.template` fills an empty message (set
   it in Preferences > Commit), a counter shows what is left of 72 characters
   in the summary, and comment lines can be left out of the commit
@@ -181,6 +189,19 @@ be installed.
   uncommitted changes or is locked; undo brings the branches back. On a
   remote, the folder's branches are deleted there in one push
 - Merge, rebase, cherry-pick, revert, reset (soft / mixed / hard)
+- Merge options, under "Merge options" in a branch's right-click menu (sidebar
+  or graph label), in the drop menu and in the command palette: always a
+  merge commit (`--no-ff`), fast-forward only, or a squash merge, which stages
+  what the branch adds as one change and puts a prepared message in the
+  commit panel, with a banner to commit it (Continue) or abort it. Each can
+  be undone
+- Fixup commits: right-click a commit of the checked-out branch for "Fixup
+  this commit with staged changes", or "Squash into this commit", which also
+  adds the message typed in the commit panel. "Autosquash", on a fixup
+  commit's menu or in the command palette, folds every fixup of the branch
+  into the commit it names (`git rebase -i --autosquash`, no editor): commits
+  another branch has are never rewritten, a conflict stops it like any
+  rebase, and undo puts the branch back
 - Interactive rebase: pick, reword, squash, fixup, drop and reorder
 - Several selected commits at once, from their right-click menu, the panel
   or the command palette: cherry-pick them (oldest first) or revert them
@@ -363,6 +384,9 @@ src/
     conflict.rs  three-way conflict regions and resolutions
     rebase.rs    interactive rebase plans
     multi.rs     cherry-pick, revert and squash several commits
+    merge.rs     merge modes, the squash merge's prepared message
+    fixup.rs     fixup commits and autosquash plans
+    trailers.rs  sign-off, co-author trailers, skipping hooks
     blame.rs     file history and blame
     picture.rs   decoding images for the image preview
     cli.rs       running git
@@ -379,6 +403,9 @@ src/
     gitflow.rs   Gitflow dialogs, menus and palette entries
     multi/       several selected commits: selecting (pick.rs), their
                  panel, comparison, menu and palette entries
+    merge.rs     merge options, the squash merge banner
+    fixup.rs     fixup and autosquash menus and palette entries
+    commit_options.rs  sign-off, hooks and co-authors of the next commit
     palette.rs   command palette (Ctrl+P)
     image_diff.rs  image preview     update.rs   update offer, status bar
     widgets.rs   shared widgets
@@ -420,10 +447,8 @@ build.rs         the Windows executable's icon and version details
   as text
 - No reflog view and no bisect (a bisect started in a terminal is only
   shown as in progress)
-- Merges always use git's default (no choice of a merge commit or a squash
-  merge), and there are no fixup commits or autosquash
-- Commits cannot be signed off, committed without hooks or given
-  co-authors from the commit panel
+- Autosquash only folds fixups whose commit comes after the last merge
+  commit on the branch
 - Commit search looks at messages, authors and SHAs only: not at the files
   a commit changed, its code (`git log -S`) or its date
 - Commits are compared tree to tree: not with the working tree, and not

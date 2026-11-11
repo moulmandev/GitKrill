@@ -1070,6 +1070,7 @@ fn row_menu(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &Arc<Repo
         tab.run(ops::revert(commit.oid, is_merge));
     }
     crate::ui::multi::compare_with_head(ui, tab, shared, snap, commit.oid);
+    crate::ui::fixup::menu_items(ui, tab, shared, snap, commit);
     // Reword, squash, reorder or drop everything after this commit.
     if !is_head
         && let Some(branch) = &snap.head.branch

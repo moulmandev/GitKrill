@@ -162,9 +162,10 @@ fn follow_up_id(path: &Path) -> Id {
     Id::new(("commit-follow-up", path))
 }
 
-/// Pushes or opens the pull request dialog once a commit made with that
-/// action has succeeded. Called every frame the repository is shown; one
-/// lookup in egui's memory when nothing waits.
+/// Once a commit succeeded: puts the commit options back to their defaults
+/// and, for those actions, pushes or opens the pull request dialog. Called
+/// every frame the repository is shown; one lookup in egui's memory when
+/// nothing waits.
 pub fn follow_up(ctx: &egui::Context, tab: &mut RepoTab, shared: &mut Shared) {
     let id = follow_up_id(&tab.path);
     let Some(mut pending) = ctx.data(|d| d.get_temp::<FollowUp>(id)) else { return };
@@ -173,12 +174,21 @@ pub fn follow_up(ctx: &egui::Context, tab: &mut RepoTab, shared: &mut Shared) {
         None => match tab.take_outcome(&pending.label, pending.since) {
             // Still running.
             None => return,
-            // Its failure is already on screen; nothing follows.
+            // Its failure is already on screen; nothing follows, and the
+            // options stay for the next try.
             Some(false) => {
                 ctx.data_mut(|d| d.remove::<FollowUp>(id));
                 return;
             }
-            Some(true) => *pending.succeeded.insert(Instant::now()),
+            Some(true) => {
+                // Sign-off, hooks and co-authors were for this commit.
+                crate::ui::commit_options::committed(ctx, &tab.path);
+                if pending.action == CommitAction::Commit {
+                    ctx.data_mut(|d| d.remove::<FollowUp>(id));
+                    return;
+                }
+                *pending.succeeded.insert(Instant::now())
+            }
         },
     };
     let waited = succeeded.elapsed() >= SNAPSHOT_WAIT;
@@ -264,18 +274,10 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSnap
 
     let staged = snap.status.staged.len();
     let unstaged = snap.status.unstaged.len();
-    let has_message = !tab.summary.trim().is_empty() && !untouched_template(ui.ctx(), tab);
-    let committing = tab.is_running("Commit") || tab.is_running("Amend commit");
-    let blocked = if committing {
-        Some("Committing…")
-    } else if tab.amend {
-        (!has_message).then_some("Type a message to amend")
-    } else if staged == 0 && unstaged == 0 {
-        Some("Nothing to commit")
-    } else if !has_message {
-        Some(if tab.summary.trim().is_empty() { "Type a message to commit" } else { "Edit the template to commit" })
-    } else {
-        None
+    let blocked = match commit_blocker(ui.ctx(), tab) {
+        Some(why) if why == COMMITTING || tab.amend => Some(why),
+        _ if !tab.amend && staged == 0 && unstaged == 0 => Some("Nothing to commit"),
+        why => why,
     };
     let plan = Plan { blocked, everything: !tab.amend && staged == 0, staged };
     let enabled = plan.blocked.is_none();
@@ -354,8 +356,34 @@ pub fn show(ui: &mut Ui, tab: &mut RepoTab, shared: &mut Shared, snap: &RepoSnap
     }
 }
 
-/// The message in the fields, as git gets it.
-fn message(tab: &RepoTab) -> String {
+const COMMITTING: &str = "Committing…";
+
+/// Why the message fields do not allow a commit now (a commit running, no
+/// message, the template untouched), whatever is staged.
+pub fn commit_blocker(ctx: &egui::Context, tab: &RepoTab) -> Option<&'static str> {
+    let has_message = !tab.summary.trim().is_empty() && !untouched_template(ctx, tab);
+    if tab.is_running("Commit") || tab.is_running("Amend commit") {
+        Some(COMMITTING)
+    } else if has_message {
+        None
+    } else if tab.amend {
+        Some("Type a message to amend")
+    } else if tab.summary.trim().is_empty() {
+        Some("Type a message to commit")
+    } else {
+        Some("Edit the template to commit")
+    }
+}
+
+/// Commits what is staged with the message in the fields and the commit
+/// options, as the plain commit button does; for buttons elsewhere (a squash
+/// merge's Continue). Check [`commit_blocker`] first.
+pub fn commit_staged(ctx: &egui::Context, tab: &mut RepoTab, snap: &RepoSnapshot, prefs: &RepoCommit) {
+    commit(ctx, tab, snap, prefs, CommitAction::Commit, false);
+}
+
+/// The message in the fields, as the user wrote it.
+pub fn message(tab: &RepoTab) -> String {
     let mut message = tab.summary.trim().to_owned();
     let body = tab.description.trim();
     if !body.is_empty() {
@@ -365,26 +393,26 @@ fn message(tab: &RepoTab) -> String {
     message
 }
 
-/// Commits, and leaves what `action` adds for [`follow_up`].
+/// Commits with the commit options (sign-off, hooks, co-authors; see
+/// `ui::commit_options`), and leaves what `action` adds, and putting the
+/// options back once it succeeded, for [`follow_up`].
 fn commit(ctx: &egui::Context, tab: &mut RepoTab, snap: &RepoSnapshot, prefs: &RepoCommit, action: CommitAction, everything: bool) {
-    let message = message(tab);
+    let options = crate::ui::commit_options::options(ctx, tab, prefs);
+    let message = options.message(&message(tab));
     let mut cmd = if everything { ops::commit_everything(&message) } else { ops::commit(&message, tab.amend) };
     if prefs.strip_comments {
         cmd = cmd.strip_comments();
     }
-    let id = follow_up_id(&tab.path);
-    if action == CommitAction::Commit {
-        ctx.data_mut(|d| d.remove::<FollowUp>(id));
-    } else {
-        let pending = FollowUp {
-            label: cmd.label.clone(),
-            since: Instant::now(),
-            action,
-            head_before: snap.head.oid,
-            succeeded: None,
-        };
-        ctx.data_mut(|d| d.insert_temp(id, pending));
-    }
+    let ident = crate::ui::commit_options::sign_off_ident(ctx, &tab.path);
+    let cmd = options.apply(cmd, &message, ident.as_deref());
+    let pending = FollowUp {
+        label: cmd.label.clone(),
+        since: Instant::now(),
+        action,
+        head_before: snap.head.oid,
+        succeeded: None,
+    };
+    ctx.data_mut(|d| d.insert_temp(follow_up_id(&tab.path), pending));
     tab.run(cmd);
 }
 
