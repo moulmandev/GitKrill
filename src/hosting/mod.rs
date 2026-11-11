@@ -511,7 +511,10 @@ pub fn offers(remotes: &[RemoteInfo], servers: &Servers) -> Vec<Offer> {
 
 // ---- model ----------------------------------------------------------------
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// `Default` is there so a backend can leave fields it does not know (or
+/// that were added after it was written) at their "unknown" value with
+/// `..Default::default()`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PullRequest {
     /// The number the service shows: a GitLab merge request's `iid`.
     pub number: u64,
