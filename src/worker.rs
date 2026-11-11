@@ -32,6 +32,16 @@ enum Request {
     Details { oid: Oid, is_stash: bool },
 }
 
+/// What the operator thread is asked to do. Commands go one at a time, so
+/// boxing the larger variant would only add an allocation.
+#[allow(clippy::large_enum_variant)]
+enum Op {
+    Run(GitCmd, Origin),
+    /// Look whether the operation an undo entry waits for (`git::carry`)
+    /// was finished outside GitKrill.
+    Check,
+}
+
 /// Why a command was run; undo/redo carry their entry so it can be moved to
 /// the opposite stack once the command succeeds.
 pub enum Origin {
@@ -56,12 +66,19 @@ pub enum Response {
         undo: Option<UndoEntry>,
         origin: Origin,
     },
+    /// An operation that stopped on conflicts was finished outside GitKrill
+    /// (in a terminal, or while it was closed): its undo entry, offered as
+    /// if it had been finished here.
+    Finished(UndoEntry),
 }
 
 pub struct RepoHandle {
     req_tx: Sender<Request>,
-    op_tx: Sender<(GitCmd, Origin)>,
+    op_tx: Sender<Op>,
     pub rx: Receiver<Response>,
+    /// Set by the operator while an undo entry waits for its operation to
+    /// finish; refreshes then ask it to look again.
+    carrying: Arc<AtomicBool>,
     limit: Arc<AtomicUsize>,
     /// Refs left out of the graph; read by every refresh.
     hidden: Arc<Mutex<Hidden>>,
@@ -73,11 +90,12 @@ pub struct RepoHandle {
 impl RepoHandle {
     pub fn spawn(workdir: PathBuf, ctx: egui::Context, limit: usize) -> Self {
         let (req_tx, req_rx) = channel::<Request>();
-        let (op_tx, op_rx) = channel::<(GitCmd, Origin)>();
+        let (op_tx, op_rx) = channel::<Op>();
         let (res_tx, rx) = channel::<Response>();
         let limit = Arc::new(AtomicUsize::new(limit));
         let hidden = Arc::new(Mutex::new(Hidden::default()));
         let fs_dirty = Arc::new(AtomicBool::new(false));
+        let carrying = Arc::new(AtomicBool::new(false));
 
         {
             let workdir = workdir.clone();
@@ -94,18 +112,24 @@ impl RepoHandle {
             let workdir = workdir.clone();
             let ctx = ctx.clone();
             let req_tx = req_tx.clone();
+            let carrying = carrying.clone();
             thread::Builder::new()
                 .name("git-operator".into())
-                .spawn(move || operator(&workdir, op_rx, res_tx, req_tx, &ctx))
+                .spawn(move || operator(&workdir, op_rx, res_tx, req_tx, &carrying, &ctx))
                 .expect("spawn operator thread");
         }
 
         let watcher = start_watcher(&workdir, fs_dirty.clone(), ctx);
-        RepoHandle { req_tx, op_tx, rx, limit, hidden, fs_dirty, _watcher: watcher }
+        RepoHandle { req_tx, op_tx, rx, carrying, limit, hidden, fs_dirty, _watcher: watcher }
     }
 
     pub fn refresh(&self) {
         let _ = self.req_tx.send(Request::Refresh);
+        // What changed may be an operation that stopped on conflicts,
+        // finished in a terminal.
+        if self.carrying.load(Ordering::Relaxed) {
+            let _ = self.op_tx.send(Op::Check);
+        }
     }
 
     pub fn set_limit(&self, limit: usize) {
@@ -147,7 +171,7 @@ impl RepoHandle {
     }
 
     pub fn run(&self, cmd: GitCmd, origin: Origin) {
-        let _ = self.op_tx.send((cmd, origin));
+        let _ = self.op_tx.send(Op::Run(cmd, origin));
     }
 }
 
@@ -218,17 +242,32 @@ fn reader(
 
 fn operator(
     workdir: &Path,
-    op_rx: Receiver<(GitCmd, Origin)>,
+    op_rx: Receiver<Op>,
     res_tx: Sender<Response>,
     req_tx: Sender<Request>,
+    carrying: &AtomicBool,
     ctx: &egui::Context,
 ) {
-    // Undo entries of operations that stopped on conflicts, until finished.
-    let mut carry = crate::git::carry::Carry::default();
-    while let Ok((mut cmd, origin)) = op_rx.recv() {
+    // Undo entries of operations that stopped on conflicts, until finished,
+    // starting with one an earlier session left waiting: finished while
+    // GitKrill was closed, it is offered now.
+    let mut carry = crate::git::carry::Carry::open(workdir);
+    let offer = |entry: Option<UndoEntry>| {
+        if let Some(entry) = entry {
+            let _ = res_tx.send(Response::Finished(entry));
+            ctx.request_repaint();
+        }
+    };
+    offer(carry.check(workdir));
+    carrying.store(carry.is_holding(), Ordering::Relaxed);
+    while let Ok(op) = op_rx.recv() {
+        // Before any command too: the operation may have been finished in a
+        // terminal since the last refresh.
+        offer(carry.check(workdir));
+        carrying.store(carry.is_holding(), Ordering::Relaxed);
+        let Op::Run(mut cmd, origin) = op else { continue };
         let by_user = matches!(origin, Origin::User);
         let wants_undo = by_user && !matches!(cmd.undo, UndoKind::None);
-        let continues = by_user && carry.start(workdir);
 
         let (before, deleted_at) = if wants_undo {
             match git2::Repository::open(workdir) {
@@ -292,11 +331,10 @@ fn operator(
 
         // A command that finishes an operation which stopped earlier (Continue)
         // gets that operation's undo; one that stops keeps its own for later.
-        let carried = if by_user {
-            carry.end(workdir, &cmd, result.is_ok(), before.as_ref(), deleted_at, continues)
-        } else {
-            None
-        };
+        let carried =
+            if by_user { carry.end(workdir, &cmd, result.is_ok(), before.as_ref(), deleted_at) } else { None };
+        // Before the answer goes out, so a refresh that follows it looks.
+        carrying.store(carry.is_holding(), Ordering::Relaxed);
         let undo = carried.or_else(|| match (&result, before) {
             (Ok(()), Some(before)) => git2::Repository::open(workdir).ok().and_then(|repo| {
                 note_refs(&repo, &mut cmd.undo, true);
@@ -375,7 +413,8 @@ fn is_relevant(path: &Path, root: &Path, gitdir: &Path, repo: &git2::Repository)
         .or_else(|| path.strip_prefix(gitdir).ok());
 
     if let Some(rel) = in_git {
-        if path.extension().is_some_and(|e| e == "lock") {
+        // What `git::carry` keeps for the next session changes nothing shown.
+        if path.extension().is_some_and(|e| e == "lock") || rel == Path::new(crate::git::carry::FILE) {
             return false;
         }
         return match rel.components().next().and_then(|c| c.as_os_str().to_str()) {

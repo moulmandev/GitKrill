@@ -326,8 +326,8 @@ be installed.
   file and why). Mails from `git format-patch` can be committed with their
   authors and messages (`git am`); any patch can go into the working tree,
   staged or not, and what does not apply is saved beside its file as a
-  `.rej`. Applying to the working tree is undoable; a `git am` stopped on a
-  conflict waits with Continue, Skip and Abort
+  `.rej`. Applying is undoable; a `git am` stopped on a conflict waits with
+  Continue, Skip and Abort, and is undone as a whole once finished
 - "Export as archive…" on a commit's, branch's or tag's right-click menu
   (the command palette exports what is checked out): a zip, tar.gz or tar of
   its files, by the extension of the name you give, in a folder named after
@@ -345,11 +345,14 @@ be installed.
   on a conflict carries on from there when run again
 - Undo / redo for commits, checkouts, merges, resets, rebases, branch create
   and delete, adding, editing and removing remotes, deleting a tag and
-  applying a patch to the working tree. A rebase, merge, cherry-pick or
-  revert that stopped on conflicts is undone as a whole once Continue (or
-  the commit that concludes a merge) finishes it, and a drag action that
-  checks out another branch first is undone in one step, back on the branch
-  you were on
+  applying a patch to the working tree. A rebase, merge, cherry-pick,
+  revert or `git am` that stopped on conflicts is undone as a whole once it
+  is finished: by Continue (or the commit that concludes a merge) in the
+  app, or in a terminal or another tool, even while GitKrill was closed.
+  What only finishing leaves behind (the rebase's last reflog entry, the
+  merge commit, the picked commits) tells it from an abort or a `--quit`,
+  which leave nothing to undo. A drag action that checks out another branch
+  first is undone in one step, back on the branch you were on
 - Reflog (**View > Reflog**, "Show reflog" in the toolbar's branch menu or on
   a branch's right-click menu, or the command palette): a panel under the
   graph lists where HEAD, or a branch, pointed after every commit,
@@ -641,8 +644,11 @@ build.rs         the Windows executable's icon and version details
 
 ## Known gaps
 
-- Undo does not cover an operation that stopped on conflicts and was then
-  continued or finished in a terminal (the reflog still has it)
+- An operation that stopped on conflicts and was finished outside GitKrill
+  is not offered for undo when its end looks like giving it up: a rebase
+  of a detached HEAD, several cherry-picks, reverts or mails whose last one
+  was skipped, or anything committed on top before GitKrill looked (the
+  reflog still has them)
 - Bitbucket Data Center (Server), SourceHut and other hosts; Azure DevOps SSH
   keys cannot be listed or added in Preferences > Integrations (it has no
   API for them), Bitbucket lists no comment counts for its issues, and

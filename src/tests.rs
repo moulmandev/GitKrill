@@ -25,6 +25,9 @@ pub(crate) struct Done {
     pub(crate) result: Result<String, String>,
     pub(crate) undo: Option<UndoEntry>,
     pub(crate) snap: Arc<RepoSnapshot>,
+    /// The entry of an operation that stopped on conflicts and was finished
+    /// outside GitKrill, offered before the command ran (`git::carry`).
+    pub(crate) finished: Option<UndoEntry>,
 }
 
 /// Runs plain git for test setup, panicking on failure.
@@ -93,13 +96,15 @@ impl Fixture {
         while self.handle.rx.try_recv().is_ok() {}
         self.handle.run(cmd, origin);
         let mut finished = None;
+        let mut offered = None;
         loop {
             match self.handle.rx.recv_timeout(TIMEOUT).expect("operation finishes") {
                 Response::OpDone { result, undo, .. } => finished = Some((result, undo)),
+                Response::Finished(entry) => offered = Some(entry),
                 // The operator requests a refresh after every command.
                 Response::Snapshot(snap) => {
                     if let Some((result, undo)) = finished.take() {
-                        return Done { result, undo, snap };
+                        return Done { result, undo, snap, finished: offered };
                     }
                 }
                 Response::LoadError(e) => panic!("load error: {e}"),

@@ -759,6 +759,48 @@ mod tests {
         let done = fx.run(crate::git::ops::continue_op(RepoState::ApplyMailbox).unwrap());
         assert_eq!(done.snap.state, RepoState::Clean);
         assert_eq!(git(&fx.dir, &["log", "-1", "--format=%s"]), "Change two");
+
+        // Undone as a whole once finished.
+        let entry = done.undo.expect("undoable");
+        assert_eq!(entry.label, "Apply 1 patch");
+        fx.run_as(entry.undo.clone(), Origin::Undo(entry)).result.expect("undo works");
+        assert_eq!(git(&fx.dir, &["log", "-1", "--format=%s"]), "Local change");
+    }
+
+    #[test]
+    fn mails_finished_in_a_terminal_are_offered_for_undo() {
+        let (fx, mail, _) = with_patch("patch-am-terminal");
+        fx.write("a.txt", "one\ntwo, changed here\nthree\n");
+        fx.commit_all("Local change");
+        let info = inspected(&fx, &mail);
+        let stop = || assert!(fx.run_as(apply(&fx.dir, &info, How::Commit), Origin::User).result.is_err());
+        let resolve = || {
+            fx.write("a.txt", "one\nTWO, changed here\nthree\n");
+            git(&fx.dir, &["add", "a.txt"]);
+        };
+        // The operation thread looks before each command.
+        let look = || fx.run(GitCmd::empty("Look").quiet()).finished;
+        let subject = || git(&fx.dir, &["log", "-1", "--format=%s"]);
+
+        stop();
+        resolve();
+        git(&fx.dir, &["am", "--continue"]);
+        let entry = look().expect("offered");
+        assert_eq!(entry.label, "Apply 1 patch");
+        fx.run_as(entry.undo.clone(), Origin::Undo(entry)).result.expect("undo works");
+        assert_eq!(subject(), "Local change");
+
+        // Aborted, or finished and then committed on: nothing.
+        stop();
+        git(&fx.dir, &["am", "--abort"]);
+        assert!(look().is_none());
+        stop();
+        resolve();
+        git(&fx.dir, &["am", "--continue"]);
+        fx.write("later.txt", "later\n");
+        fx.commit_all("later");
+        assert!(look().is_none());
+        assert_eq!(subject(), "later");
     }
 
     #[test]

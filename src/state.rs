@@ -756,6 +756,11 @@ impl RepoTab {
                 Response::OpDone { cmd, result, undo, origin } => {
                     self.on_op_done(shared, cmd, result, undo, origin);
                 }
+                // As for a command of the user's that finished it.
+                Response::Finished(entry) => {
+                    self.undo.push(entry);
+                    self.redo.clear();
+                }
             }
         }
 
